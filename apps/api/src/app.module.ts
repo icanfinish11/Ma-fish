@@ -1,8 +1,11 @@
 import { Module, type MiddlewareConsumer, type NestModule } from '@nestjs/common';
+import { APP_GUARD } from '@nestjs/core';
 import { ConfigModule } from './config/config.module.js';
 import { DbModule } from './db/db.module.js';
 import { AppLoggerModule } from './common/logging/logger.module.js';
 import { TraceMiddleware } from './common/logging/trace.middleware.js';
+import { PolicyGuard } from './common/policy/policy.guard.js';
+import { PolicyModule } from './common/policy/policy.module.js';
 import { HealthModule } from './modules/health/health.module.js';
 
 /**
@@ -27,9 +30,25 @@ import { HealthModule } from './modules/health/health.module.js';
  *   （默认只有完成行）。
  *
  * 因此注册顺序在当下不是承重的；这里仍按「身份先于日志」的语义把它放在根模块。
+ *
+ * ## 全局守卫的顺序（Task 7 起承重，先记在这里）
+ *
+ * `APP_GUARD` 的**数组顺序**就是执行顺序，因此未来的 `CsrfGuard` 必须排在 `PolicyGuard`
+ * **之前**（计划 Task 7 原文：`[{ provide: APP_GUARD, useClass: CsrfGuard },
+ * { provide: APP_GUARD, useExisting: PolicyGuard }]`）：CSRF 是「请求是否可信」，
+ * 授权是「这个身份能不能」，前者更便宜也更靠前，且不该让一次跨站请求走到条件判定里。
+ *
+ * ## 为什么是 `useExisting` 而不是 `useClass`
+ *
+ * `PolicyGuard` 由 `@Global()` 的 `PolicyModule` 提供并导出，本处只是**指向同一个实例**。
+ * 若写成 `useClass`，Nest 会为 `APP_GUARD` 另造一个守卫实例，而各业务模块注入到的仍是
+ * `PolicyModule` 那一个——它们 `registerCondition` 注册的条件就永远到不了真正拦截请求的守卫上，
+ * 表现为「条件全部未注册 ⇒ 相关路由全部 403」。该不变量由
+ * `tests/security/policy-default-deny.test.ts` 的「同一实例」用例钉住。
  */
 @Module({
-  imports: [ConfigModule, AppLoggerModule, DbModule, HealthModule],
+  imports: [ConfigModule, AppLoggerModule, DbModule, PolicyModule, HealthModule],
+  providers: [{ provide: APP_GUARD, useExisting: PolicyGuard }],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer): void {
