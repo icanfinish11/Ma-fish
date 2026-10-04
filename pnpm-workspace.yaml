@@ -1,6 +1,10 @@
 packages:
   - 'apps/*'
   - 'packages/*'
+  # tests 是一等 workspace 包：pnpm 隔离式 node_modules 下，tests/ 无法解析
+  # 只声明在 apps/api 里的包（见 task-1-report.md §5 偏差 1）。提升为包后，
+  # 测试侧依赖在此显式声明，且 tests/** 被 pnpm -r typecheck 覆盖。
+  - 'tests'
 
 allowBuilds:
   prisma: true

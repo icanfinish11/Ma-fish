@@ -8,21 +8,9 @@ importers:
 
   .:
     devDependencies:
-      '@nestjs/testing':
-        specifier: 12.1.2
-        version: 12.1.2(@nestjs/common@12.1.2(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.1.2)(@nestjs/platform-express@12.1.2)
-      '@types/supertest':
-        specifier: ^7.2.1
-        version: 7.2.1
       eslint:
         specifier: 10.12.0
         version: 10.12.0
-      reflect-metadata:
-        specifier: 0.2.2
-        version: 0.2.2
-      supertest:
-        specifier: 7.3.1
-        version: 7.3.1
       typescript-eslint:
         specifier: 8.71.0
         version: 8.71.0(eslint@10.12.0)(typescript@6.0.3)
@@ -66,6 +54,37 @@ importers:
 
   packages/shared:
     devDependencies:
+      typescript:
+        specifier: 6.0.3
+        version: 6.0.3
+
+  tests:
+    dependencies:
+      '@vca/api':
+        specifier: workspace:*
+        version: link:../apps/api
+      '@vca/shared':
+        specifier: workspace:*
+        version: link:../packages/shared
+    devDependencies:
+      '@nestjs/common':
+        specifier: 12.1.2
+        version: 12.1.2(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/testing':
+        specifier: 12.1.2
+        version: 12.1.2(@nestjs/common@12.1.2(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@12.1.2)(@nestjs/platform-express@12.1.2)
+      '@types/node':
+        specifier: 22.20.5
+        version: 22.20.5
+      '@types/supertest':
+        specifier: 7.2.1
+        version: 7.2.1
+      reflect-metadata:
+        specifier: 0.2.2
+        version: 0.2.2
+      supertest:
+        specifier: 7.3.1
+        version: 7.3.1
       typescript:
         specifier: 6.0.3
         version: 6.0.3
