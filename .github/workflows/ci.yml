@@ -79,9 +79,16 @@ jobs:
           psql "$MIGRATE_DATABASE_URL" -v ON_ERROR_STOP=1 -f infra/db/apply-grants.sql
 
       # Ruling 1 的闭环：上一步「没报错」不等于「授权真的生效」。这里直接问 PostgreSQL
-      # 三件事——运行期角色**能用**什么、**不能用**什么、以及能不能碰到迁移台账。
-      # 期望值 t|t|f|f 的含义：auth 表可读写 / audit 表可 INSERT（append-only 的另一半）/
-      # audit 表**不可** UPDATE（不变式 #5）/ public._prisma_migrations 不可读（Task 3 修复）。
+      # 四件事——运行期角色**能用**什么、**不能用**什么，以及能不能碰到迁移台账。
+      # 期望值 t|t|f|f|f 的含义：auth 表可读写 / audit 表可 INSERT（append-only 的另一半）/
+      # audit 表**不可** UPDATE / audit 表**不可** DELETE / public._prisma_migrations 不可读
+      # （Task 3 修复）。UPDATE 与 DELETE 两项是 `apply-grants.sql` 里那条
+      # `REVOKE UPDATE, DELETE` 的两个方向，缺一不可（不变式 #5）。
+      #
+      # 修复轮 2 补上 DELETE：此前注释与报告都说「append-only 的 REVOKE 被这一步覆盖」，
+      # 而语句里只查了 UPDATE——那条 REVOKE 有两个动词，检查只有一个。DELETE 另有一层
+      # 兜着（集成套件的 append-only 用例在真容器上断言写入被拒），所以那是个**精度**
+      # 问题而不是漏洞；补第五个判据只花一行，换来的是注释与事实一致。
       - name: 运行期角色的权限事实（不变式 #5 / Ruling 1）
         env:
           MIGRATE_DATABASE_URL: postgresql://vca_owner:owner_pw@127.0.0.1:5432/vca
@@ -91,11 +98,12 @@ jobs:
             SELECT has_table_privilege('app_user','auth.users','SELECT'),
                    has_table_privilege('app_user','audit.audit_logs','INSERT'),
                    has_table_privilege('app_user','audit.audit_logs','UPDATE'),
+                   has_table_privilege('app_user','audit.audit_logs','DELETE'),
                    has_table_privilege('app_user','public._prisma_migrations','SELECT')")
-          echo "app_user: auth.users SELECT | audit_logs INSERT | audit_logs UPDATE | migrations SELECT = $actual"
-          if [ "$actual" != "t|t|f|f" ]; then
-            echo "::error::运行期角色权限不符合预期（期望 t|t|f|f）：$actual"
-            echo "::error::多半是引导顺序错了（授权跑在迁移之前 → 对空 schema 静默授予零个对象），或 append-only 的 REVOKE 被删。"
+          echo "app_user: auth.users SELECT | audit_logs INSERT | audit_logs UPDATE | audit_logs DELETE | migrations SELECT = $actual"
+          if [ "$actual" != "t|t|f|f|f" ]; then
+            echo "::error::运行期角色权限不符合预期（期望 t|t|f|f|f）：$actual"
+            echo "::error::多半是引导顺序错了（授权跑在迁移之前 → 对空 schema 静默授予零个对象），或 append-only 的 REVOKE UPDATE, DELETE 被删。"
             exit 1
           fi
 

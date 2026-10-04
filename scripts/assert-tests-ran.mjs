@@ -14,8 +14,14 @@
  * ## 做法
  *
  * 用 vitest 的 **json reporter** 把这次运行的结果写到临时文件，然后断言：
- *   1. 真的跑了测试（`numTotalTests` 不少于下面 `GATES` 里登记的下限）；
+ *   1. 真的**执行**了测试（条数不少于下面 `GATES` 里登记的下限）；
  *   2. 没有失败（退出码与 `success` 同时看）。
+ *
+ * 「执行」是字面意思：判据取 `numTotalTests - numPendingTests - numTodoTests`，**不是**
+ * `numTotalTests`。vitest 的 `numTotalTests` 把 `it.skip` / `it.todo` 也算进去，
+ * 于是「把一条安全用例改成 `it.skip`」会让门**照样绿**（修复轮 2 实测：49 条里 skip 掉
+ * 一条，`numTotalTests` 仍是 49）。那正是本文件开头那段话的反面——门看起来还在，
+ * 实际检查的东西少了一件。被跳过的条数会在下面的输出里显式报出来。
  *
  * 下限写成**具体数字**而不是 `> 0`：整数下限能同时抓住「整个 project 没了」与
  * 「某一个测试文件被静默删掉/改名」。数字与当前实际条数对齐，因此**任何**删除都会
@@ -129,30 +135,41 @@ try {
 
     const total = report.numTotalTests ?? 0;
     const passed = report.numPassedTests ?? 0;
-    if (total === 0) {
+    // 「收集到」不等于「执行了」：`it.skip` / `it.todo` 都计入 numTotalTests。减法而不是
+    // 直接用 numPassedTests，是为了让失败时能报出「收集了多少、跳过多少」这两项，
+    // 归因不必靠猜。（失败本身由下面的 success 分支负责，不会漏。）
+    const pending = (report.numPendingTests ?? 0) + (report.numTodoTests ?? 0);
+    const executed = total - pending;
+    if (executed === 0) {
       console.error(
-        `::error::${project}：一条用例都没跑起来（0 条）。门在这一刻是**空的**，` +
-          '命令不能算通过——最常见的原因是 include glob 或测试文件名被改过，' +
-          '或者 project 选择写错了。',
+        `::error::${project}：一条用例都没**执行**（收集到 ${total} 条，其中 ${pending} 条被 skip/todo）。` +
+          '门在这一刻是**空的**，命令不能算通过——最常见的原因是 include glob 或测试文件名被改过、' +
+          'project 选择写错了，或者整个文件被 skip 掉了。',
       );
       failed = true;
       continue;
     }
     if (run.failed || report.success !== true) {
-      console.error(`::error::${project}：用例未全部通过（${passed}/${total} 通过）${run.reason ?? ''}`);
+      console.error(
+        `::error::${project}：用例未全部通过（执行 ${executed} 条，通过 ${passed} 条）${run.reason ?? ''}`,
+      );
       failed = true;
       continue;
     }
-    if (total < floor) {
+    if (executed < floor) {
       console.error(
-        `::error::${project}：只跑了 ${total} 条用例，低于登记的 ${floor} 条。` +
-          '门被削弱了（文件被改名/删除？project 选择写错？）。若是有意为之，' +
+        `::error::${project}：只**执行**了 ${executed} 条用例，低于登记的 ${floor} 条` +
+          `（收集到 ${total} 条，其中 ${pending} 条被 skip/todo，不计入）。` +
+          '门被削弱了（文件被改名/删除？有用例被 skip 掉？project 选择写错？）。若是有意为之，' +
           '请下调 scripts/assert-tests-ran.mjs 的 GATES 并在提交信息里说明理由。',
       );
       failed = true;
       continue;
     }
-    console.log(`✔ ${project}：实际执行 ${total} 条用例（下限 ${floor}），全部通过。`);
+    console.log(
+      `✔ ${project}：实际执行 ${executed} 条用例（下限 ${floor}），全部通过。` +
+        (pending > 0 ? `另有 ${pending} 条被 skip/todo，**未**计入执行数。` : ''),
+    );
   }
 } finally {
   rmSync(workDir, { recursive: true, force: true });
