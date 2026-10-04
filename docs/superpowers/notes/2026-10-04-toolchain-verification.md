@@ -136,7 +136,14 @@ $argon2id$v=19$m=19456,t=2,p=1$...
 | 金额 `BigInt` | ✅ 往返为 `bigint`，无精度损失 |
 | 跨 schema join | ✅ 被拒（无关系定义即无法 join，符合「禁跨模块 join」） |
 | `SERIALIZABLE` + `SELECT ... FOR UPDATE` | ✅ 事务内行锁可用 |
-| 时间戳 | `TIMESTAMP(3)`（毫秒），符合「出价记录到毫秒」 |
+| 时间戳 | ⚠️ 见下方修订：**必须用 `@db.Timestamptz(3)`**，不能用裸 `TIMESTAMP(3)` |
+
+> **修订（Task 3 审查时发现，已回填）**：本行原记录为「`TIMESTAMP(3)`（毫秒），符合『出价记录到毫秒』」——**这是错的，已废弃**。
+>
+> 裸 `timestamp(3)` **不带时区**，PostgreSQL 会按**会话 `TimeZone`** 求值 `CURRENT_TIMESTAMP`，并据此转换带偏移的输入。因此在非 UTC 会话下，数据库默认值与 Prisma 自身的 `Date` 写入都会把**本地墙钟时间**存进一个无时区列——审计与账本的时间戳会静默错误。它此前「看起来没问题」，只是因为所用的 Postgres 镜像恰好默认 UTC。
+>
+> **正确做法（已作为全仓约定）：所有 `DateTime` 字段一律 `@db.Timestamptz(3)`**，从而存储的是**时刻**而非墙钟，毫秒精度不变，C6 的「所有时间戳为 UTC」才真正被强制而非仅仅被声明。另在 compose 的 Postgres 服务上设 `TZ=UTC` / `PGTZ=UTC` 作为纵深防御。此约定同样适用于 P2 的账本与 P4 的出价。
+
 
 ### 2.10 ⚠️ 关键安全发现：append-only 的 `REVOKE` 对表属主无效
 
