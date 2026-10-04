@@ -4,9 +4,14 @@
 -- ## 执行时机（硬性）
 --
 -- 本文件必须在 **`prisma migrate deploy` 之后**执行，由属主角色 `vca_owner` 运行。
--- 与角色层 `infra/db/roles.sql` 的分工见该文件顶部注释：那里只做「建角色 + 连接授权 +
--- `public` 的默认权限」，因为它在容器初始化时就跑，那时 `auth`/`audit`/`notify` 三个
--- schema 与所有表都还不存在。这里才做建表之后的授权。
+-- 与角色层 `infra/db/roles.sql` 的分工见该文件顶部注释：那里只做「建角色 + 连接授权」，
+-- 因为它在容器初始化时就跑，那时 `auth`/`audit`/`notify` 三个 schema 与所有表都还不存在。
+-- 这里才做建表之后的授权。
+--
+-- 另注：`roles.sql` 里**没有**任何 `public` schema 的默认权限。曾经有，但它会把
+-- `prisma migrate deploy` 事后建出的迁移台账 `public._prisma_migrations` 一并授予运行期
+-- 角色（实测 `has_table_privilege(app_user, ..., 'UPDATE'|'DELETE') = t`），故已删除；
+-- 原因与实测见该文件末尾的长注释。三个模块 schema 的默认权限只在本文件里施加。
 --
 -- ## 为什么必须重跑（不是保险动作）
 --

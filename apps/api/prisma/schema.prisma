@@ -1,6 +1,19 @@
 // Prisma 7 起 `datasource` 内**不允许**出现 `url`：连接串只在 `prisma.config.ts`
 // （迁移期，属主角色）与运行期 driver adapter（`PrismaService`，`app_user` 角色）里出现。
 // `multiSchema` 自 Prisma 7 已 GA，无需 `previewFeatures`。
+//
+// ── 时间戳的表示（C6，**后续所有模块必须沿用**）──────────────────────
+// 本仓库**每一个** `DateTime` 字段一律写 `@db.Timestamptz(3)`，即 PostgreSQL 的
+// `timestamptz`（timestamp **with** time zone）。这一条从本迁移起就是全仓约定，
+// P2 的账本、P4 的竞价等后续模块照抄，不要再出现裸的 `DateTime`。
+//
+// 为什么不能用 Prisma 的默认 `timestamp(3)`（without time zone）——实测与语义两条：
+//   * `CURRENT_TIMESTAMP` 与携带偏移量的输入都是**按会话 `TimeZone` 求值**的。裸
+//     `timestamp` 列不带时区，于是「数据库默认值」与「Prisma 写入的 Date」都会被折算成
+//     **本地墙上时间**存进去，UTC 只在会话恰好是 UTC 时才成立——今天绿只是因为镜像默认 UTC。
+//   * `timestamptz` 存的是绝对时刻（内部按 UTC 存），读回来时区语义明确，C6「全 UTC」才
+//     是可验证的而不是靠环境的巧合。
+// 另外 `infra/docker-compose.yml` 给 Postgres 显式设了 `TZ: UTC` 作纵深防御，本地与 CI 一致。
 generator client {
   provider = "prisma-client"
   output   = "../src/generated/prisma"
@@ -19,8 +32,8 @@ model User {
   passwordHash String?  @map("password_hash")
   role         String   @default("USER")
   creditScore  Int      @default(100) @map("credit_score")
-  createdAt    DateTime @default(now()) @map("created_at")
-  updatedAt    DateTime @updatedAt @map("updated_at")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   identities Identity[]
 
@@ -33,7 +46,7 @@ model Identity {
   userId     String   @map("user_id") @db.Uuid
   provider   String
   externalId String   @map("external_id")
-  createdAt  DateTime @default(now()) @map("created_at")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
 
   user User @relation(fields: [userId], references: [id])
 
@@ -53,7 +66,7 @@ model AuditLog {
   resourceId String?  @map("resource_id")
   traceId    String?  @map("trace_id")
   metadata   Json?
-  createdAt  DateTime @default(now()) @map("created_at")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
 
   @@index([actorId, createdAt])
   @@index([resource, resourceId])
@@ -67,8 +80,8 @@ model OutboxEvent {
   topic          String
   payload        Json
   idempotencyKey String    @unique @map("idempotency_key")
-  createdAt      DateTime  @default(now()) @map("created_at")
-  processedAt    DateTime? @map("processed_at")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  processedAt    DateTime? @map("processed_at") @db.Timestamptz(3)
   attempts       Int       @default(0)
   lastError      String?   @map("last_error")
 
@@ -82,7 +95,7 @@ model OutboxEvent {
 // Prisma 要求每个 model 至少有一个 `@id` 或 `@unique` 字段，此处标 `@id`。
 model ProcessedJob {
   idempotencyKey String   @id @map("idempotency_key")
-  processedAt    DateTime @default(now()) @map("processed_at")
+  processedAt    DateTime @default(now()) @map("processed_at") @db.Timestamptz(3)
 
   @@schema("notify")
   @@map("processed_jobs")

@@ -18,8 +18,10 @@
     "test:arch": "vitest run --project architecture --passWithNoTests",
     "arch": "depcruise --config .dependency-cruiser.cjs apps packages",
     "db:generate": "pnpm -r db:generate",
-    "db:up": "docker compose -f infra/docker-compose.yml up -d",
-    "db:down": "docker compose -f infra/docker-compose.yml down -v"
+    "db:up": "docker compose -f infra/docker-compose.yml up -d --wait",
+    "db:down": "docker compose -f infra/docker-compose.yml down -v",
+    "db:grants": "docker compose -f infra/docker-compose.yml exec -T postgres psql -v ON_ERROR_STOP=1 -U vca_owner -d vca -f /opt/vca/apply-grants.sql",
+    "db:setup": "pnpm db:up && pnpm --filter @vca/api db:migrate:deploy && pnpm db:grants"
   },
   "devDependencies": {
     "@types/node": "22.20.5",

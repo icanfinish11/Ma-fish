@@ -87,6 +87,59 @@ function toLoopback(host: string): string {
 }
 
 /**
+ * 以属主身份跑 `prisma migrate deploy`。
+ *
+ * ## 连接串从哪来
+ *
+ * `migrate deploy` 的连接串来自 `apps/api/prisma.config.ts` 的 `datasource.url`，
+ * 该值读 `MIGRATE_DATABASE_URL`——下面把它指向本次 testcontainer，而非本机 compose 的库。
+ *
+ * 刻意**不**加 `--url`：Prisma 7 的 `migrate deploy` 没有这个选项（`migrate dev` 才有），
+ * 传了会被当作未知参数、退化成打印 help 并以非零码退出（已实测）。归属由此只由
+ * `MIGRATE_DATABASE_URL` 决定，与 `infra/db/roles.sql`「先建角色」的顺序保持不变。
+ *
+ * ## 为什么输出要捕获而不是 `stdio: 'inherit'`
+ *
+ * 此前是 `inherit`，于是**每个**集成测试文件都会往控制台打十几行 `migrate deploy`
+ * 的输出；并行 project 交错在一起，既淹掉真正的测试结果，也让「哪一行属于哪个文件」
+ * 无法判断。现在正常路径**完全静默**，只有迁移真的失败时才把捕获到的 stdout/stderr
+ * 原样回放到 **stderr**（在抛错之前），失败诊断信息一个字都不少。
+ *
+ * `stdio` 必须**显式**写成三项：`execFileSync` 在未指定 `stdio` 时会把子进程的
+ * **stderr 直接透传到父进程的 stderr**（只设 `encoding` 不管用）——实测第一次改完仍会
+ * 漏出 `Loaded Prisma config from prisma.config.ts.` / `Prisma schema loaded from ...`
+ * 这两行（Prisma 把它们写在 stderr，其余写在 stdout）。`['ignore','pipe','pipe']`
+ * 才是「两个流都捕获」。
+ */
+function runMigrateDeploy(connectionString: string): void {
+  try {
+    execFileSync(
+      NODE_BIN,
+      [
+        PRISMA_CLI,
+        'migrate',
+        'deploy',
+        '--config',
+        'prisma.config.ts',
+        '--schema',
+        'prisma/schema.prisma',
+      ],
+      {
+        cwd: apiDir(),
+        env: { ...process.env, MIGRATE_DATABASE_URL: connectionString },
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+  } catch (err) {
+    const { stdout, stderr } = err as { stdout?: string; stderr?: string };
+    if (stdout) process.stderr.write(stdout);
+    if (stderr) process.stderr.write(stderr);
+    throw err;
+  }
+}
+
+/**
  * 启动真实 Postgres，跑 Prisma 迁移，再应用最小权限授权。
  */
 export async function startPostgres(): Promise<TestPg> {
@@ -106,29 +159,7 @@ export async function startPostgres(): Promise<TestPg> {
     await runSql(ownerUri, await readFile(ROLES_SQL, 'utf8'));
 
     // ② 跑迁移（属主身份）
-    // `migrate deploy` 的连接串来自 `apps/api/prisma.config.ts` 的 `datasource.url`，
-    // 该值读 `MIGRATE_DATABASE_URL`——下面把它指向本次 testcontainer，而非本机 compose 的库。
-    //
-    // 刻意**不**加 `--url`：Prisma 7 的 `migrate deploy` 没有这个选项（`migrate dev` 才有），
-    // 传了会被当作未知参数、退化成打印 help 并以非零码退出（已实测）。归属由此只由
-    // `MIGRATE_DATABASE_URL` 决定，与 `infra/db/roles.sql`「先建角色」的顺序保持不变。
-    execFileSync(
-      NODE_BIN,
-      [
-        PRISMA_CLI,
-        'migrate',
-        'deploy',
-        '--config',
-        'prisma.config.ts',
-        '--schema',
-        'prisma/schema.prisma',
-      ],
-      {
-        cwd: apiDir(),
-        env: { ...process.env, MIGRATE_DATABASE_URL: ownerUri },
-        stdio: 'inherit',
-      },
-    );
+    runMigrateDeploy(ownerUri);
 
     // ③ 迁移后重新授权（新表不会继承既有 GRANT；append-only 的 REVOKE 在此生效）
     await runSql(ownerUri, await readFile(APP_GRANTS_SQL, 'utf8'));

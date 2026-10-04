@@ -22,12 +22,15 @@
 --   2. 集成测试里 testcontainer 起来之后（`tests/helpers/db.ts`，`vca_owner` 身份）。
 --
 -- 两处都发生在 **`prisma migrate deploy` 之前**：此时 `auth`/`audit`/`notify` 三个 schema
--- 以及所有表都还不存在。所以这里**只允许**出现「建角色」「`GRANT CONNECT`」以及
--- **不指名任何尚不存在 schema** 的 `ALTER DEFAULT PRIVILEGES`。
+-- 以及所有表都还不存在。所以这里**只允许**出现「建角色」与「`GRANT CONNECT`」这类
+-- 与 schema/表无关的语句。
 -- 一旦在此写 `ALTER SCHEMA auth OWNER TO ...` 或 `GRANT ... ON ALL TABLES IN SCHEMA auth`，
 -- 容器初始化会直接报错（`ALL TABLES` 更糟：它会静默地授予零个对象，留下一个看起来
 -- 成功、实际没有任何授权的假象）。建表授权与 append-only 的 `GRANT`/`REVOKE` 全在
 -- `infra/db/apply-grants.sql`，由 `prisma migrate deploy` **之后**执行。
+--
+-- 这里也**不再**有 `ALTER DEFAULT PRIVILEGES ... IN SCHEMA public`：那不是「schema 不存在」
+-- 的问题，而是它会把迁移台账交给运行期角色。原因与实测见文件末尾的长注释。
 --
 -- ## 为什么迁移后必须重跑授权（不是可选项）
 --
@@ -53,9 +56,24 @@ $$;
 -- 运行期角色至少要能连上库；库级权限与 schema 级权限是两套独立判定，缺一不可。
 GRANT CONNECT ON DATABASE vca TO app_user;
 
--- 未来由 `vca_owner` 在 `public` schema 里新建的表，自动沿用同样的默认权限。
--- `public` 是 PostgreSQL 自带 schema，此刻必然存在，因此这条在本文件的两个执行时机都安全；
--- 而 `auth`/`audit`/`notify` 的默认权限要等迁移建出 schema 之后才能施加，
--- 故它们与各自的表级 `GRANT`/`REVOKE` 一起放在 `apply-grants.sql`。
-ALTER DEFAULT PRIVILEGES FOR ROLE vca_owner IN SCHEMA public
-  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_user;
+-- ════════════════════════════════════════════════════════════════════════════
+-- 这里**刻意不再有** `ALTER DEFAULT PRIVILEGES ... IN SCHEMA public`。
+--
+-- 曾经的写法是 `FOR ROLE vca_owner IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE
+-- ON TABLES TO app_user`，理由是「public 是 PostgreSQL 自带 schema，此刻必然存在」。
+-- 那个理由本身没错，但**后果被漏掉了**：默认权限作用于「此后**任何**由 vca_owner 在
+-- public 里新建的表」，而 `prisma migrate deploy`（以 vca_owner 身份运行）恰恰在容器
+-- 初始化**之后**才建出迁移台账 `public._prisma_migrations`。于是这条默认权限把
+-- **迁移历史**一并交给了最小权限的运行期角色。
+--
+-- 已在真实 postgres:16-alpine 上实测到该后果（修复前的取证）：
+--   relacl = {vca_owner=arwdDxt/vca_owner,app_user=arwd/vca_owner}
+--   has_table_privilege('app_user','public._prisma_migrations','UPDATE') = t
+--   has_table_privilege('app_user','public._prisma_migrations','DELETE') = t
+-- 即运行期角色可以改写或抹掉迁移历史——而它**从未**被 brief 或任何 ruling 要求过。
+--
+-- 应用真正需要的一切都在 `auth`/`audit`/`notify` 三个模块 schema 里，`public` 里没有任何
+-- 属于应用的表（迁移台账是 Prisma 的内部结构，应用不该碰）。所以：把 public 的默认权限
+-- 整段删掉，运行期角色在 public 上不留任何表级权限。三个模块 schema 的默认权限仍在
+-- `apply-grants.sql` 里按模块分别施加（那里本来就覆盖了，删掉这条零损失）。
+-- ════════════════════════════════════════════════════════════════════════════

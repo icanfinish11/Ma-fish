@@ -13,10 +13,14 @@
   // 把它排除在外，而 `pnpm -r typecheck` 也不会去检查包根部的文件。它承载的是
   // **迁移属主连接串**这一安全边界（C7），拼错字段或写错角色名只会在迁移时以运行期
   // 错误暴露，正是本文件当初要关掉的那类缺口。
+  //
+  // `vitest.setup.ts`（根级 `globalSetup`）同理：`vitest.config.ts` 里的字符串
+  // `'./vitest.setup.ts'` **不构成** TypeScript 的程序纳入关系，它此前不被任何 tsconfig
+  // 覆盖。它一旦有编译错误（例如 import 路径写错），表现是所有测试项目都起不来。
   "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "types": ["node"],
     "noEmit": true
   },
-  "include": ["vitest.config.ts", "apps/api/prisma.config.ts"]
+  "include": ["vitest.config.ts", "vitest.setup.ts", "apps/api/prisma.config.ts"]
 }

@@ -10,6 +10,12 @@ services:
       POSTGRES_USER: vca_owner
       POSTGRES_PASSWORD: 'owner_pw'
       POSTGRES_DB: vca
+      # C6（全 UTC）的纵深防御：显式把容器与会话时区钉在 UTC，使本地开发与 CI 一致。
+      # 真正的保障在列类型上——所有时间戳列都是 `timestamptz`（见 schema.prisma 顶部注释），
+      # 已经存绝对时刻；这里只是让「万一有裸 timestamp 或依赖 CURRENT_TIMESTAMP 的语句」
+      # 也不会因为镜像默认时区不同而产生行为分叉。
+      TZ: UTC
+      PGTZ: UTC
     ports: ['5432:5432']
     volumes:
       # 只在**数据卷为空**的首次启动执行一次（docker-entrypoint-initdb.d 的语义）。
@@ -19,6 +25,10 @@ services:
       # 授予零个对象）。建表权限与 append-only 的 GRANT/REVOKE 在迁移之后由
       # `infra/db/apply-grants.sql` 施加。
       - ./db/roles.sql:/docker-entrypoint-initdb.d/10-roles.sql:ro
+      # 迁移后的授权脚本。它**不能**放进 `docker-entrypoint-initdb.d`（那时表还不存在），
+      # 而是由根脚本 `pnpm db:grants` 在 `prisma migrate deploy` 之后从容器里执行；
+      # 挂进来只是为了让那一步在 Windows 与 Linux 上都不依赖宿主的 psql 客户端。
+      - ./db/apply-grants.sql:/opt/vca/apply-grants.sql:ro
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U vca_owner -d vca']
       interval: 5s

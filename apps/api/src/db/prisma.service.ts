@@ -32,7 +32,12 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
 
   async onModuleInit(): Promise<void> {
     await this.$connect();
-    this.logger.log('数据库已连接');
+    // 措辞刻意保守：`$connect()` 只是**初始化连接池**，它并不触碰数据库
+    // （惰性建连，连接串指向一个不存在的库时这里照样不报错——已实测）。
+    // 所以这里能诚实宣称的只有「客户端已就绪」，不是「数据库已连接」。
+    // 真正的探活属于后续模块的健康检查端点，且**不放在这里**：
+    // 应用启动测试本就允许在没有数据库的情况下起服务，加 `SELECT 1` 会把它们打红。
+    this.logger.log('Prisma 客户端已初始化');
   }
 
   async onModuleDestroy(): Promise<void> {

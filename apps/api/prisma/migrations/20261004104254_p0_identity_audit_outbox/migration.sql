@@ -14,8 +14,8 @@ CREATE TABLE "auth"."users" (
     "password_hash" TEXT,
     "role" TEXT NOT NULL DEFAULT 'USER',
     "credit_score" INTEGER NOT NULL DEFAULT 100,
-    "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updated_at" TIMESTAMP(3) NOT NULL,
+    "created_at" TIMESTAMPTZ(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updated_at" TIMESTAMPTZ(3) NOT NULL,
 
     CONSTRAINT "users_pkey" PRIMARY KEY ("id")
 );
@@ -26,7 +26,7 @@ CREATE TABLE "auth"."identities" (
     "user_id" UUID NOT NULL,
     "provider" TEXT NOT NULL,
     "external_id" TEXT NOT NULL,
-    "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "created_at" TIMESTAMPTZ(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "identities_pkey" PRIMARY KEY ("id")
 );
@@ -40,7 +40,7 @@ CREATE TABLE "audit"."audit_logs" (
     "resource_id" TEXT,
     "trace_id" TEXT,
     "metadata" JSONB,
-    "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "created_at" TIMESTAMPTZ(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "audit_logs_pkey" PRIMARY KEY ("id")
 );
@@ -51,8 +51,8 @@ CREATE TABLE "notify"."outbox_events" (
     "topic" TEXT NOT NULL,
     "payload" JSONB NOT NULL,
     "idempotency_key" TEXT NOT NULL,
-    "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "processed_at" TIMESTAMP(3),
+    "created_at" TIMESTAMPTZ(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "processed_at" TIMESTAMPTZ(3),
     "attempts" INTEGER NOT NULL DEFAULT 0,
     "last_error" TEXT,
 
@@ -62,7 +62,7 @@ CREATE TABLE "notify"."outbox_events" (
 -- CreateTable
 CREATE TABLE "notify"."processed_jobs" (
     "idempotency_key" TEXT NOT NULL,
-    "processed_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "processed_at" TIMESTAMPTZ(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "processed_jobs_pkey" PRIMARY KEY ("idempotency_key")
 );

@@ -13,3 +13,15 @@ allowBuilds:
   cpu-features: false
   protobufjs: false
   ssh2: false
+
+# 强制 `testcontainers` 解析到 12.0.4。
+#
+# 为什么必须用 override 而不是只在 tests/package.json 里写版本：`@testcontainers/postgresql@12.0.4`
+# 自己声明的是 `testcontainers: ^12.0.4`，而 **12.1.0 起**该包声明 `engines.node >= 22.22`，
+# 高于本仓库的 `engines.node: >=22.19.0`。只钉直接依赖时，pnpm 仍会把**实际被 import 的那一份**
+# 解析到 12.2.0（已实测：lockfile 里 `@testcontainers/postgresql@12.0.4 → testcontainers: 12.2.0`），
+# 于是声明与实际执行的不是同一个版本，engine 不一致照样存在。
+# 另注：pnpm 11 起 `package.json` 的 `pnpm.overrides` 不再被读取（实测会打印
+# `The "pnpm" field in package.json is no longer read by pnpm`），override 只在此处生效。
+overrides:
+  testcontainers: 12.0.4
