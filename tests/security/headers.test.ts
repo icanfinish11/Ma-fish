@@ -21,8 +21,8 @@ interface NonceProbeBody {
  * 共用的那个安装点里。照抄一份 `helmet(...)` 到测试里，测的就只是「helmet 这个库
  * 会不会设头」，与「我们的应用有没有装它、装在哪一步」完全无关——那正是 Task 7
  * 要防的假绿（brief 的 `createSecureTestApp` 若与生产接线漂移，本文件会全绿而线上裸奔）。
- * 因此这里只调 `createTestApp({ withSecurity: true })`，它内部调的是**生产那个**
- * `applySecurityMiddleware`。
+ * 因此这里只调 `createTestApp(...)`，它内部调的是**生产那个**
+ * `applySecurityMiddleware`（修复轮 3 起**无条件**安装，没有开关可关）。
  *
  * ## nonce 的**两处**落点都要断言
  *
@@ -82,7 +82,6 @@ describe('安全响应头与 CSP（威胁 #9 / 验收 13.2）', () => {
     // 一次性 Redis（见文件头）：桶从这个容器开始，跨运行不累积。
     redis = await startTestRedis();
     app = await createTestApp({
-      withSecurity: true,
       extraModules: [NonceProbeModule],
       overrides: [(b) => b.overrideProvider(REDIS).useValue(redis.newClient())],
     });

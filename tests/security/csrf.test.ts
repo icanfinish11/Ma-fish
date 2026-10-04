@@ -78,7 +78,6 @@ describe('CSRF 双提交令牌（威胁 #10 / C13）', () => {
   beforeAll(async () => {
     redis = await startTestRedis();
     app = await createTestApp({
-      withSecurity: true,
       overrides: [(b) => b.overrideProvider(REDIS).useValue(redis.newClient())],
     });
   }, 180_000);
@@ -192,7 +191,6 @@ describe('CSRF：令牌下发与放行（C13 的另一半）', () => {
     // 共用容器时只有 1 次余量，任何新用例都会以 429 的形式莫名其妙地红。
     redis = await startTestRedis();
     app = await createTestApp({
-      withSecurity: true,
       // `overrideProvider` 必须在 `compile()` 之前：`createTestApp` 内部顺序已是如此。
       overrides: [
         (builder) => builder.overrideProvider(AuthService).useValue(stubAuth),

@@ -12,9 +12,11 @@ import { nonceHelmetMiddleware } from './headers.js';
  * 评审点名过的形态（另一处测试文件里出现过第二套引导）：抄件与真件迟早漂移，
  * 而漂移的方向总是「测试里装了、生产里没装」，于是安全断言全绿而线上什么都没有。
  *
- * 所以这里只留**一个**函数：`main.ts` 的引导与 `tests/helpers/app.ts` 的
- * `withSecurity` 选项都调它。两处唯一的差别是 `isProduction` 的取值
- * （生产读 `NODE_ENV`，测试恒为 `false`），而这个差别是**显式入参**，不是抄件的自由发挥。
+ * 所以这里只留**一个**函数：`main.ts` 的引导与 `tests/helpers/app.ts` 都调它。
+ * 两处唯一的差别是 `isProduction` 的取值（生产读 `NODE_ENV`，测试恒为 `false`），
+ * 而这个差别是**显式入参**，不是抄件的自由发挥。
+ * 测试助手侧**没有开关**：`createTestApp` 无条件装这条栈（修复轮 3 删掉了那个
+ * 「关掉就什么都不装」的 `withSecurity` 选项——它的失效形态是静默地没有 cookie-parser）。
  *
  * ## 顺序是承重的
  *

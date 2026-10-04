@@ -113,6 +113,15 @@ describe('引导期（Ruling 3）', () => {
       enableShutdownHooks: () => order.push('enableShutdownHooks'),
       listen: () => {
         order.push('listen');
+        // **`listen` 自己把接线补上**（修复轮 3 补）：这样「接线排在 listen 之后」的
+        // 实现也会把 `useLogger` / `use` / `set` 记进 `order`，下面那两条 `lessThan`
+        // 才有东西可比、才真的会红。否则（不记账的话）接线落在 `listen` 之后时
+        // `indexOf('useLogger')` 是 -1，而 `-1 < indexOf('listen')` 恰好为真——
+        // 一条**恒真**的顺序断言（本仓库已经抓到过这种形状）。
+        // 真实机制见 `configureApp`：缓冲的启动日志是在 `listen() → init()` 里被
+        // **当时那个 logger** 冲出去的，因此接线晚于 `listen` 就是「那批日志由
+        // 默认 ConsoleLogger 写出去、绕过 pino」。
+        order.push('useLogger', 'use', 'set', 'enableShutdownHooks');
         return Promise.reject(boom);
       },
       close: () => {
@@ -130,17 +139,21 @@ describe('引导期（Ruling 3）', () => {
       exit,
     });
 
-    expect(order, '失败路径的顺序必须是 接线 → listen → close → exit').toEqual([
-      'useLogger',
-      // 安全栈的两条中间件：nonce+helmet 与 cookie-parser。
-      'use',
-      'use',
-      'set',
-      'enableShutdownHooks',
-      'listen',
-      'close',
-      'exit:1',
-    ]);
+    // **顺序**断言（修复轮 3 改正）：原来这里把整个数组**逐字**钉死（`use, use, set, …`），
+    // 于是任何一次无关的中间件增删都会让这条用例变红——那是**过度指定**，
+    // 而它并不比下面两条关系断言多证明什么。真正承重的关系只有两条：
+    //   1. 接线（`useLogger` / 安全栈 / `set` / `enableShutdownHooks`）都在 `listen` **之前**
+    //      ——反了的话 `useLogger` 接不住 `init()` 冲出来的缓冲启动日志（见 `configureApp`）；
+    //   2. `close` 在 `exit` **之前** ——反过来的话连接会被直接晾掉，而「进程确实退出了」
+    //      这条观测看不出这个差别（子进程用例也看不出）。
+    const idx = (label: string): number => order.indexOf(label);
+    expect(idx('listen'), 'listen 没有被调用').toBeGreaterThanOrEqual(0);
+    expect(idx('useLogger'), 'useLogger 必须排在 listen 之前').toBeLessThan(idx('listen'));
+    expect(idx('use'), '安全中间件栈必须排在 listen 之前').toBeLessThan(idx('listen'));
+    expect(idx('set'), 'trust proxy 必须排在 listen 之前').toBeLessThan(idx('listen'));
+    expect(idx('enableShutdownHooks'), '关停钩子必须排在 listen 之前').toBeLessThan(idx('listen'));
+    expect(idx('close'), 'close 必须排在 exit 之前').toBeLessThan(idx('exit:1'));
+    expect(order.at(-1), '失败路径的最后一步必须是 exit').toBe('exit:1');
     expect(logged, '引导失败没有写任何日志').toHaveLength(1);
     // **原始错误对象**（同一个引用）必须被带进日志：pino 的 `err` 序列化器会输出
     // name/message/stack。若实现写成 `String(error)` 或只记一句「引导失败」，
@@ -183,6 +196,60 @@ describe('引导期（Ruling 3）', () => {
     expect(exit, '关停挂住时没有退出：这正是修复要消灭的「永远活着」').toHaveBeenCalledWith(1);
   });
 
+  it('接线自己抛错时，已建好的应用同样被关掉（句柄在接线**之前**就交出去了）', async () => {
+    // 修复轮 3 补的缺口：修复轮 2 把 `onReady` 放在 `listen()` 之前，但仍在 `configureApp`
+    // **之后**。于是「接线抛错」这条路径上 `bootstrap()` 的返回值同样不会产生，
+    // `closeQuietly` 拿到 `undefined` 直接返回——**`close()` 一次都没跑**，
+    // 而 `RedisModule` 的 ioredis socket 早就建好了。它与修复轮 2 修掉的那个
+    // 「`listen()` 失败时拿不到句柄」是同一个形状，只是触发点更早、更不容易被注意到。
+    //
+    // 这里让 `app.get()` 抛：`configureApp` 的第一步就是 `app.get(PinoLogger)`，
+    // 因此这正是「接线自己抛错」的最小形态。`set` / `enableShutdownHooks` / `listen`
+    // 一次都不该被调用（接线在第一行就断了），而 `close` 必须被调用。
+    const order: string[] = [];
+    const boom = new Error('接线失败：取不到 PinoLogger');
+    const app = {
+      get: () => {
+        order.push('get');
+        throw boom;
+      },
+      useLogger: () => order.push('useLogger'),
+      use: () => order.push('use'),
+      set: () => order.push('set'),
+      enableShutdownHooks: () => order.push('enableShutdownHooks'),
+      listen: () => {
+        order.push('listen');
+        return Promise.resolve();
+      },
+      close: () => {
+        order.push('close');
+        return Promise.resolve();
+      },
+    };
+    const logged: Array<{ obj: unknown; msg: unknown }> = [];
+    const logger: BootstrapLogger = {
+      error: (obj: unknown, msg?: string) => {
+        logged.push({ obj, msg });
+      },
+      flush: () => undefined,
+    };
+    const exit = vi.fn((code: number) => {
+      order.push(`exit:${code}`);
+    });
+
+    await runBootstrap({
+      createApp: () => Promise.resolve(app as never),
+      logger,
+      exit,
+    });
+
+    expect(order, '接线抛错时应用没有被关掉：连接会被直接晾在那里').toContain('close');
+    expect(order.indexOf('close'), 'close 必须发生在 exit 之前').toBeLessThan(order.indexOf('exit:1'));
+    expect(order, '接线已经抛错，listen 不该被调用').not.toContain('listen');
+    expect((logged[0]?.obj as { err?: unknown } | undefined)?.err, '原始错误对象没有被记下来').toBe(boom);
+    expect(exit, '接线抛错后必须请求以码 1 退出').toHaveBeenCalledWith(1);
+  });
+
   it('真实引导路径：安全头到位、trust proxy 就位、Nest 框架 logger 接进 pino', async () => {
     process.env.PORT = '0'; // 随机端口：不占用固定端口，也不与开发者本机的服务抢
     const app = await bootstrap();
@@ -223,7 +290,19 @@ describe('引导期（Ruling 3）', () => {
  * 形态刻意与生产一致：
  * 1. spawn `apps/api/dist/main.js`（`pnpm start` 的同一个文件）；
  * 2. 端口先被**本进程**占住，且占用面与 Node 默认的 `http.listen(port)` 一致；
- * 3. 只断言「子进程在限时内自己退出，且退出码非零」。
+ * 3. 断言「子进程在限时内自己退出，且退出码非零」，**并且**（修复轮 3 补）
+ *    它的输出证明这次失败**确实是**那个端口冲突。
+ *
+ * ## 为什么 `NODE_ENV` 是 `production`（修复轮 3 改正）
+ *
+ * 原来是 `test`。而 `buildLoggerOptions` 在 `NODE_ENV === 'test'` 时把 pino 的 level 设为
+ * `'silent'` —— pino 会把六个日志方法整体换成 noop，于是退出路径的
+ * `logger.error({ err })` **一个字节都不写**（实测子进程 stdout / stderr 都是 0 字节）。
+ * 那样「断言失败确为端口冲突」就没有任何材料可用，失败时也留不下诊断。
+ * 换成 `production` 后实测子进程写出 5411 字节 JSON，其中原样带着
+ * `"err":{"code":"EADDRINUSE","syscall":"listen","address":"::","port":<port>}`。
+ * 这不改变要观测的东西：失败点是 `listen()`，进程从未服务过请求，`isProduction`
+ * 带出的 HSTS / secure cookie 没有机会生效；env 校验是**同一份** schema，不按环境分叉。
  *
  * ## 为什么占用面必须是 `::` 而不是 `0.0.0.0`（实测踩到过）
  *
@@ -232,6 +311,7 @@ describe('引导期（Ruling 3）', () => {
  * （`http.listening=true address={"address":"::","port":…}`）——于是用例会安静地
  * 测到成功路径上，变成一条恒真断言。占 `::` 才真正制造 EADDRINUSE
  * （实测 `code=EADDRINUSE message=listen EADDRINUSE: address already in use :::PORT`）。
+ * 这条实测同时是**归属断言**能成立的前提：没有真的 EADDRINUSE，输出里那句就无从谈起。
  *
  * ## 为什么子进程的 `REDIS_URL` 指向一个**死端口**
  *
@@ -271,15 +351,32 @@ describe('引导失败必须真的终止进程（修复轮 2 / Fix 1）', () => 
         cwd: APP_DIR,
         env: {
           ...process.env,
-          NODE_ENV: 'test',
+          // **生产**（修复轮 3 改正，此前是 `test`）：`buildLoggerOptions` 在 `NODE_ENV === 'test'`
+          // 时把 pino 的 level 设为 `'silent'`（六个方法整体换成 noop），于是退出路径
+          // `logger.error({ err })` **一个字节都不写**——实测子进程 stdout/stderr 均为 0 字节。
+          // 那样「断言失败确为端口冲突」根本无从谈起（这正是评审说的「诊断为空」）。
+          // 换到 `production` 后同一条路径实测写出 5411 字节 JSON，其中
+          // `"err":{"code":"EADDRINUSE","syscall":"listen","address":"::","port":<port>}`
+          // 原样可读（探针：evidence/t7-fix3-child-output-probe.mjs 与 t7-fix3-child-output.txt）。
+          //
+          // 这不改变用例要观测的东西：失败点仍是 `listen()`，进程**从未服务过任何请求**，
+          // 因此 `isProduction` 带出的 HSTS / secure cookie 没有任何机会生效；
+          // env 校验这套 schema 在生产与测试下是**同一份**（env.schema.ts 不按环境分叉），
+          // 而这里照样显式给出 `REDIS_URL`（指向死端口）。
+          NODE_ENV: 'production',
           PORT: String(port),
           // 死端口：让 ioredis 的重连定时器成为「把事件循环撑住」的那个句柄（见上）。
           REDIS_URL: 'redis://127.0.0.1:6399',
         },
-        stdio: ['ignore', 'ignore', 'pipe'],
+        // stdout 也接管（修复轮 3）：pino 写 fd 1，原来那句 `'ignore'` 把唯一的诊断丢掉了。
+        stdio: ['ignore', 'pipe', 'pipe'],
       });
 
+      let stdout = '';
       let stderr = '';
+      child.stdout.on('data', (chunk: Buffer) => {
+        stdout += String(chunk);
+      });
       child.stderr.on('data', (chunk: Buffer) => {
         stderr += String(chunk);
       });
@@ -299,10 +396,25 @@ describe('引导失败必须真的终止进程（修复轮 2 / Fix 1）', () => 
       expect(
         outcome.signal,
         `子进程在 ${CHILD_EXIT_TIMEOUT_MS}ms 内没有退出（被父进程 SIGKILL）：` +
-          '引导失败后进程仍然活着——编排系统会把它当成健康容器。stderr 末段：' +
+          '引导失败后进程仍然活着——编排系统会把它当成健康容器。stdout 末段：' +
+          stdout.slice(-600) +
+          ' / stderr 末段：' +
           stderr.slice(-600),
       ).toBeNull();
       expect(outcome.code, `子进程退出码必须是 1（非零），实际 ${String(outcome.code)}`).toBe(1);
+
+      // **归属断言**（修复轮 3 新增）：上面那条 `code === 1` 只说明「它退出了」，
+      // 任何一个别的启动期失败（env 校验不过、模块加载失败、Redis 抛错…）都能让它以 1 退出。
+      // 既然这条用例的**前提**是「端口被占」，就必须证明失败**确实是那个端口冲突**，
+      // 否则它可能在一条与 Fix 1 无关的失败路径上保持常绿。
+      const evidence = `${stdout}\n${stderr}`;
+      expect(
+        evidence,
+        `子进程的输出里没有 EADDRINUSE（端口被占的失败形态）：退出码 1 可能来自别的启动期失败。` +
+          `stdout=${JSON.stringify(stdout.slice(0, 400))} stderr=${JSON.stringify(stderr.slice(0, 400))}`,
+      ).toContain('EADDRINUSE');
+      expect(evidence, `子进程报的端口冲突不是我们占住的那个（${port}）`).toContain(String(port));
+      expect(evidence).toContain('应用引导失败');
     } finally {
       holder.close();
     }

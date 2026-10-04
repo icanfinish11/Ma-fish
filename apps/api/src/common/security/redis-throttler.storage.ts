@@ -83,18 +83,31 @@ export interface ThrottleRecord {
  * - 集合在 `ttl` 内最多留下 `limit + 1` 个成员（超限即进封锁、封锁期间不再入账），
  *   因此内存占用有界。
  *
- * 与库的内存实现（`throttler.service.js`）的关系**逐条**如下（不再声称"等价"）：
+ * 与库的内存实现（`throttler.service.js`，6.7.1）的关系**逐条**如下（不再声称"等价"）：
  *
- * 1. **窗口**：内存实现按**每个命中的 `expiresAt = now + ttl`** 剪枝
- *    （`evictIdleRecords` 与 `getRecord` 里逐条比较），也就是滚动窗口。
+ * 1. **窗口**：内存实现把每次命中的过期时刻逐条记在 `hitExpirations` 里
+ *    （`fireHitCount` 推入 `Date.now() + ttl`），每次 `increment` 先用
+ *    `pruneExpiredHits` 按 `expiresAt > now` 过滤，也就是滚动窗口。
  *    本实现同为滚动窗口——这一条现在**真的**对上了（上一版的固定窗口是对不上的）。
  *    边界取 `score <= now - ttl` 即出窗（左闭右开，时长恰好 `ttl`）。
+ *    计数与**键的寿命**是两件不同的事，修复轮 3 才把后者改正（见下条与文件末段）；
+ *    修好之后，连「桶什么时候才能被回收」这一条也对上了：内存实现的
+ *    `evictIdleRecords` 用 `hasLiveHits`（任一命中未过期就不删记录）拦住回收，
+ *    本实现则把寿命设到**最新**命中的出窗时刻。
+ *
  * 2. **封锁**：`blockDuration > 0` 时，**第 limit+1 次**命中把记录置为封锁，
  *    封锁到 `now + blockDuration`。封锁期间**不再累加命中**（也不写入有序集合），
  *    因此反复敲门不会把窗口推后（这正是「封锁」与「计数」的区别）。
  *    被拒的那次命中**不入账**：入了的话「每分钟敲一次、每次都被拒」会让窗口
  *    永远有成员（每次都把最老的那条挤在 `ttl` 内）⇒ 实际效果是**永久封锁**，
  *    而那正是本仓库在 `throttler-storage.test.ts` 里专门钉住的反面。
+ *
+ * 2. **封锁期间的报告值**（修复轮 3 补记，此前漏了）：内存实现封锁期间
+ *    `totalHits` 停在「进入封锁时那个数」不动，直到封锁到期才 `resetBlockedRequest()`
+ *    清零；本实现报告的是「当前窗口内命中数 + 本次敲门」，而窗口里的命中会**继续**
+ *    随时间出窗 ⇒ 长时间封锁下这个数会**衰减**（趋向 1），内存实现则是恒定的。
+ *    据实记录：它**不影响**放行/拒绝的判定（封锁期间一律 429），只影响
+ *    `X-RateLimit-Remaining-<层名>` 这个展示值；本轮**没有**为它改结构。
  * 3. **封锁到期**：清空窗口并重新开始，当前这次请求算作第 1 次命中
  *    （内存实现在 `timeToBlockExpire <= 0 && isBlocked` 分支里 `resetBlockedRequest()` 后
  *    立刻 `fireHitCount()`）。**据实记录的差异**：本实现在这里**无条件清空**
@@ -109,7 +122,13 @@ export interface ThrottleRecord {
  *    `timeToExpire` 在滚动窗口下的含义是「**最老的那次命中**出窗还有多久」——
  *    也就是「下一次可能有额度空出来」的秒数，这与 `X-RateLimit-Reset` 的用法一致；
  *    窗口为空时退回封锁剩余（没有任何命中时它是唯一有意义的时刻）。
- * 6. 键的身份是 `(key, throttlerName)`——内存实现按这两个维度做二维 Map，
+ * 6. **`timeToExpire` 与内存实现的差异**（修复轮 3 补记）：内存实现那个值是
+ *    **记录级**的（`increment` 里 `getExpirationTime(key)` = `record.expiresAt - now`，
+ *    而 `expiresAt` 只在记录新建或到期时重设为 `now + ttl`），本实现则是
+ *    「最老命中出窗还有多久」——**逐命中**的滚动量。两者都是「下一次可能有额度空出来」
+ *    的单调上界，在「窗口内一直有命中」的稳态下近似一致，但**不是同一个量**；
+ *    本实现的取值对客户端更保守（不会比真实空出时刻更早）。据实记录，不改。
+ * 7. 键的身份是 `(key, throttlerName)`——内存实现按这两个维度做二维 Map，
  *    因此这里把层名编进 Redis 键，而不是只依赖 `key`。
  *
  * ## 时间取的是 **Redis 服务器**的时钟（`redis.call('TIME')`）
@@ -120,12 +139,25 @@ export interface ThrottleRecord {
  * 依赖这一点的前提是 Redis ≥ 5（effects replication），
  * `infra/docker-compose.yml` 固定 `redis:7-alpine`，与之相符。
  *
- * ## 过期与回收
+ * ## 过期与回收：**计数**逐命中过期，**键的寿命**按最新命中算（修复轮 3 改正）
  *
- * 每次写入都重设**两个键**（记录键与它旁边的有序集合）的 `PEXPIRE` 到
- * `max(最老命中 + ttl, 封锁结束) - now`：记录一旦不再需要就被 Redis 自己回收，
- * 不会像「永不 EXPIRE 的计数器」那样把一个桶永久留在库里
- * （内存实现里对应的是它的 `evictIdleRecords` 扫描）。
+ * 两件事必须分开看，上一版把它们当成了一件（这正是修复轮 3 的缺陷）：
+ *
+ * 1. **计数**只认还在 `ttl` 之内的命中——每次 `increment` 用 `ZREMRANGEBYSCORE` 剪掉出窗成员。
+ *    这一条修复轮 2 就是对的。
+ * 2. **键的寿命**必须让桶活过**它自己装着的每一个命中**，因此取**最**新命中的出窗时刻：
+ *    `PEXPIRE` 到 `max(最新命中 + ttl, 封锁结束) - now`（两个键都设）。
+ *    上一版取的是**最老**命中：最老那条一出窗，Redis 就删掉整个桶，**仍在 `ttl` 内的新命中
+ *    被一起丢掉**，计数于是在 `X-RateLimit-Reset-<层名>` 昭告的那个时刻重新从零开始——
+ *    而那个头正是客户端读一眼就能对齐的东西。方向是**放宽**：本该继续算数的命中被遗忘。
+ *    判别性用例：`throttler-storage.test.ts` 的「空转越过最老命中：仍在 `ttl` 内的命中不许
+ *    被一起丢掉」（把寿命改回最老命中 ⇒ 立刻变红）。
+ *
+ * 而**返回**给调用方的 `timeToExpire` 仍然取最老命中（见上方注释第 5 条）：
+ * 那是「下一次可能有额度空出来」的时刻，也是唯一适合放进 `X-RateLimit-Reset` 的量。
+ * 寿命比它长是**应该的**——存储多留一会儿只会让计数更准，不会误伤任何请求；
+ * 反过来（寿命短于它）才会丢掉真实的命中。
+ *
  * 两个键都设是**承重**的：修复轮 2 把计数搬进有序集合时漏掉了记录键，
  * 它立刻变成永不过期（`PTTL` 回 -1），被 `rate-limit.test.ts` 的既有断言当场抓到。
  */
@@ -197,14 +229,28 @@ end
 
 redis.call('HSET', key, 'blockedUntil', blockedUntil)
 
--- 记录的寿命 = max(最老命中的出窗时刻, 封锁结束) - now，至少 1ms。
-local oldest = redis.call('ZRANGE', key .. ':hits', 0, 0, 'WITHSCORES')
-local windowEndsAt = now
-if oldest[2] then
-  windowEndsAt = tonumber(oldest[2]) + ttl
+-- 记录/集合的寿命 = max(最**新**命中的出窗时刻, 封锁结束) - now，至少 1ms。
+-- 修复轮 3 改正（此前取的是最**老**命中）：寿命必须让桶活过它**自己装着的每一个命中**。
+-- 取最老命中时，最老那条一出窗 Redis 就把整个桶删掉，把仍在 ttl 内的新命中一起丢掉，
+-- 于是计数在**告诉客户端**的那个 X-RateLimit-Reset-<层名> 时刻重新从零开始——方向是放宽
+-- （一条本该继续算数的命中被遗忘），也就是「贴着重置时刻回来」即可多拿额度。
+-- 判别性用例：throttler-storage.test.ts 的「空转越过最老命中…」。
+local newest = redis.call('ZRANGE', key .. ':hits', -1, -1, 'WITHSCORES')
+local newestExpiresAt = now
+if newest[2] then
+  newestExpiresAt = tonumber(newest[2]) + ttl
 end
 
-local expiresIn = math.max(windowEndsAt, blockedUntil) - now
+-- 报给调用方的窗口结束时刻仍然取**最老**命中（返回值的第二个元素就是它）：
+-- 滚动窗口下它的含义是「下一次可能有额度空出来」，与 X-RateLimit-Reset 的用法一致
+-- （见上方注释第 5 条）。寿命与它**故意**不是同一个量。
+local reportedExpiresAt = newestExpiresAt
+local oldest = redis.call('ZRANGE', key .. ':hits', 0, 0, 'WITHSCORES')
+if oldest[2] then
+  reportedExpiresAt = tonumber(oldest[2]) + ttl
+end
+
+local expiresIn = math.max(newestExpiresAt, blockedUntil) - now
 if expiresIn < 1 then
   expiresIn = 1
 end
@@ -214,7 +260,7 @@ end
 redis.call('PEXPIRE', key, expiresIn)
 redis.call('PEXPIRE', key .. ':hits', expiresIn)
 
-return { reportedHits, math.ceil((windowEndsAt - now) / 1000), isBlocked and 1 or 0, timeToBlockExpire }
+return { reportedHits, math.ceil((reportedExpiresAt - now) / 1000), isBlocked and 1 or 0, timeToBlockExpire }
 `;
 
 /**

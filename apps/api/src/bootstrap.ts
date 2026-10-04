@@ -165,7 +165,8 @@ export function configureApp(app: INestApplication, options: { isProduction: boo
  * （实测：探针打出 `listen → logger.error → exit 1`，中间没有 `close`；
  * 而把 `app` 换成注入的形状就能看到 `close`——说明问题在「拿不到句柄」，不在关停逻辑）。
  *
- * 因此这里在**最后一次可能失败的操作之前**把句柄交出去。用一个显式的回调参数，
+ * 因此这里在**最后一次可能失败的操作之前**把句柄交出去——修复轮 3 起这个「之前」被推到
+ * 了 `configureApp` **之前**（见 `bootstrap` 里的说明：接线自己也会抛）。用一个显式的回调参数，
  * 而不是把这三步在 `runBootstrap` 里重抄一遍：抄一遍等于「引导顺序」有两份定义，
  * 而顺序正是 Task 6/Task 7 反复吃过亏的地方（见 `app.module.ts` 的中间件顺序记载）。
  */
@@ -174,8 +175,15 @@ export async function bootstrap(
   onReady?: (app: INestApplication) => void,
 ): Promise<INestApplication> {
   const app = await createApp();
-  configureApp(app, { isProduction: process.env.NODE_ENV === 'production' });
+  // **句柄在接线之前就交出去**（修复轮 3 从 `configureApp` 之后移上来的）：
+  // `configureApp` 自己也会抛（`app.get(PinoLogger)` 取不到、安全栈安装失败、
+  // `set('trust proxy')` 在非 express 适配器上不好使……），而那时 `bootstrap()` 的返回值
+  // 同样不会产生——`onReady` 若排在它后面，失败路径上 `closeQuietly` 又会拿到 `undefined`，
+  // 「关掉已经建好的应用」这件事**一次都不会发生**（与修复轮 2 修掉的那个
+  // 「`listen()` 失败时拿不到句柄」是同一个形状，只是触发点更早）。
+  // 代价为零：`close()` 在 `configureApp` 失败时本来就该跑（连接已经建了）。
   onReady?.(app);
+  configureApp(app, { isProduction: process.env.NODE_ENV === 'production' });
   await app.listen(Number(process.env.PORT ?? 3000));
   return app;
 }

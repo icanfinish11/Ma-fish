@@ -32,6 +32,14 @@ export type ExpressNext = Parameters<NestMiddleware['use']>[2];
  * `app.use(cookieParser())`：那曾是一条只在 `withSecurity: false` 时才会走的路径，
  * 而全仓没有任何调用方传过它——一条从不执行的抄件，正是下面那节要消灭的形状。
  *
+ * **修复轮 3**：那个 `withSecurity` 开关**整个删掉**了（不只是它里面的分支）。
+ * 它当时只被显式传过 `true`（等于默认值），而 `false` 的语义是「什么都不装」——
+ * 于是「关掉它」的失效形态是**静默地没有 cookie-parser**，`req.cookies` 永远是
+ * `undefined`，表现为一堆莫名其妙的 403。留一个没人用、又只会安静地拆掉安全栈的开关，
+ * 正是本仓库反复吃掉的那类缺陷；安全栈现在**无条件**安装，没有第二条路径可言。
+ * 真要「不装安全栈」的对照态，就在测试里显式表达（例如直接对着
+ * `applySecurityMiddleware` 做断言），而不是在这里留一个开关。
+ *
  * 顺序也与生产一致：`app.use` 注册在 express 实例上，先于 `app.init()` 建立的
  * Nest 中间件链执行，因此 cookie-parser 在 `TraceMiddleware`/`SessionMiddleware` 之前。
  *
@@ -53,7 +61,7 @@ export type ExpressNext = Parameters<NestMiddleware['use']>[2];
  * 夹具提供）。`AppModule`、中间件接线与顺序、全局守卫全部共用同一个模块，
  * 因此这里刻意**不**复刻一份接线，免得「测试接线是否正确」变成「抄件是否正确」。
  *
- * Task 7 起这条约束也覆盖**安全中间件栈**：`withSecurity`（默认开）调的是生产那个
+ * Task 7 起这条约束也覆盖**安全中间件栈**：`createTestApp` **无条件**调生产那个
  * `applySecurityMiddleware`（`apps/api/src/common/security/security-stack.ts`），
  * 而不是在测试里重写一遍 `helmet + cookieParser` 的安装顺序。brief 里那个
  * `createSecureTestApp()` 因此**没有**被加进来——那会是第二套引导。
@@ -67,22 +75,6 @@ export interface CreateTestAppOptions {
    * `.useValue(v)` 才返回 builder），所以这里直接借用它的类型。
    */
   overrides?: readonly ((builder: TestingModuleBuilder) => TestingModuleBuilder)[];
-  /**
-   * 是否安装**生产同款**的浏览器安全中间件栈（每请求 nonce + helmet + cookie-parser）。
-   *
-   * 默认 `true`：`main.ts` 的引导路径装了它，测试就该跑同一个栈，否则
-   * 「安全断言全绿」只能证明「测试里那份抄件是绿的」。默认开启也让绝大多数测试
-   * 不必关心它。
-   *
-   * **没有**「关掉它、只装 cookie-parser」的第二条路径（修复轮 2 删除）：
-   * 那个分支（`withCookieParser`）**没有任何调用方**——全仓搜不到传
-   * `withSecurity: false` 的地方，因此它是一条从不执行的 cookie-parser 安装路径，
-   * 正是 `security-stack.ts` 存在的理由所要消灭的「抄件迟早漂移」的形状
-   * （抄件里装了什么、生产装了什么，两边都不会有人发现对不上）。
-   * 真要「不装安全栈」的对照态，就在测试里显式表达（例如直接对着
-   * `applySecurityMiddleware` 做断言），而不是在这里留一个开关。
-   */
-  withSecurity?: boolean;
   /**
    * 额外的、**测试专用**的模块（探针控制器等）。
    *
@@ -110,11 +102,9 @@ export async function createTestApp(options: CreateTestAppOptions = {}): Promise
 
   const moduleRef = await builder.compile();
   const app = moduleRef.createNestApplication();
-  // 只有一条安全栈安装路径（`withSecurity !== false` 时必装；见 `withSecurity` 的注释）。
-  if (options.withSecurity !== false) {
-    // 与 `main.ts` **同一个函数**：测试与生产的差别只有 `isProduction` 这一个入参。
-    applySecurityMiddleware(app, { isProduction: false });
-  }
+  // **无条件**安装生产那一条安全栈：没有开关，因此不存在「关掉之后静默地什么也没装」的形态。
+  // 与 `main.ts` **同一个函数**：测试与生产的差别只有 `isProduction` 这一个入参。
+  applySecurityMiddleware(app, { isProduction: false });
   for (const { name, fn } of options.conditions ?? []) {
     app.get(PolicyGuard).registerCondition(name, fn);
   }

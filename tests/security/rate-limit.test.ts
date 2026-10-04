@@ -221,10 +221,27 @@ describe('限流桶在 Redis：两个应用实例共享同一个计数（修复�
     // 前者能与进程外的实例共享、能在重启后存活，后者两条都做不到。
     const keys = await inspector.keys(`${THROTTLE_KEY_PREFIX}*`);
     expect(keys.length, `Redis 里没有任何 ${THROTTLE_KEY_PREFIX}* 键：计数没落在这里`).toBeGreaterThan(0);
-    const pttl = await inspector.pttl(keys[0]!);
-    // 有过期时间 ⇒ 桶不会永久留在库里（注册层 TTL 1 小时，封锁期同为 1 小时）。
-    expect(pttl, '限流桶没有设置过期时间：它会永久占住 Redis').toBeGreaterThan(0);
-    expect(pttl).toBeLessThanOrEqual(RATE_LIMITS.register.ttlMs);
+
+    // **两个键都要有过期时间**（修复轮 3 改正：原来只查 `keys[0]`）。
+    // 一个桶由两个键组成：记录键（哈希，存 `blockedUntil`）与它旁边的有序集合 `:hits`。
+    // 修复轮 2 的真实回归就是「只给 `:hits` 设了 TTL、记录键变成永不过期（PTTL = -1）」，
+    // 而当时之所以**当场**被抓到，靠的是这条断言恰好取到了记录键——那是 `KEYS` 的返回顺序，
+    // 不是我们指定的事实。按**内容**把两个都找出来并逐个断言，这条用例才在钉住这件事
+    // （顺序变了、或只给其中一个设 TTL，都必须变红）。
+    const bucketRoot = keys.find((k) => !k.endsWith(':hits'));
+    const hitsKey = keys.find((k) => k.endsWith(':hits'));
+    expect(bucketRoot, `桶里没有记录键（只有有序集合）：${keys.join(', ')}`).toBeDefined();
+    expect(hitsKey, `桶里没有有序集合键：${keys.join(', ')}`).toBeDefined();
+
+    for (const [label, key] of [
+      ['记录键', bucketRoot!],
+      ['有序集合', hitsKey!],
+    ] as const) {
+      const pttl = await inspector.pttl(key);
+      // 有过期时间 ⇒ 桶不会永久留在库里（注册层 TTL 1 小时，封锁期同为 1 小时）。
+      expect(pttl, `${label}（${key}）没有过期时间：它会永久占住 Redis`).toBeGreaterThan(0);
+      expect(pttl).toBeLessThanOrEqual(RATE_LIMITS.register.ttlMs);
+    }
   });
 });
 

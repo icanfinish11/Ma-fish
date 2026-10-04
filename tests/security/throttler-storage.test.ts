@@ -270,6 +270,93 @@ describe('滚动窗口的形状：逐命中过期，而不是整桶清零（修�
     expect(await client.zcard(hitsKey('bid', key)), '出窗的命中没有被剪掉：桶会无限增长').toBe(limit);
   });
 
+  it('空转越过**最老**命中：仍在 `ttl` 内的命中不许被一起丢掉（键的寿命按最新命中算）', async () => {
+    const key = 'rolling-window-bucket-lifetime';
+    const tier = 'search' as const; // 60 次/60 秒：这条用例要的是一条**够宽**的额度
+    const ttl = 60_000;
+    const limit = 60;
+
+    // ## 为什么这里**刻意不把额度打满**（修复轮 3 的教训，写下来免得下一个人改回去）
+    //
+    // 第一版这条用例让历史命中达到 `limit`，于是本次 increment 进入封锁，而封锁会把
+    // 寿命抬到 `blockedUntil`——**恰好盖住**了「寿命取最老命中」这个缺陷，用例在旧实现上
+    // 也是绿的（实测：`increment#1` 之后 `PTTL = 59997`）。评审给出缺陷时用的历史是
+    // **未达上限**的（两条命中、1500ms 间隔、`PTTL ≈ 1486ms` 而不是 3000ms），
+    // 因为只有「没有封锁插手」时，寿命才**只**由 `max(最老命中 + ttl, blockedUntil)` 决定。
+    // 因此这里用 limit=60、只放 5 条历史——够「有东西可丢」，又不会引入封锁。
+    //
+    // ## 时间安排（两种老命中 + 一种新命中，全部显式给出，不靠 sleep 构造历史）
+    //
+    //   - 一条 61 秒前 ⇒ 已出窗，本次 increment 会剪掉它（剪枝这一半照旧被钉住）；
+    //   - 四条 56 秒前 ⇒ **仍在 ttl 内**，本次之后 4 秒出窗——这就是「昭告客户端的重置时刻」；
+    //     它们之后还有 4 秒余量，足以活过下面那 2.4 秒的等待（56 减 2.4 ≈ 53.6 < 60）。
+    //   - 寿命的候选值：最老命中 + ttl = 本次之后 **4 秒**；最新命中 + ttl ≈ **56 秒**。
+    //
+    // 等待 2.4 秒之后：「最老」这一支已经把桶交给 Redis 回收（连同那 4 条仍在窗内的命中），
+    // 而「最新」这一支还留着它们。两次 increment 的 `totalHits` 因此相差一个数量级。
+    const hits = hitsKey(tier, key);
+    const now = Date.now();
+    await client.zadd(
+      hits,
+      now - 61_000, 'seed:left-the-window',
+      now - 56_000, 'seed:in-window-1',
+      now - 55_999, 'seed:in-window-2',
+      now - 55_998, 'seed:in-window-3',
+      now - 55_997, 'seed:in-window-4',
+    );
+
+    // 本次命中（第 6 次，limit=60 ⇒ 放行、不进封锁，寿命因此只由命中决定）。
+    // 这次 increment 把**键的寿命**写进 Redis：下面读到的就是生产代码真正设下的那个值。
+    const first = await storage.increment(key, ttl, limit, ttl, tier);
+    expect(first.isBlocked, '本用例需要一条未达上限的历史（一旦进封锁，封锁会把桶的寿命盖住）').toBe(false);
+    expect(first.totalHits).toBe(5);
+    // 报给调用方的窗口结束时刻仍然取自**最老**的窗内命中（56 秒前）⇒ 约 4 秒。
+    expect(first.timeToExpire, 'X-RateLimit-Reset 的语义被改动了：它应当报「最老命中出窗」').toBeLessThanOrEqual(5);
+    expect(first.timeToExpire).toBeGreaterThan(0);
+
+    // ── ① 寿命本身（就是「先于实现说出来的判据」）───────────────────────────────
+    // 有缺陷的寿命 = 最老命中 + ttl = 本次之后 ≈4 秒；正确的寿命 ≈56 秒。
+    // 断言「>= 5 秒」落在两者之间，且离两边都足够远（毫秒级的抖动影响不到它）。
+    // 记录键与有序集合**都要**满足（修复轮 2 漏设记录键的 PTTL 回归靠这里一起钉住）。
+    const bucketPttl = await client.pttl(bucketKey(tier, key));
+    const hitsPttl = await client.pttl(hits);
+    for (const [label, pttl] of [
+      ['记录键', bucketPttl],
+      ['有序集合', hitsPttl],
+    ] as const) {
+      expect(
+        pttl,
+        `限流桶的${label}寿命（${pttl}ms）短于它装着的最新命中（≈56 秒）：最老那条一出窗，` +
+          'Redis 就会把整个桶删掉，仍在 ttl 内的命中被一起丢掉 ⇒ 计数在昭告客户端的重置时刻从零开始',
+      ).toBeGreaterThan(5_000);
+    }
+
+    // ── ② 把它落成**实际后果**，而不是一条「TTL 看起来够长」的性质 ────────────────
+    // 等待 2.4 秒 = 越过最老命中出窗的时刻（≈2 秒），但仍远在最新命中出窗（≈56 秒）之前。
+    // 这正是「客户端读着 X-RateLimit-Reset 回来」的时刻。
+    await new Promise((resolve) => setTimeout(resolve, 2_400));
+
+    const survived = await client.zcard(hits);
+    const after = await storage.increment(key, ttl, limit, ttl, tier);
+
+    expect(
+      after.totalHits,
+      survived > 0
+        ? `仍在 ttl 内的 ${survived} 条命中被忘了：计数变成 ${after.totalHits}（应 > 1）`
+        : '限流桶在自己仍然装着命中的时候就过期了：仍在 ttl 内的命中被一起丢掉，计数从 1 重新开始',
+    ).toBe(6);
+    // 出窗那条必须被剪掉，而 4 条仍在窗内的必须留着（逐命中过期）。
+    // 另外还有**两次** increment 各记下的一条命中（本用例调了两次 increment，
+    // 脚本写入的成员名是 `<自增序号>:<now>`，与 seed: 前缀不会撞名）⇒ 合计 6 条。
+    // 断言按**成员名**而不是只看基数：基数相同但「丢错了一条」的实现也该变红。
+    const survivors = await client.zrange(hits, '0', '-1');
+    expect(survivors, '出窗的那条命中没有被剪掉：桶会无限增长').not.toContain('seed:left-the-window');
+    for (const id of ['seed:in-window-1', 'seed:in-window-2', 'seed:in-window-3', 'seed:in-window-4']) {
+      expect(survivors, `${id} 仍在 ttl 内，却被一起丢掉了`).toContain(id);
+    }
+    expect(survivors).toHaveLength(6);
+  });
+
   it('封锁期间的敲门既不入账、也不把窗口推后（否则每次敲门都刷新「最老命中」）', async () => {
     const key = 'rolling-window-blocked-does-not-slide';
     const ttl = 60_000;
