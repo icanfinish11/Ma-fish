@@ -31,6 +31,20 @@ const PLACEHOLDER_SUBSTRINGS = [
   'todo',
 ];
 
+/**
+ * 占位值拒绝层。**使用边界（硬性约定，不可扩大）：只允许用于「密钥」字段。**
+ *
+ * 当前恰好用在三个字段上：`SESSION_SECRET`、`MASTER_ENCRYPTION_KEY`、`GITHUB_CLIENT_SECRET`。
+ *
+ * 为什么不能用于非密钥字段：上面的清单含 `example`、`todo` 这类**通用词**，
+ * 而合法配置里出现它们完全正常，例如 `MAIL_FROM=no-reply@example.com`、
+ * 部署地址里的 `/todo`。一旦把本层套到 `MAIL_FROM` / `DATABASE_URL` 之类字段上，
+ * 就会误拒合法配置、把服务挡在启动之外。
+ *
+ * 误拒密钥是 fail-closed（方向安全），误拒非密钥配置则纯属故障——这就是边界所在。
+ * 该边界由 `tests/unit/config/placeholder-boundary.test.ts` 守：一旦把本层套到
+ * 非密钥字段上，那些用例会立刻变红，而不是悄悄通过。
+ */
 const nonPlaceholder = (label: string) =>
   z.string().refine(
     (v) => {
