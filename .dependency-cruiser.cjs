@@ -16,22 +16,46 @@ module.exports = {
       severity: 'error',
       comment:
         '禁止跨模块 import 内部实现：跨模块只走 modules/<other>/index.ts 的显式接口（§3.3 第 2 条）。' +
-        '深引到别人的 service / module / repository，等于把两个模块钉死在一起，"可拆分"就只是文档里的话。',
-      from: { path: '^apps/api/src/modules/([^/]+)/' },
+        '深引到别人的 service / module / repository，等于把两个模块钉死在一起，"可拆分"就只是文档里的话。' +
+        '同时覆盖平台层与 worker（见 from.path 的说明）：平台不依赖功能模块的内部实现，' +
+        'worker 不深引模块内部——两者都是同一个约束的反方向，方向反了模块就永远拆不走。',
+      /**
+       * `from.path` 的三个分支与第 1 个捕获组
+       *
+       * 三条都是「不许深引 `modules/*` 内部」的主体：
+       * 1. `modules/<X>/…` —— 模块之间（§3.3 第 2 条的原样）；
+       * 2. `db|common` —— **平台层**。它此前不在规则里，于是 `db/redis.module.ts` 与
+       *    `common/security/security.module.ts` 都能反向 import `modules/auth/session.service.ts`
+       *    而无人报警（task-9-report.md §11.2 记录了这个空洞，修复轮 1 收口）；
+       * 3. `apps/worker` —— 独立进程，此前深引 `modules/notify/*` 的内部文件。
+       *
+       * **捕获组的位置是刻意选的**：只有第 2 个分支（模块）携带捕获组，平台与 worker
+       * 分支只有非捕获组，因为 `$1` 要表示的是「**本模块**名」，而平台/worker 没有模块名。
+       * 于是对平台与 worker，`$1` 在下面 `pathNot` 里被替换成**空串**，
+       * `^apps/api/src/modules//` 谁也匹配不上 = 不放行任何模块内部文件——正是要的效果。
+       * 若反过来把捕获组套在最外层，平台分支会捕获出 `db` 之类的目录名，
+       * `pathNot` 就会去放行 `modules/db/…`（不存在），规则静默失效。
+       * 这一点**是用变异探针实测过的**，不是读代码推的（见 task-9-report.md 修复轮 1 §13.4）。
+       */
+      from: {
+        path: '^(?:apps/api/src/(?:modules/([^/]+)|(?:db|common))/|apps/worker/src/)',
+      },
       to: {
         path: '^apps/api/src/modules/([^/]+)/',
         /**
-         * `$1` 是 `from.path` 里的第 1 个捕获组（= 本模块名），dependency-cruiser 会把它
-         * 替换进 `to.path` / `to.pathNot`（实现：`src/validate/matchers.mjs` 的
-         * `replaceGroupPlaceholders` ← `extractGroups(pRule.from, pModule.source)`）。
-         * 已实测确认该特性存在且按此语义工作，见 task-9-report.md §3；此处**不是**照抄假设。
+         * `$1` 是 `from.path` 里的第 1 个捕获组（= 本模块名，平台/worker 时为空串），
+         * dependency-cruiser 会把它替换进 `to.path` / `to.pathNot`（实现：
+         * `src/validate/matchers.mjs` 的 `replaceGroupPlaceholders` ←
+         * `extractGroups(pRule.from, pModule.source)`）。替换前会 `filter` 掉非字符串的
+         * 捕获组结果，而**空串是字符串、会被保留**——上面那条「平台/worker 分支留下空串」
+         * 的语义因此成立。已实测确认，见 task-9-report.md §3 与修复轮 1 §13.2；此处**不是**照抄假设。
          *
          * 两个备选写成一个数组会被**直接 `join('|')`**（`src/main/helpers.mjs`
          * `normalizeToREAsString`，不加 `(?:)` 包裹），因此每一项都必须自带 `^`/`$` 锚点，
          * 否则相邻项会互相串味。
          */
         pathNot: [
-          // 本模块自己的文件
+          // 本模块自己的文件（平台/worker 时 `$1` 为空串，故本条不匹配任何模块内部文件）
           '^apps/api/src/modules/$1/',
           // 任何模块的对外接口
           '^apps/api/src/modules/[^/]+/index\\.ts$',

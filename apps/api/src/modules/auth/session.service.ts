@@ -1,15 +1,9 @@
 import { Injectable, Inject } from '@nestjs/common';
 import { Redis } from 'ioredis';
 import { randomBytes } from 'node:crypto';
-
-/**
- * Redis 客户端的注入令牌。
- *
- * 用 `Symbol` 而不是字符串常量：字符串令牌会与任何同名提供者相撞（Nest 的令牌空间是平的），
- * 而 `Symbol` 在模块之间只可能通过 import 同一个常量来共享，重复注册会立刻表现为
- * 「找不到提供者」而不是「悄悄注入了另一个东西」。
- */
-export const REDIS = Symbol('VCA_REDIS');
+// `REDIS` 令牌的**定义**在 `db/redis.module.ts`（与提供者同处一地）。这里只 import：
+// 本模块是**使用者**，平台层不该反过来依赖功能模块的内部文件（Task 9 修复轮 1）。
+import { REDIS } from '../../db/redis.module.js';
 
 /** 空闲 7 天（C13）。**空闲**语义靠 `verify` 里的滑动续期实现，见下。 */
 const IDLE_TTL_SECONDS = 7 * 24 * 3600;

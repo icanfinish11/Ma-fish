@@ -150,6 +150,11 @@ describe('架构守护（C5 / 验收 13.4）', () => {
     // 规则集本身也要被断言，否则「把规则从配置里删掉」这条最省事的走法能让本用例**恒绿**：
     // 没有规则时 depcruise 照样输出 `error: 0`。这正是本仓库反复抓到的「门是空的」形态
     // （与 Task 7 的 `--passWithNoTests` 同源），所以门必须自证它加载到了什么。
+    //
+    // `no-cross-module-internals` 在修复轮 1 之后**一条规则同时管三个主体**：模块之间、
+    // 平台层（`db` / `common`）与 `apps/worker`。三者共用同一个规则名是刻意的——它们是
+    // 同一个约束（§3.3 第 2 条：不许依赖别人的内部实现）的三个方向，而拆成三条规则会让
+    // 「谁覆盖了谁」变成要读三遍 `from.path` 才知道的事。
     const declared = (summary.ruleSetUsed?.forbidden ?? []).map((r) => r.name);
     for (const rule of ['no-cross-module-internals', 'no-shared-to-apps', 'no-circular']) {
       expect(declared, `规则集里没有 ${rule}：${CONFIG_FILE} 的 forbidden 被改过？`).toContain(rule);
@@ -180,6 +185,18 @@ describe('架构守护（C5 / 验收 13.4）', () => {
     expect(
       missing,
       `下列目录一个源文件都没被巡航到：${missing.join(', ')}\n（cruise 目标或 exclude 是否把它们排除了？）`,
+    ).toEqual([]);
+
+    // 修复轮 1 起，`no-cross-module-internals` 那条规则**放行**的正是
+    // `modules/<other>/index.ts`。两个 index 因此成了「平台层与 worker 唯一的合法入口」：
+    // 它们若没被巡航到（被 exclude 吃掉、或路径写错），放行条款就无从判断，
+    // 而规则会以「到不了任何目标」的形式恒绿——今天必须点名把它们钉住。
+    const named = ['apps/api/src/modules/notify/index.ts', 'apps/api/src/modules/audit/index.ts'];
+    const notCruised = named.filter((source) => !sources.includes(source));
+    expect(
+      notCruised,
+      `这些对外接口文件没被巡航到：${notCruised.join(', ')}\n` +
+        '（它们是跨模块/平台/worker 唯一被放行的入口，规则依赖它们在场）',
     ).toEqual([]);
   });
 

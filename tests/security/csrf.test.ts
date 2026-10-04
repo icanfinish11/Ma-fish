@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import type { ExecutionContext, INestApplication } from '@nestjs/common';
 import { AuthService } from '@vca/api/modules/auth/auth.service.js';
-import { REDIS } from '@vca/api/modules/auth/session.service.js';
+import { REDIS } from '@vca/api/db/redis.module.js';
 import { CsrfGuard } from '@vca/api/common/security/csrf.guard.js';
 import { CSRF_COOKIE, CSRF_HEADER } from '@vca/api/common/security/csrf.middleware.js';
 import { createTestApp } from '../helpers/app.js';

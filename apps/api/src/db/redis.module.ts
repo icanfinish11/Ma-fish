@@ -1,8 +1,31 @@
 import { Global, Inject, Injectable, Module, type OnApplicationShutdown } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Redis } from 'ioredis';
-import { REDIS } from '../modules/auth/session.service.js';
 import type { Env } from '../config/env.schema.js';
+
+/**
+ * Redis 客户端的注入令牌。
+ *
+ * 用 `Symbol` 而不是字符串常量：字符串令牌会与任何同名提供者相撞（Nest 的令牌空间是平的），
+ * 而 `Symbol` 在模块之间只可能通过 import 同一个常量来共享，重复注册会立刻表现为
+ * 「找不到提供者」而不是「悄悄注入了另一个东西」。
+ *
+ * ## 为什么它定义在**平台层**，而不是某个功能模块里（Task 9 修复轮 1）
+ *
+ * 它原本定义在 `modules/auth/session.service.ts`（会话是第一个用 Redis 的地方），
+ * 于是 `db/redis.module.ts`（本文件的提供者）与 `common/security/security.module.ts`
+ * **都要反过来 import 一个功能模块的内部文件**——平台层依赖功能模块的内部实现，
+ * 方向是反的。**能拆分的单元是模块**：这层反向依赖意味着 `auth` 永远无法从 API 里被拆走，
+ * 而那正是 §3.3 第 2 条要保住的性质。
+ *
+ * 令牌跟随它的**提供者**（本模块 `exports: [REDIS]`），因此所有权与提供者同处一地；
+ * 功能模块（会话、限流、将来的幂等键）从平台层 import 它，方向就正过来了。
+ * 现在守着这条边的是 `.dependency-cruiser.cjs` 的 `no-cross-module-internals`。
+ *
+ * `Symbol` 的描述字符串刻意保持原值（`VCA_REDIS`）：它在调试输出里要能对上历史日志，
+ * 而且改描述没有任何收益——令牌的身份来自对象本身，不来自这行字符串。
+ */
+export const REDIS = Symbol('VCA_REDIS');
 
 /**
  * ioredis 连接的生命周期管理。

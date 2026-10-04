@@ -1,6 +1,10 @@
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
-import { OutboxConsumer } from '@vca/api/modules/notify/outbox.consumer.js';
+// `OutboxConsumer` 经**模块的对外接口**取到，而不是深引 `…/outbox.consumer.js`
+// （Task 9 修复轮 1）：worker 是独立构建/部署的进程，深引会让它的编译结果取决于
+// `notify` 的内部布局。这条边界由 `.dependency-cruiser.cjs` 的
+// `no-cross-module-internals` 守着（`apps/worker` 深引 `modules/*` 内部即报错）。
+import { OutboxConsumer } from '@vca/api/modules/notify/index.js';
 import { WorkerModule } from './worker.module.js';
 import { describeError, runWorker } from './worker.js';
 

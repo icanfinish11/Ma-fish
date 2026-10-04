@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@vca/api/config/config.module.js';
 import { DbModule } from '@vca/api/db/db.module.js';
-import { NotifyModule } from '@vca/api/modules/notify/notify.module.js';
+import { NotifyModule } from '@vca/api/modules/notify/index.js';
 
 /**
  * worker 的模块图：配置 + 数据库 + 通知（outbox 消费者与邮件端口）。
@@ -18,6 +18,14 @@ import { NotifyModule } from '@vca/api/modules/notify/notify.module.js';
  *
  * `ConfigModule` / `DbModule` 自己标了 `@Global()`，所以只写 `NotifyModule` 也能跑；
  * 三个都显式列出是为了让依赖方向可读（与 `NotifyModule` 里 `imports: [DbModule]` 同一理由）。
+ *
+ * ## 为什么经 `modules/notify/index.js` 而不是它的内部文件（Task 9 修复轮 1）
+ *
+ * 本文件与 `main.ts` 曾经分别深引 `…/notify.module.js`、`…/outbox.consumer.js`：
+ * worker 是被**独立构建、独立部署**的那个进程，深引意味着它的编译结果取决于
+ * `notify` 的内部布局。现在两者都只从 `modules/notify/index.js` 取
+ * （`NotifyModule` / `OutboxConsumer`），这条边界由 `.dependency-cruiser.cjs` 的
+ * `no-cross-module-internals` 守着——`apps/worker` 深引 `modules/*` 的内部文件会直接报错。
  */
 @Module({ imports: [ConfigModule, DbModule, NotifyModule] })
 export class WorkerModule {}

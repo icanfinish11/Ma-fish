@@ -1,10 +1,10 @@
 import { Global, Module } from '@nestjs/common';
 import { ThrottlerModule } from '@nestjs/throttler';
 import type { Redis } from 'ioredis';
-// `REDIS` 令牌定义在 `session.service.ts`（`db/redis.module.ts` 也是从那里 import 的：
-// 它只在 `exports: [REDIS]` 里给出 Nest 的提供者，**没有**再 ES 导出这个常量）。
-// 沿用同一处定义，令牌的唯一性才成立。
-import { REDIS } from '../../modules/auth/session.service.js';
+// `REDIS` 令牌与它的提供者同处一地（`db/redis.module.ts`，Task 9 修复轮 1 前它定义在
+// `modules/auth/session.service.ts`，于是平台层要反向 import 一个功能模块的内部文件）。
+// 这里从平台层取同一个常量——令牌的唯一性正来自「所有人 import 的是同一处定义」。
+import { REDIS } from '../../db/redis.module.js';
 import { CsrfGuard } from './csrf.guard.js';
 import { CsrfMiddleware } from './csrf.middleware.js';
 import { RedisThrottlerStorage } from './redis-throttler.storage.js';

@@ -3,7 +3,7 @@ import request from 'supertest';
 import { Controller, Get, Module, Res, type INestApplication } from '@nestjs/common';
 import { Public } from '@vca/api/common/policy/policy.decorator.js';
 import { buildHelmetOptions } from '@vca/api/common/security/headers.js';
-import { REDIS } from '@vca/api/modules/auth/session.service.js';
+import { REDIS } from '@vca/api/db/redis.module.js';
 import { createTestApp } from '../helpers/app.js';
 import { startTestRedis, type TestRedis } from '../helpers/redis.js';
 

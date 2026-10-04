@@ -3,7 +3,7 @@ import request from 'supertest';
 import type { ExecutionContext, INestApplication } from '@nestjs/common';
 import type { Redis } from 'ioredis';
 import { AuthService } from '@vca/api/modules/auth/auth.service.js';
-import { REDIS } from '@vca/api/modules/auth/session.service.js';
+import { REDIS } from '@vca/api/db/redis.module.js';
 import { CSRF_COOKIE, CSRF_HEADER } from '@vca/api/common/security/csrf.middleware.js';
 import { RATE_LIMITS, trackerFor } from '@vca/api/common/security/throttler.js';
 import {
