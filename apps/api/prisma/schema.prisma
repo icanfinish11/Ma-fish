@@ -75,6 +75,11 @@ model AuditLog {
 }
 
 // ── notify ── transactional outbox（C15）─────────────────────────
+// `abandoned_at`（修复轮 1 / Fix 1）：到达重试上限而**放弃**的终止标记。
+// 为什么要单独一列而不是复用 `processed_at`：消费者退出待处理集合靠 `processed_at`，
+// 但那个字段单独存在时**区分不出**「投递成功」与「试了 N 次后放弃」——运维拿到的会是
+// 「已处理」这个错误结论（一封其实没发出去的邮件看起来像发出去了）。
+// 约定：`processed_at` 非空 且 `abandoned_at` 为空 = 投递成功；两者都非空 = 放弃。
 model OutboxEvent {
   id             String    @id @default(uuid(7)) @db.Uuid
   topic          String
@@ -82,6 +87,7 @@ model OutboxEvent {
   idempotencyKey String    @unique @map("idempotency_key")
   createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
   processedAt    DateTime? @map("processed_at") @db.Timestamptz(3)
+  abandonedAt    DateTime? @map("abandoned_at") @db.Timestamptz(3)
   attempts       Int       @default(0)
   lastError      String?   @map("last_error")
 

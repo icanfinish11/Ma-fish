@@ -42,6 +42,35 @@ export function maskEmail(email: string): string {
   return `${email[0]}***${email.slice(at)}`;
 }
 
+/**
+ * 文本里出现的邮箱（C11 的**字符串**那一层）。
+ *
+ * `redact()` 只按键名脱敏——值里的邮箱它看不见，那是它自己写明的边界。而两类**落库/落日志的
+ * 文本**经常自带收件人：
+ * - SMTP 的错误消息（`550 5.1.1 <user@example.com>: Recipient address rejected`）；
+ * - 消费者写进 `outbox_events.last_error` 的任何异常文本。
+ *
+ * 因此这一层必须存在，而且**只能存在一份**：worker 的失败行与消费者的 `last_error`
+ * 共用本函数（修复轮 1 / Fix 2 把原先写在 `apps/worker/src/worker.ts` 里的那份搬到这里）。
+ * 两份实现就是漂移的开始——正则、掩码规则、边界字符迟早会分叉，而它们本该永远一致。
+ *
+ * 边界如实记录（三条都是实测，不是推测）：
+ * - **MIME 编码字完全漏掉**：`=?utf-8?Q?victim=40example.com?=` 里根本没有字面量 `@`，无从匹配；
+ * - **带引号的 local-part 会部分残留**：`"quoted local"@example.com` 里引号不在「地址字符」集合内，
+ *   匹配因此从引号之后开始，`quoted`（不含 `@` 那一段）原样留下；
+ * - 反过来，**被 `<`/`>`/`,`/`;`/`"` 包起来的普通地址是安全的**：分隔符只是边界，
+ *   `RCPT TO:<user@example.com>`、`"user@example.com"`、`a@x.com,b@y.com` 都能正确掩码。
+ *
+ * 结论：这是**缓解**，不是保证。主防线仍然是「不要把地址写进日志消息/错误文本」。
+ * 上列边界在 `tests/unit/logging/redact.test.ts` 里被钉住（改正则就必须同时改那里的期望）。
+ */
+const EMAIL_IN_TEXT = /[^\s<>()[\]{},;:'"]+@[^\s<>()[\]{},;:'"]+/g;
+
+/** 把文本里出现的邮箱换成掩码形式（见 {@link EMAIL_IN_TEXT} 的边界说明）。 */
+export function scrubEmails(text: string): string {
+  return text.replace(EMAIL_IN_TEXT, (match) => maskEmail(match));
+}
+
 /** 环引用替身：降级成可读的值，而不是抛出 `RangeError`。 */
 const CIRCULAR = '[Circular]';
 

@@ -1,4 +1,4 @@
-import { maskEmail } from '@vca/api/common/logging/redact.js';
+import { scrubEmails } from '@vca/api/common/logging/redact.js';
 
 /**
  * worker 的**进程内逻辑**：轮询、停机顺序、有界关停。
@@ -34,7 +34,7 @@ const BATCH_SIZE = 50;
 
 /** 循环真正用到的那一面（结构化类型：单测不必造一个真 Nest 应用）。 */
 export interface WorkerDependencies {
-  consumer: { runOnce(batchSize?: number): Promise<number> };
+  consumer: { runOnce(options?: { batchSize?: number }): Promise<number> };
   close(): Promise<void>;
 }
 
@@ -57,29 +57,16 @@ export interface RunWorkerOptions {
 }
 
 /**
- * 把文本里出现的邮箱换成掩码形式（C11 的字面要求）。
- *
- * 为什么需要这一层：worker 记录的失败行来自 SMTP/Prisma，而 **SMTP 的错误消息经常带着
- * 收件人**（`550 unknown user <user@example.com>`）。`redact()` 只按键名脱敏，
- * 值里的邮箱它看不见——那是它自己写明的边界。因此字符串这一层由这里兜住。
- *
- * 边界如实记录：这是**缓解**，不是保证。正则认的是「不含空白与分隔符的 `x@y`」，
- * 被引号或方括号特殊包起来的地址、`=?utf-8?...?=` 编码过的地址都可能漏掉。
- * 主防线仍然是「不要把地址写进日志消息」。
- */
-const EMAIL_IN_TEXT = /[^\s<>()[\]{},;:'"]+@[^\s<>()[\]{},;:'"]+/g;
-
-function scrubEmails(text: string): string {
-  return text.replace(EMAIL_IN_TEXT, (match) => maskEmail(match));
-}
-
-/**
  * 把一段文本压成**单行**。
  *
  * 为什么必须有这一步（实测）：Prisma 的错误消息自带换行
  * （`Invalid \`prisma.outboxEvent.findMany()\` invocation:\n\nCan't reach database server …`），
  * 直接写进 stderr 会让「一条失败」变成五行输出，把行数与事件数的一一对应关系破坏掉
  * （本仓库的日志约定是每条记录一行，pino 那边是 newline-delimited JSON）。
+ *
+ * 邮箱脱敏走 `scrubEmails`（`common/logging/redact.ts`，**与消费者写 `last_error` 的那一份是同一段代码**）：
+ * 这里曾经是本文件的私有实现，修复轮 1 / Fix 2 把它搬到了共享位置——任务要求
+ * 「复用你已有的 scrubber，而不是写第二个」，理由就是两份实现必然会漂移。
  */
 function oneLine(text: string): string {
   return scrubEmails(text).replace(/\s+/g, ' ').trim();
@@ -174,7 +161,7 @@ export async function runWorker(
   while (!signal?.aborted) {
     let handled: number;
     try {
-      handled = await deps.consumer.runOnce(BATCH_SIZE);
+      handled = await deps.consumer.runOnce({ batchSize: BATCH_SIZE });
     } catch (err) {
       log(`[worker] 消费失败，${pollMs}ms 后重试：${describeError(err)}`);
       await sleep(pollMs, signal);

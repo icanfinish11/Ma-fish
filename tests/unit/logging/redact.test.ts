@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { maskEmail, redact } from '@vca/api/common/logging/redact.js';
+import { maskEmail, redact, scrubEmails } from '@vca/api/common/logging/redact.js';
 
 /**
  * C11（日志绝不记录令牌/密码/完整邮箱）与威胁 #6（密封出价上限）的**常驻回归**。
@@ -219,5 +219,40 @@ describe('日志脱敏（C11 / 威胁 #15）', () => {
     }
     expect(cursor, '没有深度上界：要么爆栈抛出 RangeError，要么一路递归下去').toBe('[MaxDepth]');
     expect(levels, '深度上界应当是个小常数，而不是 20 万').toBeLessThan(200);
+  });
+
+  /**
+   * `scrubEmails`：C11 的**字符串**那一层（修复轮 1 / Fix 2 把它搬到本模块）。
+   *
+   * 为什么它必须在这里有直接的用例：它此前是 `apps/worker/src/worker.ts` 的私有函数，
+   * 现在有**两个**生产消费方——worker 的失败行与消费者写进 `outbox_events.last_error`
+   * 的错误文本。搬到共享位置的全部理由就是「只存在一份」，因此这一份的行为必须被钉住：
+   * 少了这些断言，将来任何一处「顺手改一下正则」都会静默地让另一边漏掉地址。
+   */
+  describe('scrubEmails（值里的邮箱）', () => {
+    it('把文本里的地址换成掩码形式，域名保留', () => {
+      expect(scrubEmails('550 5.1.1 <victim@example.com>: Recipient address rejected')).toBe(
+        '550 5.1.1 <v***@example.com>: Recipient address rejected',
+      );
+      // 一条文本里出现多个地址：每一个都要被处理
+      expect(scrubEmails('from a@x.com to b@y.com')).toBe('from a***@x.com to b***@y.com');
+    });
+
+    it('没有地址的文本原样返回（不得改动运维要看的内容）', () => {
+      const plain = 'Mail command failed: 550 5.1.1 Recipient address rejected';
+      expect(scrubEmails(plain)).toBe(plain);
+      expect(scrubEmails('')).toBe('');
+    });
+
+    it('已知边界：MIME 编码字（=?utf-8?Q?...?=）完全漏掉，带引号的 local-part 部分残留在域名前', () => {
+      // 两条边界都是**实测**的（不是猜的），钉在这里是为了让「缓解 vs 保证」的区别
+      // 在代码里可见：改了正则就要同时改这里，而不是让保证悄悄变强。
+      // 主防线始终是「不要把地址写进日志消息/错误文本」。
+      expect(scrubEmails('=?utf-8?Q?victim=40example.com?=')).toBe('=?utf-8?Q?victim=40example.com?=');
+      // 引号不在正则的「地址字符」集合里 ⇒ 匹配从引号**之后**开始，local-part 的第一个字符被漏掉。
+      // 结果是地址不再完整（域名前的部分被截断），但掩码形状与常规情况不同。
+      expect(scrubEmails('550 "quoted local"@example.com rejected')).toBe('550 "quoted local"@example.com rejected');
+      expect(scrubEmails('"victim@example.com"')).toBe('"v***@example.com"');
+    });
   });
 });
