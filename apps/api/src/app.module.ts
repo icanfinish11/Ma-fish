@@ -76,18 +76,28 @@ import { HealthModule } from './modules/health/health.module.js';
  *    （「这是不是他的 Asset」），而入口处一个比较就能挡掉它；
  * 3. **`PolicyGuard`（这个身份能不能）** —— 仍然放在最后，理由同 Task 5。
  *
- * ## 为什么 `CsrfGuard` 可以是 `useClass`，而 `PolicyGuard` 必须 `useExisting`
+ * ## 为什么两个守卫都用 `useExisting`（修复轮 1 把 `CsrfGuard` 也改成 `useExisting`）
  *
- * `CsrfGuard` 是**无状态**的（没有任何可注册的配置），因此给 `APP_GUARD` 另造一个实例
- * 与别处注入到的实例行为完全一致，`useClass` 没有代价。
+ * `useClass` 会让 Nest 为 `APP_GUARD` **另造一个实例**，于是「模块里提供/导出的那个」
+ * 与「真正拦截请求的那个」是两个对象。
  *
  * `PolicyGuard` **有状态**：条件用 `PolicyGuard.registerCondition` 注册在**实例**上
- * （`private readonly conditions = new Map(...)`）。写成 `useClass` 时，Nest 会为
- * `APP_GUARD` 另造一个实例，而各业务模块注入到的仍是 `PolicyModule` 导出的那一个——
- * 它们注册的条件永远到不了真正拦截请求的守卫上，表现为「条件全部未注册 ⇒ 相关路由全部 403」。
- * Task 5 已用「条件放行」用例实测过这一点（当时整条用例变红），
+ * （`private readonly conditions = new Map(...)`）。写成 `useClass` 时，各业务模块注入到的
+ * 仍是 `PolicyModule` 导出的那一个——它们注册的条件永远到不了真正拦截请求的守卫上，
+ * 表现为「条件全部未注册 ⇒ 相关路由全部 403」。Task 5 已用「条件放行」用例实测过这一点，
  * 常驻回归在 `tests/security/policy-default-deny.test.ts` 的「同一实例」用例里。
- * 这里只是**指向同一个实例**，因此用 `useExisting`。
+ *
+ * `CsrfGuard` 今天无状态，`useClass` 的行为与 `useExisting` 完全一致——但那正是
+ * Task 5 那个陷阱的**前提条件**，而不是豁免它的理由：任何人给它加一个按路由配置的豁免表
+ * （一个很自然的下一步），两个实例就会立刻分叉，表现为「配置不生效」这类最难查的形态。
+ * 修复轮 1 的裁定（C-2）：**不留这个隐患**。选择 `useExisting`（而不是删掉 `SecurityModule`
+ * 里的提供者）的理由：`CsrfGuard` 仍是可注入的提供者，其他模块将来注入它时拿到的是
+ * **同一个**对象，而不是「注入得到 A、拦截用 B」。
+ *
+ * 判别性断言在 `tests/security/csrf.test.ts`：只在 `app.get(CsrfGuard)` 上包一层计数器
+ * 再发一个真实请求（`app.get(APP_GUARD)` 取不到东西，实测抛
+ * `Nest could not find APP_GUARD element`，同 `policy-default-deny.test.ts` 的说明）。
+ * `useClass` 下那层计数器**永远是 0**，而请求照样 403——这正是「只看状态码看不出来」的原因。
  */
 @Module({
   imports: [
@@ -111,7 +121,9 @@ import { HealthModule } from './modules/health/health.module.js';
     SessionMiddleware,
     // 顺序即语义（见类注释）：限流 → CSRF → 授权。
     { provide: APP_GUARD, useClass: ThrottlerGuard },
-    { provide: APP_GUARD, useClass: CsrfGuard },
+    // `CsrfGuard` 用 `useExisting`（修复轮 1 / C-2）：指向 `SecurityModule` 导出的**那个**
+    // 实例，而不是让 Nest 再 new 一个（`useClass` 的语义）。理由见类注释。
+    { provide: APP_GUARD, useExisting: CsrfGuard },
     { provide: APP_GUARD, useExisting: PolicyGuard },
   ],
 })

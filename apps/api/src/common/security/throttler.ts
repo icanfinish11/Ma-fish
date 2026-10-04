@@ -52,12 +52,79 @@ export function RateLimited(name: RateLimitName): MethodDecorator & ClassDecorat
   );
 }
 
+/**
+ * 「本路由**有意**不限流」的元数据键（修复轮 1 / C-4：覆盖率门的第二个合法状态）。
+ */
+const RATE_LIMIT_SKIP_KEY = 'vca:rate-limit-skip';
+
+/**
+ * 显式声明「本路由有意不限流」（威胁 #13 的覆盖面上限之外的路径）。
+ *
+ * ## 为什么需要它：把「忘记声明」与「有意不限流」分开
+ *
+ * 运行期的规则是「每层只对显式声明它的路由生效」（见 `throttlerOptions`），
+ * 因此**未声明的路由本来就不限流**——于是「新路由漏写 `@RateLimited`」的失效形态是
+ * **静默不限流**，没有任何测试会红。这与本仓库已经抓到过的四次缺陷同一形状
+ * （空操作的 `REVOKE`、漏掉 `.tsx` 的扫描器、死代码规则、恒真断言）。
+ *
+ * `tests/security/rate-limit-coverage.test.ts` 是那道门：它用 `PolicyRegistry` 枚举
+ * 全部已注册路由，要求每条路由**要么**声明了某一层、**要么**打了这个标。
+ * 于是「漏写」在 CI 里就是一条列出「哪个 controller、哪个方法、哪条路径」的失败，
+ * 而不是线上一个不限流的接口。
+ *
+ * ## 这个装饰器在**运行期不做任何事**（据实记载，别误以为是 `@Public()` 那样的一票通过）
+ *
+ * `skipIf` 只读层名（`RATE_LIMIT_KEY`），**不读**这个键：未被任何层声明的路由在运行期
+ * 本来就不受限，加不加它，请求行为完全一样。它的**唯一**消费者是覆盖率门。
+ * 之所以仍然值得存在：门需要区分「作者想过这件事并写了『不限流』」与「作者没想过」，
+ * 而后者才是要拦的。
+ *
+ * 反向的诱惑（让运行期「显式豁免优先于层声明」）**没有**采纳：一个同时打了层声明与豁免标的
+ * 路由，两种写法在说谎；此时让豁免生效等于朝 fail-open 方向消解矛盾。现在的规则是
+ * 「层声明照旧生效（fail-strict），矛盾由门在 CI 里报出来」。
+ */
+export function SkipRateLimit(): MethodDecorator & ClassDecorator {
+  return SetMetadata(RATE_LIMIT_SKIP_KEY, true);
+}
+
+/** 一条路由的限流声明（运行期 `skipIf` 的判据，也是覆盖率门的输入）。 */
+export interface RateLimitDeclaration {
+  /** 本路由声明的层名；未声明为 `null`。 */
+  tier: RateLimitName | null;
+  /** 是否显式标记了「有意不限流」。 */
+  unlimited: boolean;
+}
+
+/**
+ * 元数据读取的目标：处理器函数或控制器类。
+ *
+ * 类型从 `Reflector` 自己的签名里取（`(Type<any> | Function)[]` 的元素），
+ * 而不是手写 `Function`——后者会被 `@typescript-eslint/no-unsafe-function-type` 拦下，
+ * 而且手写的类型一旦与 `Reflector` 的签名漂移，报错点会跑到调用方去。
+ */
+type RouteTarget = Parameters<Reflector['getAllAndOverride']>[1][number];
+
+/**
+ * 读一条路由的限流声明。
+ *
+ * **两处消费者共用这一个函数**是刻意的：运行期的 `skipIf` 与 CI 的覆盖率门
+ * （`PolicyRegistry.listRateLimitGaps()`）若各读各的元数据、各写一套优先级，
+ * 两者迟早漂移——而漂移方向通常是「门看到的是声明了的、守卫看到的是没声明」，
+ * 也就是门绿灯而线上不限流。方法与类同时存在时方法优先（`getAllAndOverride`）。
+ */
+export function readRateLimitDecl(handler: RouteTarget, controller: RouteTarget): RateLimitDeclaration {
+  return {
+    tier: reflector.getAllAndOverride<RateLimitName>(RATE_LIMIT_KEY, [handler, controller]) ?? null,
+    unlimited: reflector.getAllAndOverride<boolean>(RATE_LIMIT_SKIP_KEY, [handler, controller]) === true,
+  };
+}
+
 /** 只读元数据、无状态；`ThrottlerGuard` 的 `skipIf` 是纯函数签名，拿不到 DI 容器。 */
 const reflector = new Reflector();
 
 /** 本路由是否**显式**声明了名为 `name` 的限流层（`skipIf` 的判据，见 `throttlerOptions`）。 */
 function declaresRateLimit(context: ExecutionContext, name: RateLimitName): boolean {
-  return reflector.getAllAndOverride<RateLimitName>(RATE_LIMIT_KEY, [context.getHandler(), context.getClass()]) === name;
+  return readRateLimitDecl(context.getHandler(), context.getClass()).tier === name;
 }
 
 /**
@@ -126,11 +193,18 @@ function accountKey(body: unknown): string {
  * 未被任何层声明的路由在本进程内不限流——这与设计一致：威胁 #13 只点名了 5 类端点，
  * 其余路径的第一层限流在 Nginx（§3.1 的部署图）。
  *
- * **代价（如实记录）**：新增路由时漏写 `@RateLimited` 的失效形态是**不限流**（静默）。
- * 反向写法（默认全部生效 + 逐路由 `@SkipThrottle`）会让「漏写」表现为**过度限流**，
- * 但它同时要求测试里的探针路由、`/health`、`/auth/me` 全部逐条声明豁免，
- * 且五层叠加的语义（任一命中即拒）与设计里的「每类端点一个桶」并不一致。
- * 权衡后选前者，并用端到端用例把 P0 现有的两条受限路由钉住。
+ * **这个选择的代价，以及修复轮 1 补上的那道门（C-4）**：新增路由时漏写 `@RateLimited`
+ * 的失效形态是**不限流**（静默）。反向写法（默认全部生效 + 逐路由 `@SkipThrottle`）
+ * 会让「漏写」表现为**过度限流**，但它要求测试里的探针路由、`/health`、`/auth/me`
+ * 全部逐条声明豁免，且五层叠加的语义（任一命中即拒）与设计里的「每类端点一个桶」并不一致，
+ * 因此**默认层**这条替代方案**没有**采纳（它还会把 `/health` 压到最严的一层，
+ * 负载均衡因此会把整个实例判死）。
+ *
+ * 采纳的是与 Task 5 策略声明**同一形状**的覆盖率门：
+ * `tests/security/rate-limit-coverage.test.ts` + `PolicyRegistry.listRateLimitGaps()`
+ * 要求**每条已注册路由**要么声明了某一层、要么显式标 `@SkipRateLimit()`，
+ * 于是「漏写」在 CI 里变红并点名到「哪个 controller、哪个方法、哪条路径」。
+ * 门本身也有对照用例（探针模块里故意漏一条、故意矛盾一条，必须恰好报出那两条）。
  */
 export function throttlerOptions(): ThrottlerOptions[] {
   return (Object.keys(RATE_LIMITS) as RateLimitName[]).map((name) => ({

@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import type { Request, Response } from 'express';
 import { Public, Policy } from '../../common/policy/policy.decorator.js';
 import { SESSION_COOKIE, sessionCookieOptions } from '../../common/http/cookie.js';
-import { RateLimited } from '../../common/security/throttler.js';
+import { RateLimited, SkipRateLimit } from '../../common/security/throttler.js';
 import type { Env } from '../../config/env.schema.js';
 import { AuthService } from './auth.service.js';
 import { loginSchema, parseOrBadRequest, registerSchema, type LoginDto, type RegisterDto } from './dto.js';
@@ -35,6 +35,11 @@ import { loginSchema, parseOrBadRequest, registerSchema, type LoginDto, type Reg
  * `@RateLimited(...)` 同时写入「本路由属于哪一层」与那一层的数值覆盖；
  * **漏写它 = 该路由不限流**（见 `throttler.ts` 里对 `skipIf` 的实测说明），
  * 因此每条新加的写路由都该问一次「它属于哪一层」。
+ *
+ * 修复轮 1 / C-4 起这个问题有了强制答案：本模块的 `logout` 与 `me` 显式标了
+ * `@SkipRateLimit()`（有意不限流），而覆盖率门
+ * （`tests/security/rate-limit-coverage.test.ts`）要求**每条**路由二选一，
+ * 漏写会让 CI 变红并点名到方法。上面那句「都该问一次」不再依赖自觉。
  *
  * 端到端判别性断言在 `tests/security/rate-limit.test.ts`：注册第 4 次必须 429，
  * 登录第 6 次必须 429，而**换一个账号必须仍然放行**（证明分桶真的含账号）。
@@ -88,6 +93,11 @@ export class AuthController {
   }
 
   @Policy({ resource: 'Session', action: 'destroy' })
+  // 修复轮 1 / C-4：登出**不在** §4.1 威胁 #13 点名的五类端点里（登录/注册/出价/上传/搜索），
+  // 且它已经要求会话（`PolicyGuard`）。因此这里显式写「有意不限流」——
+  // 不写的话，「作者想过并决定不限流」与「作者忘了写」在代码里长得一模一样，
+  // 而覆盖率门（`tests/security/rate-limit-coverage.test.ts`）正是要区分这两者。
+  @SkipRateLimit()
   // POST 的 Nest 默认状态码是 **201 Created**，而登出没有创建任何资源——
   // 返回 201 会让「用状态码判断成败」的客户端把它当成功的同时，
   // 也让日志/监控里每次登出都记成一个「创建」事件。显式改成 200。
@@ -102,6 +112,8 @@ export class AuthController {
   }
 
   @Policy({ resource: 'Session', action: 'read' })
+  // 读自己的会话：同样不在威胁 #13 的名单里，显式声明「有意不限流」（理由见 `logout`）。
+  @SkipRateLimit()
   @Get('me')
   me(@Req() req: Request) {
     return this.auth.me(req.cookies?.[SESSION_COOKIE]);

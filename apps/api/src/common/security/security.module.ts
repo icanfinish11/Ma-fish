@@ -1,7 +1,13 @@
 import { Global, Module } from '@nestjs/common';
 import { ThrottlerModule } from '@nestjs/throttler';
+import type { Redis } from 'ioredis';
+// `REDIS` 令牌定义在 `session.service.ts`（`db/redis.module.ts` 也是从那里 import 的：
+// 它只在 `exports: [REDIS]` 里给出 Nest 的提供者，**没有**再 ES 导出这个常量）。
+// 沿用同一处定义，令牌的唯一性才成立。
+import { REDIS } from '../../modules/auth/session.service.js';
 import { CsrfGuard } from './csrf.guard.js';
 import { CsrfMiddleware } from './csrf.middleware.js';
+import { RedisThrottlerStorage } from './redis-throttler.storage.js';
 import { throttlerOptions } from './throttler.js';
 
 /**
@@ -13,9 +19,29 @@ import { throttlerOptions } from './throttler.js';
  * `@nestjs/throttler@6.7.1` 的 `throttler.module.js`：`ThrottlerModuleOptions` 是
  * `Array<ThrottlerOptions> | { throttlers: Array<ThrottlerOptions>; … }`，**数组形式仍然可用**
  * （它被当作 legacy 形态，`onModuleInit` 里两条分支都处理）。此处用对象形式，
- * 因为那是 v6 的文档形态，也是将来要加 `storage`（Redis 共享桶）时唯一能扩展的位置：
+ * 因为那是 v6 的文档形态，也是加 `storage` 时唯一能扩展的位置：
  * 数组形式下 `commonOptions` 被硬置为 `{}`（`throttler.guard.js` 第 52–54 行），
  * 想加 `storage` 就必须改结构。数值全部来自 `RATE_LIMITS`，与 brief 逐条一致。
+ *
+ * ## 修复轮 1（C-1）：限流桶搬到 Redis，改成 `forRootAsync`
+ *
+ * 设计 §3.1 把「限流桶」与会话、锁一起放在 Redis。此前用的是库默认的
+ * `ThrottlerStorageService`（**每个应用实例一份进程内 Map**），后果有二：
+ * 横向扩到 N 个实例时每个阈值**静默变成 N 倍**；以及重启即清零。
+ * 两者都是「声明了但没执行」，与 append-only 的空操作 `REVOKE`、C9 漏掉 `.tsx` 的扫描器、
+ * C10 的死代码规则、brief 那条恒真断言同一个缺陷类。
+ *
+ * 现在的接线：`forRootAsync({ inject: [REDIS], useFactory })` → 工厂里
+ * `new RedisThrottlerStorage(redis)` 作为 `storage` 交给库。
+ * **为什么必须是「实例」而不是「类」**：库的 `ThrottlerStorageProvider`
+ * （`throttler.providers.js` 第 16–24 行）是
+ * `options.storage ? options.storage : new ThrottlerStorageService()`——
+ * 它不做 DI 解析，只接受一个现成对象。
+ *
+ * `REDIS` 来自 `@Global()` 的 `RedisModule`，因此本模块不需要（也不该）重复 import 它；
+ * `AppModule` 里 `RedisModule` 排在 `SecurityModule` 之前，注入边是明确的。
+ *
+ * 层定义（`throttlerOptions()`）与数值**一个字都没改**（C12）。
  *
  * ## 为什么 `ThrottlerGuard` 的注册**不在这里**
  *
@@ -25,10 +51,19 @@ import { throttlerOptions } from './throttler.js';
  */
 @Global()
 @Module({
-  imports: [ThrottlerModule.forRoot({ throttlers: throttlerOptions() })],
+  imports: [
+    ThrottlerModule.forRootAsync({
+      inject: [REDIS],
+      useFactory: (redis: Redis) => ({
+        throttlers: throttlerOptions(),
+        storage: new RedisThrottlerStorage(redis),
+      }),
+    }),
+  ],
   providers: [CsrfGuard, CsrfMiddleware],
   // `CsrfMiddleware` 必须**导出**：它在 `AppModule.configure` 里注册，而 Nest 从
   // **注册它的那个模块**解析中间件的依赖（见 `auth.module.ts` 的实测说明）。
+  // `CsrfGuard` 导出，是为了让 `AppModule` 能用 `useExisting` 指向**同一个实例**（C-2）。
   // `ThrottlerModule` 一并导出，供将来按 `@Throttle` 覆盖数值的业务模块使用。
   exports: [CsrfGuard, CsrfMiddleware, ThrottlerModule],
 })

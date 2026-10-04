@@ -3,7 +3,9 @@ import request from 'supertest';
 import { Controller, Get, Module, Res, type INestApplication } from '@nestjs/common';
 import { Public } from '@vca/api/common/policy/policy.decorator.js';
 import { buildHelmetOptions } from '@vca/api/common/security/headers.js';
+import { REDIS } from '@vca/api/modules/auth/session.service.js';
 import { createTestApp } from '../helpers/app.js';
+import { startTestRedis, type TestRedis } from '../helpers/redis.js';
 
 /** nonce 探针的响应体（断言用，字段是 `unknown`：回显的就是响应对象上的原始值）。 */
 interface NonceProbeBody {
@@ -31,6 +33,14 @@ interface NonceProbeBody {
  * 那时 CSP 头看起来完全正常，而页面里注入的 nonce 永远不匹配——CSP 会静默地把
  * **自己的**脚本全挡掉（表现为「页面白屏，控制台一堆 CSP 报错」）。
  * 所以第 2 条断言的是「探针回显的 nonce 与它自己那次响应的 CSP 头里的 nonce **逐字相同**」。
+ *
+ * ## 修复轮 1 / C-1：本文件也要一个自己的 Redis 容器
+ *
+ * 「错误响应同样带头」那条用例会 `POST /auth/login`（拿一个 403 来断言错误响应也有头）。
+ * 限流桶搬进 Redis 之后，那个请求会**真的**写进登录层的桶（`by: 'ip+account'`，
+ * 5 次/15 分钟，桶键含固定邮箱 ⇒ 跨运行累积）。用测试进程默认的 compose Redis 时，
+ * 同一小时内跑到第 6 次就会在 CSRF 之前被 429 掉，于是这条断言变成随机失败。
+ * 一次性容器让每次运行都是干净桶；`REDIS` 覆盖见 `beforeAll`。
  */
 
 /** 从 CSP 头里取出 nonce（`'nonce-…'`）。 */
@@ -66,13 +76,22 @@ class NonceProbeModule {}
 
 describe('安全响应头与 CSP（威胁 #9 / 验收 13.2）', () => {
   let app: INestApplication;
+  let redis: TestRedis;
 
   beforeAll(async () => {
-    app = await createTestApp({ withSecurity: true, extraModules: [NonceProbeModule] });
-  });
+    // 一次性 Redis（见文件头）：桶从这个容器开始，跨运行不累积。
+    redis = await startTestRedis();
+    app = await createTestApp({
+      withSecurity: true,
+      extraModules: [NonceProbeModule],
+      overrides: [(b) => b.overrideProvider(REDIS).useValue(redis.newClient())],
+    });
+  }, 180_000);
 
   afterAll(async () => {
+    // 顺序不能反：先关应用（`RedisLifecycle` 会 disconnect 那个客户端），再停容器。
     await app?.close();
+    await redis?.stop();
   });
 
   it('设置 nosniff / frame-deny / referrer-policy', async () => {

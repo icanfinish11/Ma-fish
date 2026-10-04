@@ -1,6 +1,7 @@
 import { Injectable, type Type } from '@nestjs/common';
 import { DiscoveryService, MetadataScanner, Reflector } from '@nestjs/core';
 import { POLICY_KEY, PUBLIC_KEY, type PolicyDecl } from './policy.decorator.js';
+import { readRateLimitDecl, type RateLimitName } from '../security/throttler.js';
 
 /** 一条已注册路由及其策略声明（覆盖率门的输入）。 */
 export interface RouteEntry {
@@ -10,6 +11,10 @@ export interface RouteEntry {
   path: string;
   decl: PolicyDecl | null;
   isPublic: boolean;
+  /** 本路由声明的限流层（`@RateLimited`）；未声明为 `null`。 */
+  rateLimit: RateLimitName | null;
+  /** 本路由是否显式标记了「有意不限流」（`@SkipRateLimit()`）。 */
+  rateLimitSkipped: boolean;
 }
 
 /**
@@ -21,6 +26,19 @@ export interface RouteEntry {
  *
  * 两者读的是**同一个** `POLICY_KEY` / `PUBLIC_KEY`、同一套优先级（方法优先于类，见下），
  * 因此门禁看到的声明与守卫实际执行的声明不会漂移。
+ *
+ * ## 修复轮 1（C-4）：**同一个**注册表也报告限流声明，而不是再加一个并行的 walker
+ *
+ * 限流的覆盖率门（`tests/security/rate-limit-coverage.test.ts`）与策略门问的是同一个问题：
+ * 「这条已注册的路由声明了它的安全归属吗」。再写一遍 `DiscoveryService` + `MetadataScanner`
+ * 的遍历等于把「哪些是路由」这件事表达两次——两份实现迟早漂移，而漂移方向通常是
+ * 「一条新路由被其中一份漏掉」，正是门要防的东西。因此这里扩展同一份 `RouteEntry`。
+ *
+ * 声明本身仍由 `throttler.ts` 的 `readRateLimitDecl()` 读（守卫的 `skipIf` 用的是同一个函数），
+ * 注册表只负责「枚举路由」这一件事。
+ *
+ * **名字保留 `PolicyRegistry`**：它是 Task 5 的既有名字，改名会波及既有断言面，
+ * 属于修复轮之外的改动。它的职责应读作「路由声明的注册表」。
  */
 @Injectable()
 export class PolicyRegistry {
@@ -56,6 +74,7 @@ export class PolicyRegistry {
         if (routePath === undefined) continue;
         const isPublic = (this.reflector.get<boolean>(PUBLIC_KEY, handler) ?? false) || controllerPublic;
         const decl = this.reflector.get<PolicyDecl>(POLICY_KEY, handler) ?? controllerPolicy;
+        const rateLimit = readRateLimitDecl(handler, wrapper.metatype as Type);
         out.push({
           controller: (wrapper.metatype as Type).name,
           handler: methodName,
@@ -64,6 +83,8 @@ export class PolicyRegistry {
           path: normalizePath(`/${controllerPath}/${routePath}`),
           decl: decl ?? null,
           isPublic,
+          rateLimit: rateLimit.tier,
+          rateLimitSkipped: rateLimit.unlimited,
         });
       }
     }
@@ -80,6 +101,32 @@ export class PolicyRegistry {
     return this.listRoutes()
       .filter((r) => !r.isPublic && r.decl === null)
       .map((r) => `${r.controller}.${r.handler}  ${r.path}`);
+  }
+
+  /**
+   * 限流覆盖率门用：**没有**限流归属的路由（应当为空）。
+   *
+   * 两种形态都算「没有归属」，因此错误信息必须分得清：
+   *
+   * 1. `rateLimit === null && !rateLimitSkipped` —— 漏声明。新增路由时最容易发生，
+   *    而它在运行期的表现是**完全不限流**；
+   * 2. `rateLimit !== null && rateLimitSkipped` —— 自相矛盾：既声明了某一层、
+   *    又要求豁免。运行期以层声明为准（fail-strict），但两种声明里必有一个在说谎，
+   *    所以一样报出来，而不是静默挑一个执行。
+   */
+  listRateLimitGaps(): string[] {
+    return this.listRoutes()
+      // **两个条件必须是「异或」，不是「或」**：合法状态有两种——只声明层、或只标豁免，
+      // 因此「缺归属」= 恰好只有一个成立。写成 `rateLimit === null || rateLimitSkipped`
+      // 会把**合法的**`@SkipRateLimit()` 路由（层为空 + 有标）一并报出来，
+      // 于是门对着照规矩写的代码变红（修复轮 1 实测踩到过：`/health` 被误报）。
+      .filter((r) => (r.rateLimit === null) === !r.rateLimitSkipped)
+      .map((r) => {
+        const where = `${r.controller}.${r.handler}  ${r.path}`;
+        return r.rateLimitSkipped
+          ? `${where}  ← 同时声明了 ${r.rateLimit} 层与 @SkipRateLimit()：两种声明矛盾`
+          : `${where}  ← 既未声明 @RateLimited(...)，也未标 @SkipRateLimit()`;
+      });
   }
 
   /** 按「控制器类名 + 方法名」定位一条路由（供需要精确查声明的测试使用）。 */

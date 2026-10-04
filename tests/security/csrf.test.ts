@@ -1,9 +1,12 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
-import type { INestApplication } from '@nestjs/common';
+import type { ExecutionContext, INestApplication } from '@nestjs/common';
 import { AuthService } from '@vca/api/modules/auth/auth.service.js';
+import { REDIS } from '@vca/api/modules/auth/session.service.js';
+import { CsrfGuard } from '@vca/api/common/security/csrf.guard.js';
 import { CSRF_COOKIE, CSRF_HEADER } from '@vca/api/common/security/csrf.middleware.js';
 import { createTestApp } from '../helpers/app.js';
+import { startTestRedis, type TestRedis } from '../helpers/redis.js';
 
 /**
  * CSRF 双提交令牌（威胁 #10 / C13）。
@@ -24,6 +27,15 @@ import { createTestApp } from '../helpers/app.js';
  * `ForbiddenException`（403）是本仓库既有的判权语义（`PolicyGuard` 也用 403）。
  * CSRF 失败与「身份不够」在状态码上同形、在**消息**上可分（`CSRF 令牌…` vs `需要登录`）——
  * 用状态码区分会引入一个新的状态码语义，代价大于收益。
+ *
+ * ## 修复轮 1 / C-1：本文件每个 describe 一个自己的 Redis 容器
+ *
+ * 这些用例打的是真实 `/auth/login`（拿 403 来断言 CSRF），而**限流守卫排在 CSRF 之前**，
+ * 因此每个请求都会真的写进 Redis 里的桶（登录层 `by: 'ip+account'`，5 次/15 分钟，
+ * 桶键含固定邮箱 ⇒ 跨运行累积）。用测试进程默认的 compose Redis 时，
+ * 同一刻钟内跑到第 6 次就会在 CSRF 之前被 429 掉——断言变成随机失败。
+ * 每个 describe 一个一次性容器（`tests/helpers/redis.ts`）让预算从零开始：
+ * 第一个 describe 用掉登录层 4 次、注册层 1 次，都有余量。
  */
 
 /**
@@ -61,13 +73,19 @@ const SAFE = ['GET', 'HEAD', 'OPTIONS'] as const;
 
 describe('CSRF 双提交令牌（威胁 #10 / C13）', () => {
   let app: INestApplication;
+  let redis: TestRedis;
 
   beforeAll(async () => {
-    app = await createTestApp({ withSecurity: true });
-  });
+    redis = await startTestRedis();
+    app = await createTestApp({
+      withSecurity: true,
+      overrides: [(b) => b.overrideProvider(REDIS).useValue(redis.newClient())],
+    });
+  }, 180_000);
 
   afterAll(async () => {
     await app?.close();
+    await redis?.stop();
   });
 
   it('不带令牌的写操作被拒绝（403）', async () => {
@@ -118,6 +136,38 @@ describe('CSRF 双提交令牌（威胁 #10 / C13）', () => {
       expect(res.status, `${r.method.toUpperCase()} ${r.path} 未受 CSRF 保护`).toBe(403);
     }
   });
+
+  /**
+   * 修复轮 1 / C-2：全局守卫与可注入的 `CsrfGuard` 必须是**同一个实例**。
+   *
+   * ## 为什么这条断言是**行为**证明，而不是 `app.get(CsrfGuard) === app.get(APP_GUARD)`
+   *
+   * `app.get(APP_GUARD)` 取不到东西（实测抛 `Nest could not find APP_GUARD element`，
+   * 见 `policy-default-deny.test.ts` 的同一处说明）。所以这里换一个能观察的方向：
+   * 只在**注入到的那个实例**上包一层计数，然后发一个真实请求。
+   *
+   * `useExisting` ⇒ 拦请求的就是它 ⇒ 计数为 1；
+   * `useClass` ⇒ Nest 为 `APP_GUARD` 另造了一个实例，包在旧实例上的计数器**永远是 0**
+   * （而请求照样 403，所以「只看状态码」区分不出来——这正是这类缺陷难查的原因）。
+   */
+  it('全局守卫就是 SecurityModule 导出的那个实例（C-2：useExisting 而不是 useClass）', async () => {
+    const injected = app.get(CsrfGuard);
+    const calls = vi.fn();
+    const original = injected.canActivate.bind(injected);
+    injected.canActivate = (context: ExecutionContext): boolean => {
+      calls();
+      return original(context);
+    };
+
+    const res = await request(app.getHttpServer())
+      .post('/auth/login')
+      // 换一个邮箱：`by: 'ip+account'` 的桶键含账号，避免与本文件前几条用例共用桶
+      // （登录层 5 次/15 分钟，前四条已经用掉 4 次）。
+      .send({ email: 'csrf-same-instance@example.com', password: 'x'.repeat(12) });
+
+    expect(res.status).toBe(403); // 保护照旧生效
+    expect(calls, '全局 CSRF 守卫不是注入到的那个实例（`useClass` 会另造一个）').toHaveBeenCalledTimes(1);
+  });
 });
 
 /**
@@ -125,17 +175,25 @@ describe('CSRF 双提交令牌（威胁 #10 / C13）', () => {
  */
 describe('CSRF：令牌下发与放行（C13 的另一半）', () => {
   let app: INestApplication;
+  let redis: TestRedis;
 
   beforeAll(async () => {
+    // 与上一个 describe **各自的**容器：注册层 3 次/小时，两个 describe 各用掉 1 次，
+    // 共用容器时只有 1 次余量，任何新用例都会以 429 的形式莫名其妙地红。
+    redis = await startTestRedis();
     app = await createTestApp({
       withSecurity: true,
       // `overrideProvider` 必须在 `compile()` 之前：`createTestApp` 内部顺序已是如此。
-      overrides: [(builder) => builder.overrideProvider(AuthService).useValue(stubAuth)],
+      overrides: [
+        (builder) => builder.overrideProvider(AuthService).useValue(stubAuth),
+        (builder) => builder.overrideProvider(REDIS).useValue(redis.newClient()),
+      ],
     });
-  });
+  }, 180_000);
 
   afterAll(async () => {
     await app?.close();
+    await redis?.stop();
   });
 
   it('安全请求下发 vca_csrf cookie，且它必须**可被 JS 读取**（HttpOnly=false）', async () => {

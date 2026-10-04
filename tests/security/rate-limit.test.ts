@@ -1,11 +1,18 @@
-import { describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import type { ExecutionContext, INestApplication } from '@nestjs/common';
+import type { Redis } from 'ioredis';
 import { AuthService } from '@vca/api/modules/auth/auth.service.js';
+import { REDIS } from '@vca/api/modules/auth/session.service.js';
 import { CSRF_COOKIE, CSRF_HEADER } from '@vca/api/common/security/csrf.middleware.js';
 import { RATE_LIMITS, trackerFor } from '@vca/api/common/security/throttler.js';
+import {
+  RedisThrottlerStorage,
+  THROTTLE_KEY_PREFIX,
+} from '@vca/api/common/security/redis-throttler.storage.js';
 import { runInContext } from '@vca/api/common/context/request-context.js';
 import { createTestApp } from '../helpers/app.js';
+import { startTestRedis, type TestRedis } from '../helpers/redis.js';
 
 /**
  * 分层限流（威胁 #13 / C12）。
@@ -19,11 +26,19 @@ import { createTestApp } from '../helpers/app.js';
  * 并把恒真的那一条换成真正会红的用例（Ruling 5）：在真实路由上把某一层打满，
  * 断言 429 + `Retry-After`。变异探针见报告（去掉守卫 → 本文件立刻红）。
  *
- * ## 为什么三个用例各起一个应用
+ * ## 修复轮 1 / C-1：桶搬进 Redis 之后，测试的隔离方式**必须**跟着改
  *
- * 限流计数在**进程内**（`ThrottlerStorageService` 的 Map，每个应用实例一份），
- * 且键是「控制器-处理器-层-分桶」。三个用例若共用应用实例，计数会互相污染，
- * 断言就变成顺序相关的——那种测试在单独跑时绿、全量跑时红，最难查。
+ * 此前每个 `createTestApp()` 天生带一份干净的进程内桶，所以「一个用例起一个应用」
+ * 就等于「一个用例一份干净计数」。现在桶在 Redis（这正是 C-1 要的），
+ * 计数**跨应用、跨运行**共享，于是：
+ *
+ * - 每个应用通过 `REDIS` 覆盖拿到**自己的客户端**，且指向本文件**自己的容器**
+ *   （`tests/helpers/redis.ts`）。用测试进程默认的 `REDIS_URL`（本机 compose 那个）
+ *   会让注册层的桶（TTL 1 小时）在两次运行之间累积，第二次跑就变成随机红；
+ * - 三个用例走的是**不同的路由**（⇒ 不同的桶键：`generateKey` 里含控制器+处理器+层名），
+ *   因此同一个容器里它们互不污染；
+ * - 需要「两个实例共用同一个桶」的用例（见下）必须**另起一个容器**——
+ *   它打的正是注册层，与第一个用例的桶键完全相同。
  *
  * ## 为什么桩掉 `AuthService`
  *
@@ -43,16 +58,34 @@ const stubAuth = {
 const CSRF_TOKEN = 'rate-limit-probe-token-0123456789';
 const withCsrf = { Cookie: `${CSRF_COOKIE}=${CSRF_TOKEN}`, [CSRF_HEADER]: CSRF_TOKEN } as const;
 
-async function withApp<T>(options: Parameters<typeof createTestApp>[0], fn: (app: INestApplication) => Promise<T>): Promise<T> {
-  const app = await createTestApp({ overrides: [(b) => b.overrideProvider(AuthService).useValue(stubAuth)], ...options });
-  try {
-    return await fn(app);
-  } finally {
-    await app.close();
-  }
-}
-
 describe('分层限流（威胁 #13 / C12）', () => {
+  let redis: TestRedis;
+
+  beforeAll(async () => {
+    redis = await startTestRedis();
+  }, 180_000);
+
+  afterAll(async () => {
+    await redis?.stop();
+  });
+
+  /** 每个用例一个应用；应用自带一个指向本文件容器的 Redis 客户端（生命周期属于应用）。 */
+  async function withApp<T>(fn: (app: INestApplication) => Promise<T>): Promise<T> {
+    const app = await createTestApp({
+      overrides: [
+        (b) => b.overrideProvider(AuthService).useValue(stubAuth),
+        (b) => b.overrideProvider(REDIS).useValue(redis.newClient()),
+      ],
+    });
+    try {
+      return await fn(app);
+    } finally {
+      // `app.close()` → `RedisLifecycle.onApplicationShutdown` 会 disconnect 那个客户端；
+      // 重复关闭会在输出里留下 ioredis 的 `Connection is closed.`（见 integration 套件的实测）。
+      await app.close();
+    }
+  }
+
   it('限流表与设计文档 §4.1 威胁 #13 逐条一致', () => {
     expect(RATE_LIMITS.login).toEqual({ limit: 5, ttlMs: 15 * 60_000, by: 'ip+account' });
     expect(RATE_LIMITS.register).toEqual({ limit: 3, ttlMs: 60 * 60_000, by: 'ip' });
@@ -62,7 +95,7 @@ describe('分层限流（威胁 #13 / C12）', () => {
   });
 
   it('注册层（3 次/小时，按 IP）：第 4 次返回 429，且带 Retry-After', async () => {
-    await withApp({ withSecurity: true }, async (app) => {
+    await withApp(async (app) => {
       const statuses: number[] = [];
       const responses: request.Response[] = [];
       for (let i = 0; i < 4; i++) {
@@ -88,7 +121,7 @@ describe('分层限流（威胁 #13 / C12）', () => {
   });
 
   it('登录层（5 次/15 分钟，按 IP+账号）：第 6 次 429，换个账号仍然放行', async () => {
-    await withApp({ withSecurity: true }, async (app) => {
+    await withApp(async (app) => {
       const attempt = (email: string) =>
         request(app.getHttpServer())
           .post('/auth/login')
@@ -114,7 +147,7 @@ describe('分层限流（威胁 #13 / C12）', () => {
     // 会对**每一个**已配置的层求值**每一个**未跳过的路由，`@Throttle` 只覆盖**同名**那一层。
     // 因此若不按「本路由是否声明了该层」过滤，/health 会被 5 层里最严的
     // 「注册 3 次/小时」压住——第 4 次就 429，健康探针会把整个实例判死（LB 探活失败）。
-    await withApp({ withSecurity: true }, async (app) => {
+    await withApp(async (app) => {
       const statuses: number[] = [];
       for (let i = 0; i < 6; i++) {
         statuses.push((await request(app.getHttpServer()).get('/health')).status);
@@ -123,6 +156,140 @@ describe('分层限流（威胁 #13 / C12）', () => {
     });
   });
 });
+
+/**
+ * **判别性用例**（修复轮 1 / C-1）：限流桶在 Redis，因此两个独立的 Nest 应用实例
+ * 共用同一个计数。
+ *
+ * 内存存储下这条用例**必红**：`ThrottlerStorageService` 的 Map 是每个应用实例一份，
+ * 两个实例各自有 3 次/小时的额度，于是 B 的两次请求都会是 201，
+ * 而实际阈值会随实例数变成 3N 次——这正是「声明了但没执行」的失效形态。
+ *
+ * 这也是唯一能区分「桶在 Redis」与「桶在进程内」的测试形态：单实例的
+ * 「打满仍然返回 429」在两种存储上都通过，证明不了任何新东西。
+ *
+ * 另起一个容器：本用例打的是注册层（按 IP 分桶），与上面第一个用例的桶键完全相同。
+ */
+describe('限流桶在 Redis：两个应用实例共享同一个计数（修复轮 1 / C-1）', () => {
+  let redis: TestRedis;
+  let inspector: Redis;
+  let instanceA: INestApplication;
+  let instanceB: INestApplication;
+
+  const bootInstance = (client: Redis) =>
+    createTestApp({
+      overrides: [
+        (b) => b.overrideProvider(AuthService).useValue(stubAuth),
+        (b) => b.overrideProvider(REDIS).useValue(client),
+      ],
+    });
+
+  beforeAll(async () => {
+    redis = await startTestRedis();
+    // **两个独立客户端**（不是一个客户端被两个应用借用）：各自的生命周期属于各自的实例，
+    // 关掉 A 不会顺手掐断 B 的连接。它们指向**同一个** Redis。
+    inspector = redis.newClient();
+    instanceA = await bootInstance(redis.newClient());
+    instanceB = await bootInstance(redis.newClient());
+  }, 180_000);
+
+  afterAll(async () => {
+    await instanceA?.close();
+    await instanceB?.close();
+    // `inspector` 不属于任何应用，没有钩子会替你收（ioredis 的活跃 socket 会让 worker 不退出）。
+    inspector?.disconnect();
+    await redis?.stop();
+  });
+
+  it('实例 A 用掉 2 次额度后，实例 B 的第 2 次就是全局第 4 次 ⇒ 429', async () => {
+    const register = (app: INestApplication, i: number) =>
+      request(app.getHttpServer())
+        .post('/auth/register')
+        .set(withCsrf)
+        .send({ email: `shared-bucket-${i}@example.com`, password: 'a-strong-passphrase' });
+
+    const onA = [(await register(instanceA, 1)).status, (await register(instanceA, 2)).status];
+    expect(onA, '实例 A 自己就把 3 次/小时的额度用完了，后面的断言无从谈起').toEqual([201, 201]);
+
+    // 实例 B 的**第 1 次**是全局第 3 次 ⇒ 仍然放行（证明 B 确实在看同一个桶，而不是碰巧坏了）；
+    // 第 2 次是全局第 4 次 ⇒ 429。
+    // 内存存储下这里是 [201, 201]（每个实例各有 3 次额度）⇒ 用例变红。
+    const onB = [(await register(instanceB, 3)).status, (await register(instanceB, 4)).status];
+    expect(onB, '两个实例没有共用同一个桶：各自放行了 3 次（阈值被实例数放大）').toEqual([201, 429]);
+
+    // 直接证明「桶确实落在 Redis 里」而不是某个模块级共享 Map：
+    // 前者能与进程外的实例共享、能在重启后存活，后者两条都做不到。
+    const keys = await inspector.keys(`${THROTTLE_KEY_PREFIX}*`);
+    expect(keys.length, `Redis 里没有任何 ${THROTTLE_KEY_PREFIX}* 键：计数没落在这里`).toBeGreaterThan(0);
+    const pttl = await inspector.pttl(keys[0]!);
+    // 有过期时间 ⇒ 桶不会永久留在库里（注册层 TTL 1 小时，封锁期同为 1 小时）。
+    expect(pttl, '限流桶没有设置过期时间：它会永久占住 Redis').toBeGreaterThan(0);
+    expect(pttl).toBeLessThanOrEqual(RATE_LIMITS.register.ttlMs);
+  });
+});
+
+/**
+ * 故障语义：**fail-closed**（修复轮 1 / C-1 的第二半）。
+ *
+ * 决定与理由写在 `RedisThrottlerStorage.increment` 的注释里，这里只固定**后果**：
+ * 存储不可用时受限路由返回 500，**绝不放行**。若有人把 storage 改成
+ * 「catch 住错误、返回一个 `isBlocked: false` 的记录」（最诱人的写法），
+ * 下面两条都会红：第一条（`increment` 不再 reject）与第二条（请求变成 201）。
+ */
+describe('限流存储不可用：fail-closed，不放行（修复轮 1 / C-1）', () => {
+  /**
+   * 一个「命令必定失败」的 Redis 替身。
+   *
+   * 为什么不用「指向一个死端口的真客户端」：那会带来 ioredis 的重连与
+   * `[ioredis] Unhandled error event` 噪音（本仓库要求输出 pristine），
+   * 而本用例要观察的是「存储报错之后限流器怎么办」，不是「ioredis 怎么报连接错误」。
+   * `status`/`disconnect` 是 `RedisLifecycle` 关停路径会用到的两个成员。
+   */
+  const failingRedis = {
+    status: 'ready',
+    eval: () => Promise.reject(new Error('ECONNREFUSED（探针替身：模拟限流存储不可用）')),
+    disconnect: () => undefined,
+  } as unknown as Redis;
+
+  it('存储命令失败时 increment 抛错，而不是返回一个「未拦截」的记录', async () => {
+    const storage = new RedisThrottlerStorage(failingRedis);
+    await expect(storage.increment('probe-key', 60_000, 3, 60_000, 'register')).rejects.toThrow(/ECONNREFUSED/);
+  });
+
+  it('存储故障时受限路由的请求被拒（500），不会被放行', async () => {
+    const app = await createTestApp({
+      overrides: [
+        (b) => b.overrideProvider(AuthService).useValue(stubAuth),
+        (b) => b.overrideProvider(REDIS).useValue(failingRedis),
+      ],
+    });
+    try {
+      // 这一条**故意**造成一次 500，而 Nest 的异常过滤器会把未捕获异常的栈打到控制台
+      // （测试进程里 pino 是静音的，但 Nest 的 ConsoleLogger 不是）。
+      // `useLogger(false)` 是 Nest 官方的「关掉框架日志」入口（`Logger.overrideLogger(false)`
+      // → `staticInstanceRef = undefined`，实测见修复轮报告），这里只为了让
+      // 「预期中的失败」不污染 pristine 输出。它作用在该 worker 的静态 logger 上，
+      // 因此本用例被放在文件末尾，不影响其他用例。
+      app.useLogger(false);
+
+      const res = await request(app.getHttpServer())
+        .post('/auth/register')
+        .set(withCsrf)
+        .send({ email: 'fail-closed@example.com', password: 'a-strong-passphrase' });
+
+      // fail-closed 的形态：请求被拒（500 而不是 201）。Redis 故障时**放行**才是缺陷。
+      expect(res.status, failClosedHint(res.status)).toBe(500);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+function failClosedHint(status: number): string {
+  return status < 400
+    ? `限流存储不可用时请求仍然被放行（${status}）：这是 fail-open`
+    : `预期 500（fail-closed），实际 ${status}`;
+}
 
 /**
  * 分桶维度（`by`）的纯函数断言。
