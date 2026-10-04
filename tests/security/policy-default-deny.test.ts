@@ -34,6 +34,13 @@ import { AppModule } from '@vca/api';
  * Task 6 的会话中间件：带上 `x-test-user` 头即视为已认证，不带则匿名。
  * 中间件与生产同款（`runInContext(ctx, () => next())`，见 `trace.middleware.ts`）。
  *
+ * ## 默认是「已认证」而不是「所有人」（方案 B，修复轮裁决）
+ *
+ * 除 `@Public()` 外的**任何**声明都要求身份，包括**没有** condition 的声明——
+ * 判据是「忘了写 condition」只该降级成「任何已登录用户」，而不是「任何人」。
+ * 「所有人可访问」由 `@Public()` 独占表达。因此本文件里那条无 condition 的 `/probe/declared`
+ * **匿名必须 403**（它下面有正反两条用例）。
+ *
  * ## Ruling 3：输出必须 pristine，但**不许**把生产日志删掉
  *
  * 默认拒绝那条路径会 `logger.warn`，条件未注册那条会 `logger.error`。
@@ -79,7 +86,10 @@ class ProbeController {
     return { ok: true };
   }
 
-  /** 声明「资源-动作」但无附加条件：对应 §9 的「所有人」行（如 Asset 元数据 read）。 */
+  /**
+   * 声明「资源-动作」但**无**附加条件：语义是「登录即可」——仍然要求身份（方案 B）。
+   * 它同时是「忘了写 condition」这一失误的**降级形态**：爆炸半径被压到「任何已登录用户」。
+   */
   @Policy({ resource: 'Asset', action: 'read' })
   @Get('declared')
   declared(): { ok: boolean } {
@@ -205,8 +215,19 @@ describe('PolicyGuard 默认拒绝（威胁 #1）', () => {
     expect(res.status).toBe(200);
   });
 
-  it('显式声明策略的路由在其条件满足时放行', async () => {
+  it('声明了策略但无附加条件，且请求匿名：拒绝（无 condition 不等于「无需身份」）', async () => {
+    // 方案 B 的核心断言，也是「忘了写 condition」这一失误的看守者：
+    // 没有身份 ⇒ 403『需要登录』，而不是放行。改坏守卫（无条件声明直接 return true）
+    // 会让**恰好这一条**变红，见报告修复轮的变异探针 P9。
     const res = await request(app.getHttpServer()).get('/probe/declared');
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ message: '需要登录' });
+  });
+
+  it('声明了策略但无附加条件，且已认证：放行（身份由 ALS 上下文提供，与生产路径同款）', async () => {
+    // 身份不是靠「削弱守卫」造出来的：走的是 ProbeIdentityMiddleware → runInContext(...)
+    // → currentContext().userId，即 Task 6 会话中间件将要走的同一条路径。
+    const res = await request(app.getHttpServer()).get('/probe/declared').set('x-test-user', 'user-1');
     expect(res.status).toBe(200);
   });
 

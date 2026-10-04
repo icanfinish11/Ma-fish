@@ -24,18 +24,26 @@ export type PolicyCondition = (ctx: PolicyContext) => boolean | Promise<boolean>
 /**
  * 全局授权守卫：**默认拒绝**（设计 §9 / 威胁 #1）。
  *
- * 判定顺序是承重的，四步都不可交换：
+ * 判定顺序是承重的，逐步都不可交换：
  *
- * 1. `@Public()` → 放行。这是唯一的白名单，且必须**显式**书写；
+ * 1. `@Public()` → 放行。这是**唯一**的白名单，且必须**显式**书写；
  * 2. 无任何声明 → 拒绝（403）+ 告警。这就是「默认拒绝」的全部含义：没写声明 = 没被授权，
  *    而不是「未声明即公开」；
- * 3. 有条件声明 → **先要求身份**，再求值条件。顺序不能反：条件做的判定是「这个人能不能」，
- *    匿名请求下让它返回 true 就等于把「谁」这一列从矩阵里抹掉；
- * 4. 有条件但条件未注册 → 拒绝（fail-closed）。
+ * 3. 有声明但**条件未注册** → 拒绝（fail-closed）+ error 告警。这是接线错误，先于身份判定报出来，
+ *    免得「条件忘了注册」被伪装成「你没登录」；
+ * 4. **任何**非 `@Public()` 的声明（**无论有没有条件**）都先要求身份：
+ *    `currentContext()?.userId` 缺失即 403 `需要登录`；
+ * 5. 无条件的声明到此放行（「登录即可」）；有条件声明再求值条件，为假则 403。
  *
- * 无条件的声明（`@Policy({resource, action})`）不要求身份，对应 §9 中「谁 = 所有人」的行
- * （`Asset` 元数据 read、`Bid.amount` read）。需要「登录即可」的路由应显式注册一个判定
- * `userId` 的条件，而不是依赖省略条件来表达——省略表达的是「对所有人成立」。
+ * 第 4 步对**无条件**声明同样生效，这是刻意的（方案 B，见任务报告修复轮）：
+ * 一个忘了写 condition 的声明，其爆炸半径被压到「任何已登录用户」而不是「任何人」。
+ * 「所有人可访问」这件事由 `@Public()` 独占表达，不需要第二条更弱的路径；
+ * §9 矩阵里「谁 = 所有人」的行（`Asset` 元数据 read、`Bid.amount` read）应标 `@Public()`
+ * 或在该路由上显式注册一个接受匿名的条件，而不是靠「省略 condition」来表达。
+ *
+ * 代价（如实记录）：`userId` 由请求上下文（ALS）提供，而**今天没有任何中间件往里写它**——
+ * 会话验证与上下文填充是 Task 6 的交付物。在那之前，无条件的声明一律 403，这是 fail-closed
+ * 的预期表现，不是缺陷。
  *
  * `Reflector` 走**构造函数注入**（NestJS 惯用法）：本仓库是 ESM，`require()` 在运行期不存在，
  * 守卫里绝不能出现动态 `require`。
@@ -73,12 +81,11 @@ export class PolicyGuard implements CanActivate {
     }
 
     if (decl.condition === undefined) {
-      // §9 中「谁 = 所有人」的行：声明本身就表示对所有调用方成立，因此不要求身份。
+      // 无条件声明 = 「登录即可」。**仍然要求身份**（方案 B）：省略 condition 表达的是
+      // 「不再附加资源级判定」，不是「无需身份」。「所有人」由 @Public() 独占表达。
+      if (!ctx?.userId) throw new ForbiddenException('需要登录');
       return true;
     }
-
-    // 有条件的声明必须有当事人：匿名请求不进条件判定，即使条件函数对匿名返回 true。
-    if (!ctx?.userId) throw new ForbiddenException('需要登录');
 
     const condition = this.conditions.get(decl.condition);
     if (!condition) {
@@ -86,6 +93,10 @@ export class PolicyGuard implements CanActivate {
       this.logger.error(`策略条件未注册，按默认拒绝处理：${decl.condition}`);
       throw new ForbiddenException('该资源未被授权访问');
     }
+
+    // 有条件的声明同样必须有当事人：匿名请求不进条件判定，即使条件函数对匿名返回 true。
+    // 顺序不能反——条件做的判定是「这个人能不能」，匿名下让它返回 true 就等于把「谁」抹掉。
+    if (!ctx?.userId) throw new ForbiddenException('需要登录');
 
     const req = context.switchToHttp().getRequest<Request>();
     const allowed = await condition({ req, decl, userId: ctx.userId });
