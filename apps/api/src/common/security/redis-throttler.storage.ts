@@ -60,34 +60,57 @@ export interface ThrottleRecord {
  * 本任务的五个层里最严的是「登录 5 次/15 分钟」——每请求多 ~1.5 KB 上行可以忽略。
  * 若将来限流路径成为热点，改成 `defineCommand` 是局部改动。
  *
- * ## 与库内存实现（`ThrottlerStorageService`）的语义对齐
+ * ## 窗口语义：**滚动窗口**（修复轮 2 改正；此前是固定窗口）
  *
- * 逐条对照 `throttler.service.js`（6.7.1）的 `increment`：
+ * 契约是 C12 的「登录 5 次 / 15 分钟」——一句**数值**话。要让它成立，
+ * 在**任意**一个长度为 `ttl` 的时间片里，被放行的命中都不得超过 `limit`。
+ * 这要求**逐命中过期**：每条记录只在自己的时刻起算 `ttl`，到期各自消失。
  *
- * 1. 窗口：命中数在 `ttl` 毫秒的**固定窗口**里累加，窗口开始时定死结束时刻
- *    （内存实现的 `expiresAt` 只在过期后才刷新，单个命中虽然各自带过期时间戳，
- *    但窗口起点就是第一个命中，因此两者的可观测行为一致）；
- * 2. 封锁：`blockDuration > 0` 时，**第 limit+1 次**命中把记录置为封锁，
- *    封锁到 `now + blockDuration`。封锁期间**不再累加命中**，
- *    因此反复敲门不会把窗口推后（这正是「封锁」与「计数」的区别）；
- * 3. 封锁到期：清空命中并重新开始窗口，当前这次请求算作第 1 次命中
+ * 上一版实现的是**固定窗口**（脚本开头 `windowEndsAt <= now` 就把计数整体清零、
+ * 并把窗口结束时刻定死），并把两者写成「可观测行为一致」——**那句话是错的**，
+ * 而且差的方向是**放宽**：贴着边界放 5 次、边界之后再放 5 次，10 次全部放行，
+ * 于是「15 分钟内最多 5 次口令猜测」变成「15 分钟跨度内最多 10 次」。更糟的是
+ * 窗口边界会通过 `X-RateLimit-Reset-<层名>` 响应头**告诉客户端**
+ * （guard 把 `timeToExpire` 直接塞进那个头），对齐边界因此是零成本的。
+ * 等价性说明已删除，本文件现在只描述**实际**语义。
+ *
+ * 现在用**有序集合**（score = 该次命中的毫秒时间戳）实现逐命中过期：
+ * 每次 `increment` 先 `ZREMRANGEBYSCORE` 剪掉「已经出窗」的成员（`score <= now - ttl`），
+ * 再 `ZCARD` 数出**当前窗口内**的命中数。因此：
+ *
+ * - 每次命中都带自己的过期时刻，互不影响；
+ * - 窗口是滑动的，不存在「对齐边界就能多拿一倍额度」这回事；
+ * - 集合在 `ttl` 内最多留下 `limit + 1` 个成员（超限即进封锁、封锁期间不再入账），
+ *   因此内存占用有界。
+ *
+ * 与库的内存实现（`throttler.service.js`）的关系**逐条**如下（不再声称"等价"）：
+ *
+ * 1. **窗口**：内存实现按**每个命中的 `expiresAt = now + ttl`** 剪枝
+ *    （`evictIdleRecords` 与 `getRecord` 里逐条比较），也就是滚动窗口。
+ *    本实现同为滚动窗口——这一条现在**真的**对上了（上一版的固定窗口是对不上的）。
+ *    边界取 `score <= now - ttl` 即出窗（左闭右开，时长恰好 `ttl`）。
+ * 2. **封锁**：`blockDuration > 0` 时，**第 limit+1 次**命中把记录置为封锁，
+ *    封锁到 `now + blockDuration`。封锁期间**不再累加命中**（也不写入有序集合），
+ *    因此反复敲门不会把窗口推后（这正是「封锁」与「计数」的区别）。
+ *    被拒的那次命中**不入账**：入了的话「每分钟敲一次、每次都被拒」会让窗口
+ *    永远有成员（每次都把最老的那条挤在 `ttl` 内）⇒ 实际效果是**永久封锁**，
+ *    而那正是本仓库在 `throttler-storage.test.ts` 里专门钉住的反面。
+ * 3. **封锁到期**：清空窗口并重新开始，当前这次请求算作第 1 次命中
  *    （内存实现在 `timeToBlockExpire <= 0 && isBlocked` 分支里 `resetBlockedRequest()` 后
- *    立刻 `fireHitCount()`，同一语义）；
+ *    立刻 `fireHitCount()`）。**据实记录的差异**：本实现在这里**无条件清空**
+ *    刚才存活的窗口成员，内存实现只清命中、不重置窗口。两者只在
+ *    `blockDuration > ttl` 时分叉，而 guard 默认 `blockDuration = ttl`
+ *    （`throttler.guard.js` 第 93 行 `?? namedThrottler.blockDuration ?? ttl`），
+ *    本仓库五个层都没显式配 ⇒ 在我们支持的全部配置下结果相同。
  * 4. `blockDuration <= 0`：走库的 `incrementWithoutBlock` 分支——阈值是 `>=`（不是 `>`），
- *    且被拒时 `totalHits` 仍然 +1；
+ *    且被拒时 `totalHits` 仍然 +1（`reportedHits`），但**不写入**有序集合（理由同第 2 条）。
  * 5. 时间单位：`ttl`/`blockDuration` 是**毫秒**入参，返回的两个时间是**秒**（库的
- *    `Retry-After`/`X-RateLimit-Reset` 直接取用，所以单位必须是秒）；
+ *    `Retry-After`/`X-RateLimit-Reset` 直接取用，所以单位必须是秒）。
+ *    `timeToExpire` 在滚动窗口下的含义是「**最老的那次命中**出窗还有多久」——
+ *    也就是「下一次可能有额度空出来」的秒数，这与 `X-RateLimit-Reset` 的用法一致；
+ *    窗口为空时退回封锁剩余（没有任何命中时它是唯一有意义的时刻）。
  * 6. 键的身份是 `(key, throttlerName)`——内存实现按这两个维度做二维 Map，
  *    因此这里把层名编进 Redis 键，而不是只依赖 `key`。
- *
- * ## 与内存实现的一处**已知差异**（据实记录）
- *
- * 内存实现在「封锁到期」时只清命中、**不重置窗口**（除非窗口恰好也过期了）。
- * 本实现无条件重开窗口。两者只有在 `blockDuration > ttl` 时才会分叉，
- * 而库的 guard 在层没有显式配 `blockDuration` 时把它默认成 `ttl`
- * （`throttler.guard.js` 第 93 行：`?? namedThrottler.blockDuration ?? ttl`），
- * 本仓库五个层都没有显式配置 ⇒ 封锁一定晚于窗口开始、早于窗口结束，
- * 因此两条路径在我们支持的全部配置下**结果相同**。
  *
  * ## 时间取的是 **Redis 服务器**的时钟（`redis.call('TIME')`）
  *
@@ -99,47 +122,63 @@ export interface ThrottleRecord {
  *
  * ## 过期与回收
  *
- * 每次写入都重设 `PEXPIRE` 到 `max(窗口结束, 封锁结束) - now`：
- * 记录一旦不再需要就被 Redis 自己回收，不会像「永不 EXPIRE 的计数器」那样
- * 把一个桶永久留在库里（内存实现里对应的是它的 `evictIdleRecords` 扫描）。
+ * 每次写入都重设**两个键**（记录键与它旁边的有序集合）的 `PEXPIRE` 到
+ * `max(最老命中 + ttl, 封锁结束) - now`：记录一旦不再需要就被 Redis 自己回收，
+ * 不会像「永不 EXPIRE 的计数器」那样把一个桶永久留在库里
+ * （内存实现里对应的是它的 `evictIdleRecords` 扫描）。
+ * 两个键都设是**承重**的：修复轮 2 把计数搬进有序集合时漏掉了记录键，
+ * 它立刻变成永不过期（`PTTL` 回 -1），被 `rate-limit.test.ts` 的既有断言当场抓到。
  */
 const INCREMENT_SCRIPT = `
 local key = KEYS[1]
 local ttl = tonumber(ARGV[1])
 local limit = tonumber(ARGV[2])
 local blockDuration = tonumber(ARGV[3])
+local memberSeed = ARGV[4]
 
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 
-local hits = tonumber(redis.call('HGET', key, 'hits') or '0')
-local windowEndsAt = tonumber(redis.call('HGET', key, 'windowEndsAt') or '0')
 local blockedUntil = tonumber(redis.call('HGET', key, 'blockedUntil') or '0')
 
-if windowEndsAt <= now then
-  hits = 0
-  windowEndsAt = now + ttl
-end
-
+-- 封锁到期：清空窗口（含有序集合），当前这次请求随后算作第 1 次命中。
 if blockedUntil > 0 and blockedUntil <= now then
   blockedUntil = 0
-  hits = 0
-  windowEndsAt = now + ttl
+  redis.call('DEL', key .. ':hits')
 end
 
+-- 逐命中过期：只保留「从自己的时刻起算还没走完 ttl」的命中。
+-- 右边界用 '(cutoff'（开区间）：score <= now - ttl 的成员被移除，
+-- 于是恰好满 ttl 的那次命中已经出窗，窗口长度精确等于 ttl。
+local cutoff = now - ttl
+redis.call('ZREMRANGEBYSCORE', key .. ':hits', '-inf', '(' .. cutoff)
+
+local hits = redis.call('ZCARD', key .. ':hits')
 local isBlocked = blockedUntil > now
-local timeToBlockExpire = 0
 local reportedHits = hits
+local timeToBlockExpire = 0
 
 if blockDuration > 0 then
   if not isBlocked then
-    hits = hits + 1
-    reportedHits = hits
-    if hits > limit then
+    -- 先记这一次命中，再判阈值：本次命中一定落在自己的窗口里
+    -- （score = now > now - ttl），因此「窗口内最多 limit 次」这条不变量是精确的。
+    local member = memberSeed .. ':' .. now
+    redis.call('ZADD', key .. ':hits', now, member)
+    if hits + 1 > limit then
       isBlocked = true
       blockedUntil = now + blockDuration
+      -- 被拒的这次**不入账**（见上方注释第 2 条）：否则反复敲门会让窗口
+      -- 永远有成员，实际效果是永久封锁。
+      redis.call('ZREM', key .. ':hits', member)
     end
   end
+  -- 报告值统一是「窗口内被放行的次数 + 本次（被拒的）尝试」，与内存实现一致
+  -- （那里 totalHits 把进入封锁的那一次也算在内）。于是：
+  --   * 进入封锁的那一次（第 limit+1 次敲门）报告 limit + 1；
+  --   * 封锁期间的每一次敲门报告同一个值（hits 不再增长，本次尝试恒为 1），
+  --     也就是**不随敲门次数增长**——这正是 throttler-storage.test.ts 第 2 条
+  --     钉住的性质（写成「每次 +1」会让窗口被反复推后 = 永久封锁）。
+  reportedHits = hits + 1
   if isBlocked then
     timeToBlockExpire = math.ceil((blockedUntil - now) / 1000)
   end
@@ -147,20 +186,33 @@ else
   isBlocked = hits >= limit
   if isBlocked then
     reportedHits = hits + 1
-    timeToBlockExpire = math.ceil((windowEndsAt - now) / 1000)
+    timeToBlockExpire = math.ceil(ttl / 1000)
   else
+    local member = memberSeed .. ':' .. now
+    redis.call('ZADD', key .. ':hits', now, member)
     hits = hits + 1
     reportedHits = hits
   end
 end
 
-redis.call('HSET', key, 'hits', hits, 'windowEndsAt', windowEndsAt, 'blockedUntil', blockedUntil)
+redis.call('HSET', key, 'blockedUntil', blockedUntil)
+
+-- 记录的寿命 = max(最老命中的出窗时刻, 封锁结束) - now，至少 1ms。
+local oldest = redis.call('ZRANGE', key .. ':hits', 0, 0, 'WITHSCORES')
+local windowEndsAt = now
+if oldest[2] then
+  windowEndsAt = tonumber(oldest[2]) + ttl
+end
 
 local expiresIn = math.max(windowEndsAt, blockedUntil) - now
 if expiresIn < 1 then
   expiresIn = 1
 end
+-- **两个键都要设过期**（修复轮 2 的回归：搬进有序集合后只给 key:hits 设了 TTL，
+-- 记录键 key 于是变成 -1「永不过期」，被 rate-limit.test.ts 的 PTTL 断言当场抓到）。
+-- 记录键在窗口为空且未封锁时只剩一个 0，寿命取 1ms 即可——下次命中会重新写它。
 redis.call('PEXPIRE', key, expiresIn)
+redis.call('PEXPIRE', key .. ':hits', expiresIn)
 
 return { reportedHits, math.ceil((windowEndsAt - now) / 1000), isBlocked and 1 or 0, timeToBlockExpire }
 `;
@@ -194,6 +246,16 @@ return { reportedHits, math.ceil((windowEndsAt - now) / 1000), isBlocked and 1 o
  */
 export class RedisThrottlerStorage implements ThrottlerStorage {
   private readonly logger = new Logger(RedisThrottlerStorage.name);
+
+  /**
+   * 有序集合成员名的去重序号（修复轮 2）。
+   *
+   * 成员名是 `<序号>:<now>`，而 `now` 是**毫秒**——同一毫秒内的两次命中会撞名，
+   * 于是 `ZCARD` 少数一次（阈值被**放宽**，方向不对）。加一个自增序号即可；
+   * 它**不需要**跨进程唯一：不同进程的时间戳不同毫秒的概率极高，即使撞了，
+   * 也只会像上面那样少算一次，而下面的 `hits > limit` 判断仍在同一脚本里原子完成。
+   */
+  private memberSeq = 0;
 
   constructor(private readonly redis: Redis) {}
 
@@ -232,7 +294,18 @@ export class RedisThrottlerStorage implements ThrottlerStorage {
     const redisKey = `${THROTTLE_KEY_PREFIX}${throttlerName}:${key}`;
     let reply: unknown;
     try {
-      reply = await this.redis.eval(INCREMENT_SCRIPT, 1, redisKey, ttl, limit, blockDuration);
+      // 第四个参数是本次命中的**成员名种子**（见 `memberSeq`）：脚本内部会拼上
+      // Redis 服务器时钟的毫秒值，作为有序集合的成员与 score 来源。
+      this.memberSeq += 1;
+      reply = await this.redis.eval(
+        INCREMENT_SCRIPT,
+        1,
+        redisKey,
+        ttl,
+        limit,
+        blockDuration,
+        this.memberSeq,
+      );
     } catch (error: unknown) {
       // **测试环境不打这行日志**，与 `SessionMiddleware.logVerificationFailure` 同一条理由
       // （那里有完整说明）：套件里「存储不可用」这条路径是被**故意**触发的
@@ -257,19 +330,21 @@ export class RedisThrottlerStorage implements ThrottlerStorage {
  * 返回 `null`/`undefined`、字段缺失、非有限数——任何一种都可能是「脚本被改坏」
  * 或「连到了别的服务」。若把这些当成 `isBlocked: false`，限流会静默失效；
  * 因此唯一的处置是拒绝这次请求。
+ *
+ * 校验只剩**一步**（修复轮 2 精简）：`reply.length !== 4` 之后，解构出的四个值必然
+ * 存在（`reply.map()` 对每个元素都产出值），所以上一版那四个 `x === undefined`
+ * 判断是**不可达**的——它们只让这段校验看起来比实际更严。真正会触发的是
+ * `Number.isFinite`：Lua 返回的非数字（`nil` 元素会被 Redis 转成 `false`）、
+ * 或者换了一个只会回字符串的替身时，`Number(...)` 就是 `NaN`。
  */
 function parseRecord(reply: unknown): ThrottleRecord {
   if (!Array.isArray(reply) || reply.length !== 4) {
     throw new Error(`限流脚本返回了意外形状（期望 4 个整数）：${JSON.stringify(reply)}`);
   }
-  const [totalHits, timeToExpire, blockedFlag, timeToBlockExpire] = reply.map((value) => Number(value));
-  if (
-    totalHits === undefined ||
-    timeToExpire === undefined ||
-    blockedFlag === undefined ||
-    timeToBlockExpire === undefined ||
-    ![totalHits, timeToExpire, blockedFlag, timeToBlockExpire].every((value) => Number.isFinite(value))
-  ) {
+  const [totalHits, timeToExpire, blockedFlag, timeToBlockExpire] = (reply as unknown[]).map((value) =>
+    Number(value),
+  ) as [number, number, number, number];
+  if (![totalHits, timeToExpire, blockedFlag, timeToBlockExpire].every((value) => Number.isFinite(value))) {
     throw new Error(`限流脚本返回了非数值字段：${JSON.stringify(reply)}`);
   }
   return { totalHits, timeToExpire, isBlocked: blockedFlag !== 0, timeToBlockExpire };

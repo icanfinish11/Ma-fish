@@ -1,5 +1,4 @@
 import 'reflect-metadata';
-import cookieParser from 'cookie-parser';
 import { Test, type TestingModuleBuilder } from '@nestjs/testing';
 import type { DynamicModule, INestApplication, NestMiddleware, Type } from '@nestjs/common';
 import { AppModule } from '@vca/api';
@@ -22,12 +21,16 @@ export type ExpressNext = Parameters<NestMiddleware['use']>[2];
 /**
  * 与 `apps/api/src/main.ts` 保持一致的引导顺序。
  *
- * ## 为什么这里也要 `cookieParser()`
+ * ## `cookieParser()` 由安全栈装（Task 7 起；修复轮 2 删掉了本文件里那份抄件）
  *
  * `/auth/**` 的处理器与 `SessionMiddleware` 都读 `req.cookies`，而它由 cookie-parser
  * 填充。少了这一步，测试里「登录成功」后面的每一次请求都会被判成匿名——
  * 于是集成测试会**以通过的形式**骗人（403 断言全绿，200 断言全红），
  * 而生产是好的。测试助手必须复现真实的中间件栈，否则测的不是同一个应用。
+ *
+ * 它现在来自 `applySecurityMiddleware`（生产那个函数），本文件**不再自己**
+ * `app.use(cookieParser())`：那曾是一条只在 `withSecurity: false` 时才会走的路径，
+ * 而全仓没有任何调用方传过它——一条从不执行的抄件，正是下面那节要消灭的形状。
  *
  * 顺序也与生产一致：`app.use` 注册在 express 实例上，先于 `app.init()` 建立的
  * Nest 中间件链执行，因此 cookie-parser 在 `TraceMiddleware`/`SessionMiddleware` 之前。
@@ -69,14 +72,17 @@ export interface CreateTestAppOptions {
    *
    * 默认 `true`：`main.ts` 的引导路径装了它，测试就该跑同一个栈，否则
    * 「安全断言全绿」只能证明「测试里那份抄件是绿的」。默认开启也让绝大多数测试
-   * 不必关心它——只有真的需要「没装」这一对照态时才传 `false`。
+   * 不必关心它。
    *
-   * 关掉时退回旧的 `withCookieParser` 语义（只装 cookie-parser），保留它是为了
-   * 不破坏 Task 6 已有的调用面：那时还没有安全头。
+   * **没有**「关掉它、只装 cookie-parser」的第二条路径（修复轮 2 删除）：
+   * 那个分支（`withCookieParser`）**没有任何调用方**——全仓搜不到传
+   * `withSecurity: false` 的地方，因此它是一条从不执行的 cookie-parser 安装路径，
+   * 正是 `security-stack.ts` 存在的理由所要消灭的「抄件迟早漂移」的形状
+   * （抄件里装了什么、生产装了什么，两边都不会有人发现对不上）。
+   * 真要「不装安全栈」的对照态，就在测试里显式表达（例如直接对着
+   * `applySecurityMiddleware` 做断言），而不是在这里留一个开关。
    */
   withSecurity?: boolean;
-  /** 是否挂 `cookieParser()`（默认 `true`，与 `main.ts` 一致）。`withSecurity` 为真时它由安全栈负责。 */
-  withCookieParser?: boolean;
   /**
    * 额外的、**测试专用**的模块（探针控制器等）。
    *
@@ -104,11 +110,10 @@ export async function createTestApp(options: CreateTestAppOptions = {}): Promise
 
   const moduleRef = await builder.compile();
   const app = moduleRef.createNestApplication();
+  // 只有一条安全栈安装路径（`withSecurity !== false` 时必装；见 `withSecurity` 的注释）。
   if (options.withSecurity !== false) {
     // 与 `main.ts` **同一个函数**：测试与生产的差别只有 `isProduction` 这一个入参。
     applySecurityMiddleware(app, { isProduction: false });
-  } else if (options.withCookieParser !== false) {
-    app.use(cookieParser());
   }
   for (const { name, fn } of options.conditions ?? []) {
     app.get(PolicyGuard).registerCondition(name, fn);

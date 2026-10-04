@@ -160,8 +160,9 @@ function clientIp(req: Record<string, unknown>): string {
 /**
  * 账号维度只取**哈希前缀**（C11：日志/存储里不出现完整邮箱）。
  *
- * 桶键会进限流存储（当前是进程内 Map，将来是 Redis），而「用户标识」不该以明文形式
- * 落在那里。大小写与首尾空白先归一：`A@b.co` 与 `a@b.co` 是同一个账号，
+ * 桶键会进限流存储（**Redis**，见 `redis-throttler.storage.ts`；修复轮 1 从进程内 Map
+ * 搬过来的），而「用户标识」不该以明文形式落在那里——它同时是「不落日志」和
+ * 「不落共享存储」两条要求。大小写与首尾空白先归一：`A@b.co` 与 `a@b.co` 是同一个账号，
  * 不归一会让攻击者用一个字母的大小写变体把配额翻倍。
  */
 function accountKey(body: unknown): string {

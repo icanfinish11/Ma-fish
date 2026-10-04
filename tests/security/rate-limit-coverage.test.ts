@@ -139,11 +139,23 @@ describe('每个路由都必须有明确的限流归属（修复轮 1 / C-4）',
     await withApp(app, () => {
       const gaps = app.get(PolicyRegistry).listRateLimitGaps();
       expect(gaps).toHaveLength(2);
-      expect(gaps[0]).toContain('RateLimitProbeController.undeclared');
-      expect(gaps[0]).toContain('/__rate-limit-probe/undeclared');
-      expect(gaps[0]).toContain('既未声明');
-      expect(gaps[1]).toContain('RateLimitConflictProbeController.conflict');
-      expect(gaps[1]).toContain('矛盾');
+
+      // **不**按下标断言（修复轮 2 改正）：`gaps[0]`/`gaps[1]` 依赖
+      // `DiscoveryService` 扫到控制器的顺序——今天确定，但那不是本门要保证的性质，
+      // 而「顺序变了就红」是一条没人看得懂的假失败。改成「必须包含这一条」，
+      // 顺序无关，判别力不变（仍然要求**两条都在**，且第 3 条不许混进来——
+      // 由上面的 `toHaveLength(2)` 钉住）。
+      const undeclared = gaps.find((g) => g.includes('RateLimitProbeController.undeclared'));
+      expect(undeclared, `门没有报出「漏声明」那条：\n${gaps.join('\n')}`).toBeDefined();
+      expect(undeclared).toContain('/__rate-limit-probe/undeclared');
+      expect(undeclared).toContain('既未声明');
+
+      const conflict = gaps.find((g) => g.includes('RateLimitConflictProbeController.conflict'));
+      expect(conflict, `门没有报出「声明矛盾」那条：\n${gaps.join('\n')}`).toBeDefined();
+      expect(conflict).toContain('矛盾');
+
+      // 显式豁免与显式归属的那两条路由**不许**出现在报告里。
+      expect(gaps.some((g) => g.includes('RateLimitDeclaredProbeController'))).toBe(false);
     });
   });
 });

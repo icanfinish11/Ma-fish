@@ -123,7 +123,7 @@ describe('CSRF 双提交令牌（威胁 #10 / C13）', () => {
     expect(res.status).toBe(200);
   });
 
-  it('所有写路由都受保护：逐一探测，无令牌一律 403', async () => {
+  it('所有写路由都受保护：逐一探测，无令牌一律 403，且拒绝来自 CSRF 而不是别的守卫', async () => {
     const routes = [
       { method: 'post', path: '/auth/register' },
       { method: 'post', path: '/auth/login' },
@@ -134,6 +134,16 @@ describe('CSRF 双提交令牌（威胁 #10 / C13）', () => {
       expect(SAFE.includes(r.method.toUpperCase() as never)).toBe(false);
       const res = await request(app.getHttpServer())[r.method](r.path).send({});
       expect(res.status, `${r.method.toUpperCase()} ${r.path} 未受 CSRF 保护`).toBe(403);
+      // **只断言 403 是不够的**（修复轮 2 改正）：`/auth/logout` 是匿名请求，
+      // 即使 CSRF 完全关掉，它也会被排在后面的 `PolicyGuard` 以 403 挡下
+      // （`PolicyGuard` 同样用 403，见本文件头部「为什么拒绝是 403」），
+      // 于是这一行**不判别任何东西**——它绿不绿与 CSRF 无关。
+      // 三个写路由的守卫顺序都是 限流 → CSRF → 授权，因此「无令牌」被拒时
+      // 消息必然是 CSRF 那两条之一；断言它，三行才都真正落在 CSRF 上。
+      expect(
+        res.body,
+        `${r.method.toUpperCase()} ${r.path} 的 403 不是 CSRF 给出的（可能是 PolicyGuard 之类的下游守卫），这一行不判别 CSRF`,
+      ).toMatchObject({ message: expect.stringMatching(/^CSRF 令牌(缺失|不匹配)$/) });
     }
   });
 
