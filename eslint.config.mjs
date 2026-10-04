@@ -4,17 +4,19 @@ export default tseslint.config(
   { ignores: ['**/dist/**', '**/src/generated/**', '**/node_modules/**'] },
   ...tseslint.configs.recommended,
   {
-    files: ['**/*.ts', '**/*.tsx'],
+    files: ['**/*.{ts,tsx,mts,cts}'],
     rules: {
       // C9 / 威胁 #11：禁止非参数化 raw SQL
       'no-restricted-syntax': [
         'error',
         {
-          selector: "MemberExpression[property.name='$queryRawUnsafe']",
+          // 成员访问的 property 本身也是 Identifier，故这一条同时覆盖
+          // prisma.$queryRawUnsafe(...) / 解构后的裸引用 / 别名引用三种拼写。
+          selector: "Identifier[name='$queryRawUnsafe']",
           message: '$queryRawUnsafe 被禁止（威胁 #11）。请使用参数化 Prisma API 或 $queryRaw 模板标签。',
         },
         {
-          selector: "MemberExpression[property.name='$executeRawUnsafe']",
+          selector: "Identifier[name='$executeRawUnsafe']",
           message: '$executeRawUnsafe 被禁止（威胁 #11）。',
         },
         {
