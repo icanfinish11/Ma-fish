@@ -1,0 +1,30 @@
+{
+  "name": "vibe-coding-auction-web",
+  "private": true,
+  "packageManager": "pnpm@11.24.0",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "typecheck": "pnpm -r typecheck",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:unit": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
+    "test:security": "vitest run --project security",
+    "test:property": "vitest run --project property",
+    "test:arch": "vitest run --project architecture",
+    "arch": "depcruise --config .dependency-cruiser.cjs apps packages",
+    "db:up": "docker compose -f infra/docker-compose.yml up -d",
+    "db:down": "docker compose -f infra/docker-compose.yml down -v"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "12.1.2",
+    "@types/supertest": "^7.2.1",
+    "eslint": "10.12.0",
+    "reflect-metadata": "0.2.2",
+    "supertest": "7.3.1",
+    "typescript-eslint": "8.71.0",
+    "vitest": "5.0.3"
+  }
+}

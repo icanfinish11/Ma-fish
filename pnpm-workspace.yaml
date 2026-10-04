@@ -1,0 +1,11 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+allowBuilds:
+  prisma: true
+  '@prisma/engines': true
+  # testcontainers 的可选传递依赖：显式忽略，消除 ERR_PNPM_IGNORED_BUILDS 导致的退出码 1
+  cpu-features: false
+  protobufjs: false
+  ssh2: false
