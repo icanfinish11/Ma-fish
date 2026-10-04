@@ -9,6 +9,7 @@
   "scripts": {
     "typecheck": "pnpm -r typecheck && tsc -p tsconfig.node.json",
     "lint": "eslint .",
+    "pretest": "pnpm db:generate",
     "test": "vitest run",
     "test:unit": "vitest run --project unit",
     "test:integration": "vitest run --project integration --passWithNoTests",
@@ -16,6 +17,7 @@
     "test:property": "vitest run --project property --passWithNoTests",
     "test:arch": "vitest run --project architecture --passWithNoTests",
     "arch": "depcruise --config .dependency-cruiser.cjs apps packages",
+    "db:generate": "pnpm -r db:generate",
     "db:up": "docker compose -f infra/docker-compose.yml up -d",
     "db:down": "docker compose -f infra/docker-compose.yml down -v"
   },

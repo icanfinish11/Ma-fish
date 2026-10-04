@@ -1,0 +1,89 @@
+// Prisma 7 起 `datasource` 内**不允许**出现 `url`：连接串只在 `prisma.config.ts`
+// （迁移期，属主角色）与运行期 driver adapter（`PrismaService`，`app_user` 角色）里出现。
+// `multiSchema` 自 Prisma 7 已 GA，无需 `previewFeatures`。
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  schemas  = ["auth", "audit", "notify"]
+}
+
+// ── auth ──────────────────────────────────────────────────────────
+// 可读写模块（改密、注销需要 UPDATE/DELETE），非 append-only。
+model User {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  email        String?  @unique
+  passwordHash String?  @map("password_hash")
+  role         String   @default("USER")
+  creditScore  Int      @default(100) @map("credit_score")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  identities Identity[]
+
+  @@schema("auth")
+  @@map("users")
+}
+
+model Identity {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  provider   String
+  externalId String   @map("external_id")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([provider, externalId])
+  @@schema("auth")
+  @@map("identities")
+}
+
+// ── audit ── append-only（C7）────────────────────────────────────
+// 运行期角色在 `audit` schema 上只有 SELECT + INSERT；UPDATE/DELETE 由
+// `infra/db/apply-grants.sql` 显式撤销，并由 tests/integration/db/append-only.test.ts 守住。
+model AuditLog {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  actorId    String?  @map("actor_id") @db.Uuid
+  action     String
+  resource   String
+  resourceId String?  @map("resource_id")
+  traceId    String?  @map("trace_id")
+  metadata   Json?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([actorId, createdAt])
+  @@index([resource, resourceId])
+  @@schema("audit")
+  @@map("audit_logs")
+}
+
+// ── notify ── transactional outbox（C15）─────────────────────────
+model OutboxEvent {
+  id             String    @id @default(uuid(7)) @db.Uuid
+  topic          String
+  payload        Json
+  idempotencyKey String    @unique @map("idempotency_key")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  processedAt    DateTime? @map("processed_at")
+  attempts       Int       @default(0)
+  lastError      String?   @map("last_error")
+
+  @@index([processedAt, createdAt])
+  @@schema("notify")
+  @@map("outbox_events")
+}
+
+// ── notify ── 幂等消费记录（§8.5）───────────────────────────────
+// 注：`idempotency_key` 同时是主键，因为幂等键本身即该表的唯一身份；
+// Prisma 要求每个 model 至少有一个 `@id` 或 `@unique` 字段，此处标 `@id`。
+model ProcessedJob {
+  idempotencyKey String   @id @map("idempotency_key")
+  processedAt    DateTime @default(now()) @map("processed_at")
+
+  @@schema("notify")
+  @@map("processed_jobs")
+}

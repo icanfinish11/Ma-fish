@@ -50,6 +50,24 @@
  *   新增必填变量却忘了登记到本文件时，开发机 shell 里的同名变量会悄悄把它填上，
  *   于是「本机能过、CI 挂掉」。这就是上一节要求「三处同步改」的原因。
  * - 另见 `config.module.ts` 的 `ignoreEnvFile`：非开发环境连 `.env` 文件都不读（已实测）。
+ *
+ * ## 数据库凭据的「同名不同值」（Task 3 起，务必读这段）
+ *
+ * 下面的 `DATABASE_URL` 里角色是 `app_user`、口令是 `test_pw`、库名是 `vca_test`——
+ * 它**对上的是本地 compose 的库名 `vca` 与 testcontainer 的一次性口令（`app_pw`）都不一致**，
+ * 这是**刻意**的，不是笔误：本文件是**应用启动期校验**的夹具，用于任何 `import '@vca/api'`
+ * 的测试（`AppModule` 求值期就要一份合法 env）。这类测试**从不去连库**，因此 URL 只需形状合法。
+ *
+ * **必须一致的是角色名**：运行期 `app_user`、迁移属主 `vca_owner` 在
+ * `infra/docker-compose.yml`、`infra/db/roles.sql`、`apps/api/prisma.config.ts` 与本文件里
+ * 拼写完全相同（见 C7 与不变式 #5）。口令与库名允许按上下文不同。
+ *
+ * **Task 4 起若要真连库**：不要用这个 URL，用 `tests/helpers/db.ts` 的 `startPostgres()`
+ * ——它返回 `ownerUri` / `appUri`（testcontainer 真实地址，且已跑完迁移与最小权限授权）。
+ *
+ * `MIGRATE_DATABASE_URL`（迁移属主连接串）**刻意不登记在这里**：它只被 `prisma.config.ts`
+ * 读取，从不进入应用进程，登记了反而会让「运行期拿到了属主连接串」这种事看起来合法
+ * ——那正是 C7 要防的。
  */
 // `as const` 只给**编译期**只读类型，运行期照样可写；`Object.freeze` 才把它真正钉死，
 // 免得某个测试顺手改写这份「唯一登记处」而污染同进程的其他用例（vitest 的 `env` 是共享的）。

@@ -21,16 +21,27 @@ const alias = {
  */
 const withTestEnv = { env: testEnv };
 
+/**
+ * 所有 project 共用的 setup：确保 `apps/api/src/generated/` 已生成（见 `vitest.setup.ts`）。
+ *
+ * 为什么需要它：该目录不入 git，而任何 import `@vca/api` 的测试都会经
+ * `PrismaService` 走到对生成客户端的 import。npm 的 `pretest` 钩子**只在 `pnpm test` 时**
+ * 触发，覆盖不到 `pnpm vitest run --project unit` 这类直接调用——而那正是 brief 的验证命令。
+ * 挂在 setupFiles 上则与调用方式无关（已实测：冷启动下该命令原本会报
+ * `Cannot find module '../generated/prisma/client.js'`）。
+ */
+const setupFiles = ['./vitest.setup.ts'];
+
 export default defineConfig({
   resolve: { alias },
   test: {
     environment: 'node',
     projects: [
-      { resolve: { alias }, test: { name: 'unit', ...withTestEnv, include: ['tests/unit/**/*.test.ts'] } },
-      { resolve: { alias }, test: { name: 'integration', ...withTestEnv, include: ['tests/integration/**/*.test.ts'], testTimeout: 120_000, hookTimeout: 180_000 } },
-      { resolve: { alias }, test: { name: 'security', ...withTestEnv, include: ['tests/security/**/*.test.ts'], testTimeout: 120_000, hookTimeout: 180_000 } },
-      { resolve: { alias }, test: { name: 'property', ...withTestEnv, include: ['tests/property/**/*.test.ts'], testTimeout: 300_000 } },
-      { resolve: { alias }, test: { name: 'architecture', ...withTestEnv, include: ['tests/architecture/**/*.test.ts'] } },
+      { resolve: { alias }, test: { name: 'unit', ...withTestEnv, setupFiles, include: ['tests/unit/**/*.test.ts'] } },
+      { resolve: { alias }, test: { name: 'integration', ...withTestEnv, setupFiles, include: ['tests/integration/**/*.test.ts'], testTimeout: 120_000, hookTimeout: 180_000 } },
+      { resolve: { alias }, test: { name: 'security', ...withTestEnv, setupFiles, include: ['tests/security/**/*.test.ts'], testTimeout: 120_000, hookTimeout: 180_000 } },
+      { resolve: { alias }, test: { name: 'property', ...withTestEnv, setupFiles, include: ['tests/property/**/*.test.ts'], testTimeout: 300_000 } },
+      { resolve: { alias }, test: { name: 'architecture', ...withTestEnv, setupFiles, include: ['tests/architecture/**/*.test.ts'] } },
     ],
   },
 });

@@ -1,0 +1,4 @@
+# Prisma 7 的 `prisma-client` 生成器产出 TypeScript 源码，不是依赖包。
+# `migrate` 不会生成它（已实测），必须显式 `prisma generate`；产物不入 git，
+# 克隆后由根 `pretest` 与 apps/api 的 `pretypecheck` 自动生成。
+src/generated/

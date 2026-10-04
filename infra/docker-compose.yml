@@ -1,0 +1,35 @@
+# 本地开发用 Postgres 与 Redis。
+#
+# **两者都不是生产形态**：口令是明文的本地固定值，生产运行时一律来自环境变量（C10）。
+# 这里的 `vca_owner` 是**迁移属主**角色，不是运行时角色；应用连库必须用 `app_user`
+# （见 `infra/db/roles.sql` 与 `apps/api/prisma.config.ts` 的注释）。
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: vca_owner
+      POSTGRES_PASSWORD: 'owner_pw'
+      POSTGRES_DB: vca
+    ports: ['5432:5432']
+    volumes:
+      # 只在**数据卷为空**的首次启动执行一次（docker-entrypoint-initdb.d 的语义）。
+      # 因此这里放的必须只是「建角色 + 授权」这类与 schema/表无关、且幂等的语句：
+      # 此刻 Prisma 迁移尚未运行，`auth`/`audit`/`notify` 三个 schema 与任何表都还不存在，
+      # 任何 `ALTER SCHEMA`/`GRANT ... ON ALL TABLES` 在此都会失败（或对 ALL TABLES 静默
+      # 授予零个对象）。建表权限与 append-only 的 GRANT/REVOKE 在迁移之后由
+      # `infra/db/apply-grants.sql` 施加。
+      - ./db/roles.sql:/docker-entrypoint-initdb.d/10-roles.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U vca_owner -d vca']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ['6379:6379']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
