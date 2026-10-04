@@ -1,6 +1,6 @@
 # Vibe-Coding 作品交易平台 · 架构设计文档
 
-- **状态**：待用户复核
+- **状态**：已复核，进入实现（P0 计划已就绪）
 - **日期**：2026-10-04
 - **阶段**：架构设计（未进入实现）
 - **范围**：MVP（P0–P7）+ 未来子项目登记（P8–P9）
@@ -35,6 +35,8 @@
 | D7 | 价值判定 | **商品价值由用户决定**。平台保证公平交易与售后，不介入价值对等判断 | 用户明确 |
 | D8 | 补差机制 | **允许引入虚拟货币补差**，走站内复式账本结清差额 | 用户确认 |
 | D9 | 竞拍机制 | 英式加价 + 代理出价 + 反狙击软关闭 + 保留价 + Buy-Now + 保证金；排除维克里次价与荷兰式 | 委托设计方判断 |
+| D10 | TypeScript 版本 | **锁 6.0.3，不升 7**。7 是最新稳定版，但 typescript-eslint 尚不支持（peer `<6.1.0`），升 7 会直接废掉威胁 #9/#11 的 CI lint 门 | 实测（见验证报告 §2.2） |
+| D11 | 数据库角色 | **双角色**：迁移属主 `vca_owner` + 运行时最小权限 `app_user`。单角色下不变式 #5 的 `REVOKE` 是空操作 | 实测（见验证报告 §2.10） |
 
 ### 1.4 核心产品原则
 
@@ -102,6 +104,8 @@
 ├─ PostgreSQL 16   业务数据（每模块独立 schema）+ 复式账本（append-only）
 └─ 对象存储/加密卷   AES-256-GCM 分块加密的制品包
 ```
+
+**数据访问层实现约定（Prisma 7，已实测）：** 连接串**不再写在 `schema.prisma` 内**（Prisma 7 已移除 `datasource.url`）。迁移的连接串来自 `prisma.config.ts` 的 `datasource.url`；运行期由 `@prisma/adapter-pg` 的 driver adapter 传入。multiSchema 已 GA（无需 `previewFeatures`），生成器用 `prisma-client`（产出 TS 源码，需显式 `prisma generate` 且输出目录纳入构建）。
 
 ### 3.2 模块职责
 
@@ -179,6 +183,7 @@
 
 - **发布者**：GitHub OAuth（Authorization Code + PKCE，校验 `state` 与 `nonce`）。
 - **买家**：邮箱 + 密码，Argon2id（m=19456 KiB, t=2, p=1，OWASP 推荐参数）；辅以邮箱 magic-link 免密登录。
+  - 实现选型：`@node-rs/argon2`（而非 `argon2`）。前者是 N-API 预编译包，**无需 node-gyp/构建工具链**，Docker 与 CI 更省事；参数完全一致，实测 hash 17ms / verify 30ms。
 - **会话**：服务端存储于 Redis，HttpOnly + Secure + SameSite=Lax Cookie。空闲 7 天过期；**敏感操作要求最近 15 分钟内完成过认证**。
 - **2FA**：TOTP。对**管理员强制**；对普通用户可选，但**单笔金额 ≥ 10,000 元的操作强制**。
 - 不使用 localStorage 保存任何令牌。
@@ -231,6 +236,7 @@ LedgerEntry（双分录，append-only）  AuditLog（append-only）  OutboxEvent
 - 所有金额字段为 `bigint`，单位「分」，币种字段预留（MVP 单一币种 CNY）。
 - 所有时间戳为 UTC，出价时间记录到毫秒并使用**服务端时钟**。
 - 所有 append-only 表（`LedgerEntry`、`AuditLog`、`OwnershipHistory`、`Bid`）在数据库层撤销 `UPDATE`/`DELETE` 权限。
+  - ⚠️ **实施前提（已实测）**：PostgreSQL 中**表属主始终保有全部权限**，属主对自己的 `REVOKE` 是**空操作**。因此撤销权限**必须区分两个数据库角色**：迁移属主角色（跑 DDL）与运行时应用角色（`app_user`，最小权限）。只用一个角色时，`REVOKE` 之后 `UPDATE` 依然成功、数据会被真实改写。详见 §8.6 与工具链验证报告 §2.10。
 
 ---
 
@@ -370,6 +376,7 @@ DRAFT → SCHEDULED → LIVE ⇄ EXTENDED
 3. `USER_AVAILABLE >= 0` 且 `USER_FROZEN >= 0`（不可透支）
 4. `Σ PLATFORM_ESCROW ≥ Σ 所有未结算托管义务`（托管不透支）
 5. 账本条目 **append-only**（DB 层撤销 `UPDATE`/`DELETE` 权限）
+   - ⚠️ 该撤销**仅对非属主角色有效**。运行时必须以最小权限角色 `app_user` 连接，迁移以属主角色执行；详见 §8.6。
 
 > 这五条将成为**属性测试（property-based test）**：CI 每次生成 ≥10 万次随机交易序列后断言不变式恒成立。这是资金系统唯一真正可靠的验证方式。
 
@@ -385,6 +392,41 @@ DRAFT → SCHEDULED → LIVE ⇄ EXTENDED
 - 每个 Worker 任务有幂等键（如 `settle:auction:{id}`），在 `processed_jobs` 表上加唯一约束，保证 exactly-once 效果。
 - 出价与结算在 `SERIALIZABLE` 事务内，对拍卖行加 `SELECT ... FOR UPDATE` 行锁。
 - `RELEASED`（交换）与 `SETTLEMENT`（竞拍）各自在单一事务内完成。
+
+### 8.6 数据库角色模型（append-only 生效的前提，已实测）
+
+不变式 #5 要求「在数据库层撤销 `UPDATE`/`DELETE`」。**实测发现：若应用与迁移使用同一角色，该撤销完全无效** —— 因为该角色是表属主，而 PostgreSQL 的属主始终保有全部权限。
+
+**必须采用双角色：**
+
+| 角色 | 用途 | 权限 |
+|---|---|---|
+| `vca_owner` | **仅**跑 Prisma 迁移（DDL） | 库与 schema 属主；建表、改结构 |
+| `app_user` | **运行时连接**（API 与 Worker） | 按表授予最小权限 |
+
+其中 append-only 表对 `app_user` 只授予 `SELECT` + `INSERT`：
+
+```sql
+GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA audit TO app_user;
+REVOKE UPDATE, DELETE ON ALL TABLES IN SCHEMA audit FROM app_user;
+```
+
+实测结果（以 `app_user` 连接）：
+
+```
+UPDATE "ledger"."ledger_entries" SET amount = 999;
+ERROR:  permission denied for table ledger_entries      ← 拒绝
+INSERT INTO "ledger"."ledger_accounts" ... RETURNING kind;
+ kind → TEST, INSERT 0 1                                  ← 允许
+```
+
+**两条纪律：**
+
+1. `.env` 中的 `DATABASE_URL` 必须指向 `app_user`；**`MIGRATE_DATABASE_URL` 才是属主角色**，且只在迁移时注入。
+2. **迁移后必须重跑授权脚本**（`infra/db/apply-grants.sql`）：新建表不会自动继承已发出的 `GRANT`。CI 与生产发布流程中，`prisma migrate deploy` 之后必须紧跟该脚本。
+
+> 这一条是整份文档中「纸面约束」与「真实约束」差别最大的地方，因此在实现计划中作为独立任务（P0 Task 3）先行落地。
+
 
 ---
 
@@ -444,6 +486,20 @@ vibe-coding-auction-web/
 └─ docs/superpowers/specs/
 ```
 
+### 11.1 工具链版本锁定（已实测，见验证报告）
+
+| 组件 | 版本 | 备注 |
+|---|---|---|
+| Node / pnpm | 22.19.0 / 11.24.0 | pnpm 构建脚本授权写在 `pnpm-workspace.yaml` 的 `allowBuilds`（`package.json#pnpm` 已被忽略） |
+| NestJS | 12.1.2 | |
+| **TypeScript** | **6.0.3** | ⚠️ **不得升到 7**：typescript-eslint 8.71 的 peer 为 `>=4.8.4 <6.1.0`，升 7 会让威胁 #9/#11 的 CI lint 门失效 |
+| Prisma / Client | **7.10.0（两侧同版本）** | ⚠️ `prisma@latest` 目前指向**预发布** `8.0.0-rc.19`，而 `@prisma/client@latest` 是 `7.10.0`。必须硬锁，禁止使用 RC |
+| PostgreSQL / Redis | 16 / 7 | |
+| Vitest | 5.0.3 | 原生支持 `emitDecoratorMetadata`，**无需 `unplugin-swc`** |
+| Testcontainers | 12.2.0 | |
+| ioredis | 6.0.0 | ⚠️ 是 CJS，必须用具名导入 `import { Redis } from 'ioredis'` |
+| `@node-rs/argon2` | 2.2.1 | 预编译，无需构建工具链 |
+
 ---
 
 ## 12. 测试策略
@@ -452,7 +508,7 @@ vibe-coding-auction-web/
 |---|---|---|
 | 单元 | 状态机守卫、增量阶梯、反狙击计时、手续费计算、完整度评分 | 纯函数，快 |
 | **属性测试** | **账本五条不变式**：随机生成 ≥10 万次操作序列后断言恒成立 | 资金系统唯一可靠的验证方式 |
-| 集成 | 真实 Postgres + Redis；事务原子性、行锁并发、幂等键 | **账本与授权绝不用 mock** |
+| 集成 | 真实 Postgres + Redis；事务原子性、行锁并发、幂等键 | **账本与授权绝不用 mock**。用 testcontainers 起真实容器；Windows 下 Docker 守护进程就绪较慢，需带就绪等待与镜像预热（实测冷启动约 16.5s） |
 | 并发 | N 个并发出价无超卖、无重复结算；两个交换同时 `RELEASED` 的竞态 | 必须真并发，不能顺序模拟 |
 | 安全 | **越权矩阵**（遍历所有 API × 所有角色，断言默认拒绝）、恶意压缩包样本集、CSRF/限流/CSP 断言 | 每个新路由漏声明策略会让测试失败 |
 | 契约 | OpenAPI ↔ 实现 ↔ 前端 client 三方不漂移 | 防「文档骗人」 |
@@ -546,3 +602,10 @@ vibe-coding-auction-web/
 ## 17. 下一步
 
 本设计文档经用户复核确认后，进入 `writing-plans` 技能，为 **P0（安全底座与身份）** 生成第一份实现计划。后续每个子项目各自经历 spec → plan → 实现循环。
+
+**已完成：**
+
+- 工具链验证报告：`docs/superpowers/notes/2026-10-04-toolchain-verification.md`
+  （在写计划前对全部版本与关键用法做了真实安装/编译/连库/连容器验证，本文档的修订即由该报告驱动）
+- P0 实现计划：`docs/superpowers/plans/2026-10-04-p0-security-foundation.md`
+  （9 个任务，TDD，逐步含真实代码与预期命令输出）
