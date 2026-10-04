@@ -21,10 +21,13 @@ export interface AuditRecordInput {
   /**
    * 结构化补充。**不得**放口令、令牌、完整邮箱（C11）；会话 id 同属令牌，也不得放。
    *
-   * 说明（修复轮 2 的边界，避免误读这条约束的强度）：`redact.ts` 的黑名单**没有**运行时
-   * 调用方——真正的运行期防线是 pino 的 `req` 序列化器（只输出 `method`/`url`）与
-   * 「不把敏感值交给日志」。这条约束因此靠**调用点自觉 + code review** 执行，
-   * 不是靠某个会自动生效的过滤器。见任务报告 §修复轮 2。
+   * 说明（修复轮 2 的边界，避免误读这条约束的强度；**修复轮 2/3 之后已过时的那半句已改正**）：
+   * `redact.ts` 的黑名单**曾经**没有运行时调用方，但 **Task 8 起它接在 pino 的
+   * `formatters.log` 上**（见 `common/logging/logger.module.ts`），因此 deny-list
+   * **现在真的会拦**应用写出的每一条日志记录。这**不**意味着本字段可以放松：
+   * ① 脱敏只认**键名**，`metadata` 里套一层业务对象的 `email` 字段靠的是键级规则
+   * （`key.includes('email')`），字段名一变就漏；② 审计行是**落库**的，日志那条防线
+   * 管不到它。所以这条约束仍然靠**调用点自觉 + code review**，日志脱敏只是第二道网。
    */
   metadata?: Record<string, unknown> | null;
 }

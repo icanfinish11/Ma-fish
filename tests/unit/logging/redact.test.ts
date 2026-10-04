@@ -244,15 +244,56 @@ describe('日志脱敏（C11 / 威胁 #15）', () => {
       expect(scrubEmails('')).toBe('');
     });
 
-    it('已知边界：MIME 编码字（=?utf-8?Q?...?=）完全漏掉，带引号的 local-part 部分残留在域名前', () => {
-      // 两条边界都是**实测**的（不是猜的），钉在这里是为了让「缓解 vs 保证」的区别
+    it('已知边界：MIME 编码字（=?utf-8?Q?...?=）完全漏掉，因为它里面没有字面量 @', () => {
+      // 这条边界是**实测**的（不是猜的），钉在这里是为了让「缓解 vs 保证」的区别
       // 在代码里可见：改了正则就要同时改这里，而不是让保证悄悄变强。
       // 主防线始终是「不要把地址写进日志消息/错误文本」。
       expect(scrubEmails('=?utf-8?Q?victim=40example.com?=')).toBe('=?utf-8?Q?victim=40example.com?=');
-      // 引号不在正则的「地址字符」集合里 ⇒ 匹配从引号**之后**开始，local-part 的第一个字符被漏掉。
-      // 结果是地址不再完整（域名前的部分被截断），但掩码形状与常规情况不同。
-      expect(scrubEmails('550 "quoted local"@example.com rejected')).toBe('550 "quoted local"@example.com rejected');
-      expect(scrubEmails('"victim@example.com"')).toBe('"v***@example.com"');
+    });
+
+    /**
+     * 修复轮 2 改正的那条：**带引号的 local-part 整段被掩码**。
+     *
+     * 此前这里钉的是「部分残留 / 地址被截断」，而**那个描述与实测都不符**（本轮逐字验过）：
+     * 修复轮 1 的实现（`/[^\s<>()[\]{},;:'"]+@[^\s<>()[\]{},;:'"]+/g`）在
+     * `550 "quoted local"@example.com rejected` 上**一个字符都没掩**，输出与输入逐字相同
+     * ——**一个完整的地址穿过了 C11 那道过滤**。这比「部分残留」严重一档，
+     * 也是本轮把它修掉的直接理由。
+     *
+     * 期望值一律用 `Q`（`String.fromCharCode(34)`）拼装，**不写字面量引号**：
+     * 这个字符在本仓库的编辑流程里被替换成排版引号（U+201C/U+201D）过多次，而那种替换
+     * **看不出来**却会让断言以「相差一个字符」的形式红掉（本轮实测踩到两次，
+     * 其中一次还一度把我引向了「正则引擎行为不一致」的错误结论）。
+     */
+    const Q = String.fromCharCode(34);
+
+    it('带引号的 local-part（RFC 5321 quoted-string）整段被掩码，不留残片', () => {
+      const input = `550 ${Q}quoted local${Q}@example.com rejected`;
+      // 引号是 RFC 的语法符号、不是地址的一部分。起始引号原样保留，`q` 是 `quoted` 的首字符。
+      // 关键在于**完整地址不再出现**——旧实现只掩掉 `local"@example.com`，把 `quoted` 原样留下。
+      expect(scrubEmails(input)).toBe(`550 ${Q}q***@example.com rejected`);
+      expect(scrubEmails(`${Q}quoted local${Q}@example.com`)).toBe(`${Q}q***@example.com`);
+      expect(scrubEmails(input)).not.toContain(`${Q}quoted local${Q}@example.com`);
+      // 「域名前的部分被截断」那种描述是错的：真正的要求是 local-part 原样不再出现
+      expect(scrubEmails(`${Q}quoted local${Q}@example.com`)).not.toContain('quoted local');
+    });
+
+    it('普通地址被引号/尖括号包起来时只脱敏地址本身，分隔符保留', () => {
+      expect(scrubEmails(`${Q}victim@example.com${Q}`)).toBe(`${Q}v***@example.com${Q}`);
+      expect(scrubEmails('RCPT TO:<user@example.com>')).toBe('RCPT TO:<u***@example.com>');
+      expect(scrubEmails('a@x.com,b@y.com')).toBe('a***@x.com,b***@y.com');
+    });
+
+    it('mailto: 前缀不会被当成 local-part（`:` 是边界，前缀原样保留）', () => {
+      // `:` 是分隔符 ⇒ 掩码只作用于 `victim@example.com`，前缀 `mailto:` 原样留下。
+      // 若把 `:` 当成地址字符，被掩码的会是 `mailto:victim@example.com`，
+      // 输出 `m***@example.com` 会把 `victim` 完整留在原处——同一个「掩码吃错了一段」的形态。
+      const masked = scrubEmails('联系 mailto:victim@example.com 处理');
+      expect(masked).toBe('联系 mailto:v***@example.com 处理');
+      expect(masked, '完整地址仍然留在文本里（前缀保留是刻意的，地址必须被掩掉）').not.toContain(
+        'victim@example.com',
+      );
+      expect(scrubEmails('MAILTO:Victim@Example.com')).toBe('MAILTO:V***@Example.com');
     });
   });
 });

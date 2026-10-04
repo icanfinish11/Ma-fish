@@ -85,6 +85,24 @@ describe('邮件适配器与脱敏（C11）', () => {
     );
   });
 
+  /**
+   * 修复轮 2 / Fix 2 的**另一半**（「默认工厂确实把三个显式超时交给了 nodemailer」）
+   * **不在这里**，两个原因都记下来免得后人重复踩：
+   *
+   * 1. 那个默认工厂是 `smtp-mailer.ts` 的**模块私有**常量，唯一观察点是它调用
+   *    `nodemailer.createTransport` 时的参数；而本环境里 CJS 的 `nodemailer` 既不能
+   *    `vi.spyOn`（命名空间不可写），`vi.mock('nodemailer', …)` 与 `vi.doMock`
+   *    也**打不进** `smtp-mailer.ts` 的那一次 import——实测：替身的调用记录恒为空数组，
+   *    即使同一个文件里 `MAILER` 工厂那条用例确实构造了一个真 `SmtpMailer`
+   *    （试过 `importActual` 包装、`resetModules` + 动态 import，两次都是空数组）；
+   * 2. 因此断言放在它**能**被观察的地方：`tests/unit/notify/delivery-timeouts.test.ts`
+   *    直接对 `buildSmtpTransportOptions()` 断言键名与取值（那个函数的返回值就是工厂交给
+   *    nodemailer 的**同一个对象**），而「键名拼错」在编译期由 `createTransport` 的
+   *    `SMTPTransportOptions` 类型挡住（`pnpm typecheck` 是独立门禁）。
+   *
+   * 这不是「测不了就算了」：结论只依赖两件互相独立、各自被钉住的事实——
+   * 对象恰好是这四个键（单测）+ 对象被交给了 nodemailer（类型 + 那一行工厂）。
+   */
   describe('MAILER 的工厂接线（生产 SMTP / 其余 Console）', () => {
     /**
      * 用夹具环境造一个只覆盖 `NODE_ENV` 的 ConfigService——其余键仍取夹具值。

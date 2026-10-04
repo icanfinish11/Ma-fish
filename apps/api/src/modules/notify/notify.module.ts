@@ -39,6 +39,19 @@ import type { Env } from '../../config/env.schema.js';
  * Nest 的令牌概念带进一个纯逻辑类；而集成测试是 `new OutboxConsumer(prisma, fakeMailer)`
  * 直接构造的（见 `tests/integration/notify/outbox.test.ts`）。工厂把装配留在模块里，
  * 消费者保持「两个参数、可直接构造」。
+ *
+ * ## 今天的可达性：只有 worker 能走到本模块（已裁定接受，P0 边界）
+ *
+ * 唯一的使用者是 `apps/worker`。`apps/api` **没有** import 它——也就是说今天**没有生产者**：
+ * 没有任何业务代码调用 `OutboxService.publish`，因此 outbox 表在正常运行下是空的
+ * （集成测试直接构造消费者，不经过本模块）。这对 P0 是**正确**的：本任务交付的是通道本身
+ * 与它的失败语义，不是某条具体通知。
+ *
+ * **交接备注（写给 Task 9+）**：第一个真实生产者落地时，要同时确认三件事——
+ * ① 那个业务模块在自己的 `imports` 里写上 `NotifyModule`；
+ * ② `publish` 必须传**业务事务的** `tx`（`PrismaService` 结构上也满足
+ * `Prisma.TransactionClient`，类型挡不住误用，见 `outbox.service.ts`）；
+ * ③ 主题名以 `email.` 开头才会被投递（`outbox.consumer.ts` 的 `EMAIL_TOPIC_PREFIX`）。
  */
 @Module({
   imports: [DbModule],

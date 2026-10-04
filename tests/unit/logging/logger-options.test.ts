@@ -199,4 +199,42 @@ describe('formatters.log 上的脱敏（C11 / Task 8 接线）', () => {
     expect(record.password, '负载没有被丢弃：降级路径不得把未脱敏的数据写出去').toBeUndefined();
     expect(lines[0]).not.toContain('p@ss');
   });
+
+  /**
+   * 修复轮 2 的 Minor：降级标记必须**可据以行动**。
+   *
+   * 此前 `redactFailed` 只放错误的类名，而对一个普通 `Error` 那就是字面量 `"Error"`——
+   * 运维看到「脱敏失败了」，却不知道**什么**抛的、也不知道是**哪个键**触发的。
+   * 现在它有三段：名称、截断后的消息、`@键名`。
+   *
+   * 额外的两条要求都是**安全**要求，不是可读性偏好：
+   * - 消息必须过 `scrubEmails`——降级路径恰恰是「没能完成脱敏」的那条路，它更没有资格
+   *   把未脱敏文本写出去，而异常消息是最容易夹带地址的地方；
+   * - 消息必须截断——这个字段是线索，不是错误档案。
+   */
+  it('降级标记带上出错的键名与消息，且消息本身也脱敏、有长度上界', () => {
+    const { logger, lines } = capture({ NODE_ENV: 'development' });
+    const hostile = {
+      // 要害：异常消息里带着一个收件人地址（这是真实形态：SMTP 的拒绝消息就长这样）
+      get hostileKey(): string {
+        throw new Error(`550 5.1.1 <victim@example.com> rejected: ${'x'.repeat(500)}`);
+      },
+    };
+
+    runInContext({ traceId: 'trace-redact-detail' }, () => {
+      logger.info({ hostile }, 'detail probe');
+    });
+
+    const record = onlyRecord(lines);
+    const marker = record.redactFailed as string;
+
+    expect(marker, '标记里没有出错的消息（只写 "Error" 等于没写）').toContain('rejected');
+    expect(marker, '标记里没有出错的键名，运维无法定位是哪个字段').toContain('@hostileKey');
+    expect(marker, '标记里出现了完整地址：降级路径也没有资格写出未脱敏文本').not.toContain(
+      'victim@example.com',
+    );
+    expect(marker, '标记里应当保留可读的掩码形式').toContain('v***@example.com');
+    // 截断：500 个 x 不该原样进日志（120 字符的消息上界 + 名称/键名的固定前缀）
+    expect(marker.length, '降级标记没有长度上界').toBeLessThan(300);
+  });
 });

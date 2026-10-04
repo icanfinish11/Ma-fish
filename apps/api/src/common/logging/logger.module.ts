@@ -2,7 +2,7 @@ import { Module } from '@nestjs/common';
 import { LoggerModule as PinoLoggerModule } from 'nestjs-pino';
 import type { LoggerOptions } from 'pino';
 import { currentContext } from '../context/request-context.js';
-import { redact } from './redact.js';
+import { redactWithContext, RedactionError, scrubEmails } from './redact.js';
 
 /** 本模块读取的环境变量面（目前只用到 `NODE_ENV`）。 */
 export interface LoggerEnv {
@@ -28,10 +28,37 @@ export interface LoggerEnv {
  * - **保留 `traceId`/`userId`**（fail-open）：它们来自 `mixin` 的 ALS 上下文，不是负载数据，
  *   丢掉它们会让这条日志无法与请求关联；
  * - **标记 `redactFailed`**：让「负载为什么没了」这件事在日志里可解释，而不是静默丢数据。
+ *
+ * ## `redactFailed` 里放什么（修复轮 2 的 Minor）
+ *
+ * 此前它只放错误的**类名**，而对一个普通 `Error` 那就是字面量 `"Error"`：运维看到的是
+ * 「脱敏失败了」，但不知道**什么**抛的、也看不出是**哪个键**触发的——一条无法据以行动的标记。
+ * 现在放三段：`名称(截断后的消息)` + `@` + 出错的键名。键名重要是因为脱敏按**键**推进，
+ * 触发异常的那个键直接指向有问题的字段（例如某个带 getter 的 `hostile`）。
+ *
+ * 消息**过 `scrubEmails` 并截断到 120 字符**（两个都是刻意的）：异常消息是最容易
+ * 夹带地址的文本（`550 5.1.1 <user@example.com> rejected`），而降级路径**恰恰是**
+ * 我们没能完成脱敏的那条路——它更没有资格把未脱敏的文本写出去。截断则是因为这个字段
+ * 是给运维看的线索，不是错误档案（与 `last_error` 的 2000 字符是两把尺子）。
  */
-function failureName(err: unknown): string {
+
+/** 降级标记里消息部分的长度上界。 */
+const FAILURE_MESSAGE_LIMIT = 120;
+
+/**
+ * 把降级标记拼成 `名称: 截断消息 @键名`。
+ *
+ * 键名从哪里来：`redact` 必须**读**每个属性，而读就可能抛；`redactWithContext` 的钩子
+ * 把那次异常换成 `RedactionError`（带着键名），因此这里能取到它。取不到（异常发生在
+ * 递归之外，例如 `Object.getPrototypeOf` 抛）时退化成不带键名的形态——仍然比只有类名有用。
+ */
+function failureReason(err: unknown, key?: string): string {
   const name = err instanceof Error ? err.name : typeof err;
-  return name.slice(0, 60);
+  const message = err instanceof Error ? err.message : String(err);
+  const detail = scrubEmails(message).replace(/\s+/g, ' ').trim().slice(0, FAILURE_MESSAGE_LIMIT);
+  const reportedKey = key ?? (err instanceof RedactionError ? err.key : undefined);
+  const at = reportedKey === undefined ? '' : ` @${reportedKey}`;
+  return `${name.slice(0, 60)}: ${detail}${at}`;
 }
 
 function contextFields(obj: Record<string, unknown>): Record<string, unknown> {
@@ -157,12 +184,16 @@ export function buildLoggerOptions(env: LoggerEnv): LoggerOptions {
       log: (obj: Record<string, unknown>): Record<string, unknown> => {
         try {
           const { req, res, ...rest } = obj;
-          const out = redact(rest);
+          // 钩子：把「读某个键时抛出的异常」换成带键名的 `RedactionError`，
+          // 于是下面那行降级能把「是哪个键坏了」写进 `redactFailed`（修复轮 2 的 Minor）。
+          const out = redactWithContext(rest, (err, key) =>
+            key === undefined ? err : new RedactionError(key, err),
+          );
           if (req !== undefined) out.req = req;
           if (res !== undefined) out.res = res;
           return out;
         } catch (err) {
-          return { ...contextFields(obj), redactFailed: failureName(err) };
+          return { ...contextFields(obj), redactFailed: failureReason(err) };
         }
       },
     },
