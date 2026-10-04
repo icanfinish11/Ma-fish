@@ -82,3 +82,121 @@ describe('trace id 贯穿（§3.5 / 验收 13.4）—— 真实 pino 实例上�
     expect(lines).toEqual([]);
   });
 });
+
+/**
+ * `formatters.log: redact` 的接线（Task 8 / C11）。
+ *
+ * ## 为什么这条用例必须存在
+ *
+ * Task 4 的复审指出：`maskEmail` 与 `REDACT_KEYS` 此前**没有任何生产调用方**——
+ * 「键名含 email 的字符串值走掩码」这条 C11 子句只被单元测试逐字钉住，却不在任何一条
+ * 真实链路上。Task 4 把「接进 `formatters.log`」转派给 Task 8，并写明**顺序依赖**：
+ * 必须先有保形（`Date` 不变 `{}`）且防环/防深的 `redact`，否则接线的同时就引入两个新故障。
+ *
+ * 因此下面的断言分两层：
+ * - 「脱敏真的生效」（密码/令牌/邮箱）——没有接线时必红；
+ * - 「`Date`/环/超深负载活着」——它证明的正是上面那条顺序依赖：把实现换回旧版
+ *   （对所有 `typeof === 'object'` 一律重建）时，`createdAt` 会变成 `{}`（已实测，见报告探针）。
+ */
+describe('formatters.log 上的脱敏（C11 / Task 8 接线）', () => {
+  it('审计形状的负载：Prisma 的 Date 活着，密码/令牌/邮箱被脱敏', () => {
+    const { logger, lines } = capture({ NODE_ENV: 'development' });
+    const createdAt = new Date('2026-10-04T00:00:00.000Z');
+
+    logger.info(
+      {
+        action: 'auth.login',
+        resource: 'user',
+        resourceId: 'u-1',
+        createdAt, // Prisma 返回的就是 Date：旧实现把它压成 {}，时间戳静默消失
+        metadata: { email: 'alice@example.com', password: 'p@ss', sessionId: 'sess-1', attempts: 3 },
+      },
+      'audit probe',
+    );
+
+    const record = onlyRecord(lines);
+    expect(record.createdAt, 'Date 被脱敏吃掉了（旧实现在这里会变成 {}）').toBe(
+      '2026-10-04T00:00:00.000Z',
+    );
+    expect(record.metadata).toEqual({
+      email: 'a***@example.com',
+      password: '[REDACTED]',
+      sessionId: '[REDACTED]',
+      attempts: 3,
+    });
+    // 整行里不得出现完整地址（这一条是 C11 的字面要求）
+    expect(lines[0]).not.toContain('alice@example.com');
+  });
+
+  it('环与超深负载在**日志路径上**降级，而不是把一次日志变成一次异常', () => {
+    const { logger, lines } = capture({ NODE_ENV: 'development' });
+    const cyclic: Record<string, unknown> = { id: 'n1', token: 'secret-token' };
+    cyclic.self = cyclic;
+    // 40 层互不相同的嵌套（环守卫看不见它，只有深度上界能挡住）
+    let deep: Record<string, unknown> = { level: 40 };
+    for (let i = 0; i < 40; i++) deep = { next: deep };
+
+    logger.info({ cyclic, deep }, 'degradation probe');
+
+    const record = onlyRecord(lines);
+    const cyclicOut = record.cyclic as Record<string, unknown>;
+    expect(cyclicOut.token, '环上的敏感字段没有脱敏').toBe('[REDACTED]');
+    expect(cyclicOut.self, '环没有降级成 [Circular]').toBe('[Circular]');
+
+    let cursor: unknown = record.deep;
+    while (cursor !== null && typeof cursor === 'object' && 'next' in cursor) {
+      cursor = (cursor as { next: unknown }).next;
+    }
+    expect(cursor, '超深负载没有降级成 [MaxDepth]（只有 redact 会产出这个标记）').toBe('[MaxDepth]');
+  });
+
+  it('req/res 不进脱敏遍历，但也不因此泄露请求头（序列化器是另一半）', () => {
+    const { logger, lines } = capture({ NODE_ENV: 'development' });
+    let headerReads = 0;
+    const req = {
+      method: 'GET',
+      url: '/probe',
+      get headers(): Record<string, string> {
+        headerReads++;
+        return { cookie: 'sid=SUPER-SECRET', authorization: 'Bearer SUPER-SECRET' };
+      },
+    };
+    const res = { statusCode: 200 };
+
+    logger.info({ req, res, password: 'p' }, 'request probe');
+
+    const record = onlyRecord(lines);
+    // ① 序列化器把它们压成方法/路径/状态码——「不遍历也不泄露」的另一半，删掉序列化器这里就红
+    expect(record.req).toEqual({ method: 'GET', url: '/probe' });
+    expect(record.res).toEqual({ statusCode: 200 });
+    expect(lines[0]).not.toContain('SUPER-SECRET');
+    // ② 没有被拖进脱敏遍历：实测一棵真实 req/res 图约 637 个节点、每次 ~250µs，
+    //    而结果会被序列化器的输出整个替换掉。`headers` 是自有可枚举的访问器，
+    //    一旦遍历就会把它读出来（1 次），因此这个计数是判别性的。
+    expect(headerReads, 'req 被拖进了脱敏遍历（每条请求日志约 250µs 的无效工作）').toBe(0);
+  });
+
+  it('脱敏自己失败时不让**日志调用**炸掉：丢弃负载、保留 traceId（降级而不是抛错）', () => {
+    const { logger, lines } = capture({ NODE_ENV: 'development' });
+    // 一个会抛的 getter：`redact` 必须读它才能脱敏它，于是「读」这一步就会抛。
+    // 这类负载不是假想——任何第三方对象、带 getter 的模型、被代理过的对象都可能这样。
+    const hostile = {
+      get boom(): string {
+        throw new Error('getter 爆炸');
+      },
+    };
+
+    runInContext({ traceId: 'trace-redact-degrade' }, () => {
+      logger.info({ hostile, password: 'p@ss' }, 'hostile probe');
+    });
+
+    // 关键：上面这一行**没有抛**。redact 的设计原则是「它自己炸掉等于把一条本该记下来的日志
+    // 变成一次请求失败」，因此这里必须降级：负载整体丢弃（fail-closed，不知道脱敏到哪一步了），
+    // 但关联信息（traceId/userId，来自 mixin 的 ALS 上下文）保留（fail-open，可观测性优先）。
+    const record = onlyRecord(lines);
+    expect(record.traceId).toBe('trace-redact-degrade');
+    expect(record.redactFailed, '降级这件事本身必须可见，否则「负载没了」无从解释').toBeTruthy();
+    expect(record.password, '负载没有被丢弃：降级路径不得把未脱敏的数据写出去').toBeUndefined();
+    expect(lines[0]).not.toContain('p@ss');
+  });
+});

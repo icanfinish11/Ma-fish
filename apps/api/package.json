@@ -4,8 +4,16 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts",
-    "./*": "./src/*"
+    ".": {
+      "types": "./src/index.ts",
+      "node": "./dist/index.js",
+      "default": "./src/index.ts"
+    },
+    "./*": {
+      "types": "./src/*",
+      "node": "./dist/*",
+      "default": "./src/*"
+    }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -29,6 +37,7 @@
     "helmet": "8.3.0",
     "ioredis": "6.0.0",
     "nestjs-pino": "5.3.1",
+    "nodemailer": "10.0.14",
     "pg": "8.23.1",
     "pino": "10.4.0",
     "pino-http": "11.0.0",

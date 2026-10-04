@@ -7,6 +7,11 @@ import { testEnv } from './tests/helpers/env.js';
 const alias = {
   '@vca/shared': path.resolve(import.meta.dirname, 'packages/shared/src'),
   '@vca/api': path.resolve(import.meta.dirname, 'apps/api/src'),
+  // worker 的**进程内逻辑**（轮询循环、停机顺序）也在这里测：它是应用代码，
+  // 而本仓库的测试一律住在 `tests/`（Task 8 加了 `apps/worker/src/worker.ts` 这个
+  // 「可注入依赖的循环」而没有把逻辑写在带副作用的 `main.ts` 里，与 apps/api 的
+  // main.ts/bootstrap.ts 拆分同一标准）。
+  '@vca/worker': path.resolve(import.meta.dirname, 'apps/worker/src'),
 };
 
 /**

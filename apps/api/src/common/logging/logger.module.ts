@@ -2,10 +2,49 @@ import { Module } from '@nestjs/common';
 import { LoggerModule as PinoLoggerModule } from 'nestjs-pino';
 import type { LoggerOptions } from 'pino';
 import { currentContext } from '../context/request-context.js';
+import { redact } from './redact.js';
 
 /** 本模块读取的环境变量面（目前只用到 `NODE_ENV`）。 */
 export interface LoggerEnv {
   NODE_ENV?: string | undefined;
+}
+
+/**
+ * 脱敏失败时的降级（Task 8 接线后发现的边界）。
+ *
+ * ## 为什么必须有它
+ *
+ * `redact` 要**读**每个属性才能脱敏它，而「读」这一步本身就可能抛：带 getter 的对象、
+ * 被代理过的对象、第三方库的实例。`formatters.log` 位于 pino 的写入路径中间，
+ * 异常会一路冒到 `logger.info(...)` 的调用点——在请求里就是一次 500。
+ * 这与 `redact.ts` 自己写明的原则直接冲突：脱敏是日志路径上的最后一道工序，
+ * **它自己炸掉等于把一条本该记下来的日志变成一次请求失败**。
+ * 已实测：一个会抛的 getter 就能让 `logger.info()` 抛出（见报告探针 R1）。
+ *
+ * ## 降级方向是刻意选的
+ *
+ * - **负载整体丢弃**（fail-closed）：异常发生时不知道脱敏进行到哪一步，宁可少记一条，
+ *   也不能把未脱敏的数据写出去；
+ * - **保留 `traceId`/`userId`**（fail-open）：它们来自 `mixin` 的 ALS 上下文，不是负载数据，
+ *   丢掉它们会让这条日志无法与请求关联；
+ * - **标记 `redactFailed`**：让「负载为什么没了」这件事在日志里可解释，而不是静默丢数据。
+ */
+function failureName(err: unknown): string {
+  const name = err instanceof Error ? err.name : typeof err;
+  return name.slice(0, 60);
+}
+
+function contextFields(obj: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of ['traceId', 'userId'] as const) {
+    try {
+      const value = obj[key];
+      if (typeof value === 'string') out[key] = value;
+    } catch {
+      // 连这两个键都读不出来：那就只留 redactFailed（同样是 fail-open，不抛）
+    }
+  }
+  return out;
 }
 
 /**
@@ -78,7 +117,51 @@ export function buildLoggerOptions(env: LoggerEnv): LoggerOptions {
       req: (r: { method: string; url: string }) => ({ method: r.method, url: r.url }),
       res: (r: { statusCode: number }) => ({ statusCode: r.statusCode }),
     },
-    formatters: { level: (label: string) => ({ level: label }) },
+    /**
+     * **第一层防线**（C11）：每条记录在交给 serializers 与 JSON 序列化**之前**先过一遍
+     * `redact`（Task 8 接线；Task 4 的复审把这一步转派给本任务，并写明顺序依赖）。
+     *
+     * ## 为什么必须排在 serializers 之前、为什么这不成问题
+     *
+     * 读 pino 10.4.0 的 `_asJson`：`if (formatters.log) obj = formatters.log(obj)` 就在
+     * `for (const key in obj)` 那个循环**之前**，serializers 是在循环里逐键应用的。
+     * 也就是说这里拿到的是**原始** merge 对象（`err` 还是 `Error` 实例、`req`/`res` 还是活对象）。
+     * 前者正是我们要的：`redact` 保留原型的重建让 `err` 仍是 `Error`，
+     * 于是 pino 默认的 `serializers.err`（`pino.js` 的 `defaultErrorSerializer`）照旧输出
+     * name/message/stack。
+     *
+     * ## `req`/`res` 为什么**不**进脱敏遍历（实测得出，不是想当然）
+     *
+     * 它们是一整棵活对象图（socket、事件表、内部句柄），实测遍历一次约 **637 个节点 / 250µs**，
+     * 而这次遍历的产物**立刻**被下面两个 serializer 的输出整个替换掉——纯浪费，
+     * 且是每条请求日志的固定开销。所以这里把这两个键摘出来、原样交回给 serializer。
+     *
+     * **代价如实记录**：于是「请求头不会进日志」这件事有一半依赖那两个 serializer 继续存在
+     * （pino 的 `redact.paths` 是另一半）。因此它被
+     * `tests/unit/logging/logger-options.test.ts` 的第三条用例**钉住**——删掉 serializer、
+     * 或把这两个键放回遍历，那条用例立刻变红，而不是变成一次静默泄露。
+     *
+     * ## 已知边界（不遮）
+     *
+     * `formatters.log` **不覆盖 child logger 的 bindings**：pino 的 `child()` 会把 bindings
+     * 格式器重置成恒等函数（`proto.js` 的 `resetChildingsFormatter`），bindings 走的是
+     * `asChindings`（只应用 serializers）。因此不要用 `logger.child({ token })` 携带敏感值——
+     * pino-http 绑定的 `req` 恰好是安全的：它经过 `serializers.req` 压成 method/url。
+     */
+    formatters: {
+      level: (label: string) => ({ level: label }),
+      log: (obj: Record<string, unknown>): Record<string, unknown> => {
+        try {
+          const { req, res, ...rest } = obj;
+          const out = redact(rest);
+          if (req !== undefined) out.req = req;
+          if (res !== undefined) out.res = res;
+          return out;
+        } catch (err) {
+          return { ...contextFields(obj), redactFailed: failureName(err) };
+        }
+      },
+    },
     timestamp: () => `,"time":"${new Date().toISOString()}"`,
   };
 }

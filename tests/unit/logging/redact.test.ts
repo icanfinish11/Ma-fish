@@ -137,4 +137,87 @@ describe('日志脱敏（C11 / 威胁 #15）', () => {
     expect(out.arr[0]).toBe(1);
     expect(out.arr[1]).toBe('[Circular]');
   });
+
+  /**
+   * 下面四条是 **Task 8 的 Ruling 3 前置加固**（修复轮 2 复审留下的两条 deferred minor）。
+   *
+   * 上一条「非纯对象原样返回」的边界救回了 `Date`/`Error` 的值，代价是**缩小了键访问面**：
+   * `err.token = 'x'` 或类实例的 `password` 字段**不再被访问**。今日无生产调用方故不泄漏，
+   * 但 Task 8 一旦把 `redact` 接进 `formatters.log`，缺口立即生效——所以接线**之前**
+   * 必须先补上，而不允许「先接线、以后再修」（那会让「已修」与「已生效」之间出现空窗）。
+   *
+   * 另两条：深度上界（非环的极深嵌套仍会爆栈）与会话 id 的 deny-list 常驻断言
+   * （`sessionId` 是完整 bearer 凭证，此前只在代码里、没有测试钉住）。
+   */
+  it('sessionId / session_id 在黑名单内（会话 id 即 bearer 凭证，C11）', () => {
+    expect(redact({ sessionId: 'sess-1' })).toEqual({ sessionId: '[REDACTED]' });
+    expect(redact({ session_id: 'sess-1' })).toEqual({ session_id: '[REDACTED]' });
+  });
+
+  it('Error 的**自有可枚举**属性同样被脱敏，且 message/stack 不丢', () => {
+    const err = new Error('认证失败') as Error & Record<string, unknown>;
+    err.token = 'gho_secret';
+    err.actorEmail = 'alice@example.com';
+
+    const out = redact({ err });
+
+    // 仍是 Error（原型保留 ⇒ pino 的 err 序列化器仍认它），message/stack 一个字不少
+    expect(out.err).toBeInstanceOf(Error);
+    expect(out.err.message).toBe('认证失败');
+    expect(out.err.stack).toBeTruthy();
+    // 挂在 Error 上的敏感字段不能再直通
+    const seen = out.err as unknown as Record<string, unknown>;
+    expect(seen.token).toBe('[REDACTED]');
+    expect(seen.actorEmail).toBe('a***@example.com');
+  });
+
+  it('类实例的自有可枚举敏感字段被脱敏，且仍是该类实例（原型方法可用）', () => {
+    class Session {
+      constructor(
+        public readonly id: string,
+        public token: string,
+      ) {}
+      describe(): string {
+        return `session:${this.id}`;
+      }
+    }
+    const session = new Session('s-1', 'secret-token');
+
+    const out = redact({ session });
+
+    expect(out.session).toBeInstanceOf(Session);
+    expect(out.session.describe(), '原型被丢掉：类实例被压成了普通对象').toBe('session:s-1');
+    expect(out.session.token).toBe('[REDACTED]');
+  });
+
+  it('挂了自定义属性的 Date 不被重建（假 Date 会让 pino 序列化时抛错）', () => {
+    const createdAt = new Date('2026-10-04T00:00:00.000Z');
+    (createdAt as unknown as Record<string, unknown>).note = 'x';
+
+    const out = redact({ createdAt });
+
+    // 内部槽位类型整体透传：宁可漏掉挂上去的自定义字段，也不能造出一个 `getTime()` 会抛的
+    // 假 Date —— `JSON.stringify` 正是走 `toJSON` → `getTime()`，那会把脱敏变成一次日志失败。
+    expect(out.createdAt).toBe(createdAt);
+    expect(out.createdAt.getTime()).toBe(createdAt.getTime());
+    expect(JSON.stringify(out.createdAt)).toBe('"2026-10-04T00:00:00.000Z"');
+  });
+
+  it('非环的极深嵌套不爆栈：超过上界处降级为 [MaxDepth]', () => {
+    // 20 万层**互不相同**的嵌套对象（没有任何环，环守卫看不见它）。
+    const DEPTH = 200_000;
+    let deep: Record<string, unknown> = { token: 'x' };
+    for (let i = 0; i < DEPTH; i++) deep = { next: deep };
+
+    const out = redact(deep);
+
+    let cursor: unknown = out;
+    let levels = 0;
+    while (cursor !== null && typeof cursor === 'object' && 'next' in cursor) {
+      cursor = (cursor as { next: unknown }).next;
+      levels++;
+    }
+    expect(cursor, '没有深度上界：要么爆栈抛出 RangeError，要么一路递归下去').toBe('[MaxDepth]');
+    expect(levels, '深度上界应当是个小常数，而不是 20 万').toBeLessThan(200);
+  });
 });

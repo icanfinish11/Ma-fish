@@ -10,11 +10,12 @@
  *
  * `sessionId` / `session_id` 是**修复轮 2 新增的纵深防御**：会话 id 本身就是完整的
  * bearer 凭证（见 `modules/auth/session.service.ts`），而它天然会出现在请求头
- * （`x-session-id`）、URL 查询串或调试负载里。真正的运行期防线是「不要把它写进日志」
- * 与 pino 的 `req` 序列化器（只输出 `method`/`url`）——**本函数今天没有运行时调用方**，
- * 所以这两条不是「已经生效的过滤」，只是把 C11 的意图写进 deny-list：
- * 将来 `redact()` 被接进日志路径时，它们立刻生效。
- * 注意 `cookie` 已在列表中，因此 `req.headers.cookie` 这一类早已被挡。
+ * （`x-session-id`）、URL 查询串或调试负载里。注意 `cookie` 已在列表中，
+ * 因此 `req.headers.cookie` 这一类早已被挡。
+ *
+ * **Task 8 起它们不再是「意图」而是生效的过滤**：`redact()` 已接进 pino 的
+ * `formatters.log`（见 `logger.module.ts` 的 Ruling 3 记载），因此这几条 deny-list
+ * 现在真的会拦住应用写出的每一条日志记录。常驻断言在 `tests/unit/logging/redact.test.ts`。
  */
 const REDACT_KEYS = [
   'password', 'passwordHash', 'password_hash', 'token', 'accessToken', 'refreshToken',
@@ -23,6 +24,17 @@ const REDACT_KEYS = [
   'proxyCeiling', 'proxy_ceiling',
 ];
 
+/**
+ * 黑名单的小写集合（求值期算一次）。
+ *
+ * 为什么不再逐键 `REDACT_KEYS.some(...)`：Task 8 把 `redact` 接进了 `formatters.log`，
+ * 于是这段代码从「无人调用的工具函数」变成**每条日志记录**都要跑一遍的热路径，
+ * 逐键线性扫 16 条字符串是白给的常数开销。语义与原来逐字一致（大小写不敏感的全等）。
+ */
+const SENSITIVE_KEYS = new Set(REDACT_KEYS.map((key) => key.toLowerCase()));
+
+const REDACTED = '[REDACTED]';
+
 /** 邮箱只保留首字符与域名，如 `a***@example.com`。无 `@` 或 `@` 在首位时退化为 `***`。 */
 export function maskEmail(email: string): string {
   const at = email.indexOf('@');
@@ -30,10 +42,31 @@ export function maskEmail(email: string): string {
   return `${email[0]}***${email.slice(at)}`;
 }
 
-/** 环引用替身（见下方「环」一节）：降级成可读的值，而不是抛出 `RangeError`。 */
+/** 环引用替身：降级成可读的值，而不是抛出 `RangeError`。 */
 const CIRCULAR = '[Circular]';
 
-/** 只把**纯对象**（`Object.prototype` 或 `null` 原型）当作可以下钻的记录，见「边界」。 */
+/**
+ * 深度上界替身（Ruling 3 的前置加固）。
+ *
+ * 为什么需要它：环守卫只挡**同一条路径上重复出现**的对象，而一条 20 万层**互不相同**的
+ * 嵌套链（`{next:{next:…}}`）每个节点都是新对象，环守卫完全看不见——实测直接
+ * `RangeError: Maximum call stack size exceeded`（见报告 §REDACT）。
+ */
+const MAX_DEPTH_MARKER = '[MaxDepth]';
+
+/**
+ * 递归深度上界。
+ *
+ * 取 32 的依据：本项目最深的**真实**负载是「审计 metadata 里套一层业务对象」（1–2 层），
+ * 32 远高于它；而 32 个递归帧离任何真实栈上限都极远（实测在 Node 22 上，非环链要
+ * 数万层才溢出）。上界处**降级**而不是抛错：脱敏是日志路径上的最后一道工序，
+ * 它自己炸掉等于把一条本该记下来的日志变成一次请求失败。
+ *
+ * 代价如实记录：超过 32 层的负载会被截断成 `[MaxDepth]`（信息丢失，但方向安全）。
+ */
+const MAX_DEPTH = 32;
+
+/** 只把**纯对象**（`Object.prototype` 或 `null` 原型）当作可以下钻重建的记录。 */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object') return false;
   const proto: unknown = Object.getPrototypeOf(value);
@@ -41,69 +74,152 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * 递归脱敏。三类处理：
- * 1. 键名命中 `REDACT_KEYS` → `[REDACTED]`；
- * 2. 键名含 `email` 且值是字符串 → `maskEmail`（这是「完整邮箱不入日志」的落点）；
- * 3. 纯对象与数组 → 递归下钻。
+ * 数据放在**内部槽位**而不是自有属性里的内建类型。
  *
- * ## 边界：只下钻纯对象与数组，其余值**原样返回**（修复轮 1 更正）
+ * 为什么必须显式列出来（这不是分类癖，是一个真实的坏对象制造机）：
+ * `Object.create(Date.prototype)` 造出来的「Date」上调用 `getTime()` 会抛
+ * `TypeError: this is not a Date object`——而 `JSON.stringify` **正是**这样序列化 Date 的
+ * （走 `toJSON` → `this.getTime()`）。也就是说，给一个挂了自定义属性的 `Date` 做重建，
+ * 会把「脱敏」变成「pino 序列化时抛错」，比漏掉那个自定义属性严重得多。
+ * `Map`/`Set`/`RegExp`/Promise 同理（数据都在内部槽位里）。
  *
- * 上一版对所有「`typeof === 'object'`」的值一律 `Object.entries()` 重建，结果是把
- * **非纯对象压成 `{}`**——实测（见报告 §11 探针 B）：
- *
- * - `redact({ createdAt: new Date() })` → `{"createdAt":{}}`：`Date` 的数据在内部槽位，
- *   不是自有可枚举属性，于是时间戳被静默吃掉。**Prisma 返回的正是 `Date`**
- *   （`createdAt` / `updatedAt`），Task 8 的审计负载一旦过上一步就永久丢失时间；
- * - `redact({ err: new Error('boom') })` → `{"err":{}}`：`message` / `stack` 同理丢失；
- * - 环引用直接 `RangeError: Maximum call stack size exceeded`。
- *
- * 这与「脱敏不该改变普通值的形状」这条承诺直接冲突，所以现在只递归**纯对象**与数组：
- * `Date`、`Error`、`Buffer`/TypedArray、`Map`/`Set`、`RegExp`、类实例等一律原样返回
- * （引用不变，调用方拿到的是同一个对象）。这条边界的**代价据实写在下面**，不靠注释免责。
- *
- * ## 环：沿当前路径去重，命中即替成 `[Circular]`
- *
- * `seen` 集合在**进入**节点时加入、**离开**时移除，因此它检测的是「当前路径上的环」，
- * 而不是「见过的所有对象」——同一个对象出现在两个兄弟分支（DAG，很常见）仍会被完整脱敏，
- * 只有真正的环才降级。降级而不是抛错：脱敏是日志路径上的最后一道工序，
- * 它自己炸掉等于把一条本该记下来的日志变成一次 500。
- *
- * ## 两处诚实的局限
- *
- * 1. 它**只认键名**，值里的敏感信息（如 URL query 上的 token）不会被它发现——
- *    所以脱敏不是唯一防线，另一道是「不要把这些东西放进日志」。
- * 2. 非纯对象是**整体透传**的：若某个类实例自己带 `password` 字段，这里不会屏蔽它。
- *    传进来的应当是日志安全的**纯数据**（Prisma 的结果就是纯对象 + `Date`）。
- *    若将来确实要脱敏类实例，正确做法是在调用方把它摊平，而不是让本函数去猜
- *    任意对象的可枚举属性（那正是上面三个缺陷的来源）。
+ * 代价如实记录：这些类型**内部**若被挂了敏感字段，本函数不会屏蔽它（整体透传）。
+ * 这个取舍与「不能造坏对象」相比是划算的一侧，且它需要有人往 `Date` 上挂 `token` 才会发生。
  */
-export function redact<T>(value: T): T {
-  return redactValue(value, new Set<object>()) as T;
+const OPAQUE_BUILTINS: ReadonlyArray<new (...args: never[]) => object> = [
+  Date, RegExp, Map, Set, WeakMap, WeakSet, Promise, ArrayBuffer, DataView, URL, URLSearchParams,
+];
+
+function isOpaqueBuiltin(value: object): boolean {
+  // Buffer / TypedArray / DataView 都是 view，`instanceof` 对它们不可靠（跨 realm/Buffer 特例），
+  // 用 `ArrayBuffer.isView` 一次覆盖。
+  if (ArrayBuffer.isView(value)) return true;
+  return OPAQUE_BUILTINS.some((Ctor) => value instanceof Ctor);
 }
 
-function redactValue(value: unknown, seen: Set<object>): unknown {
+/**
+ * 递归脱敏。五类处理：
+ * 1. 键名命中 `REDACT_KEYS` → `[REDACTED]`；
+ * 2. 键名含 `email` 且值是字符串 → `maskEmail`（这是「完整邮箱不入日志」的落点）；
+ * 3. **纯对象**与数组 → 重建后递归下钻；
+ * 4. **非纯对象**（`Error`、类实例）→ 保留原型重建，只访问其**自有可枚举**属性；
+ * 5. 其余（`Date`/`Buffer`/`Map`/`Set`/`RegExp`/函数……）→ 原样返回。
+ *
+ * ## 边界（Task 8 / Ruling 3 更新）
+ *
+ * 修复轮 1 的边界是「只下钻纯对象与数组，其余一律原样返回」，它救回了被压成 `{}` 的
+ * `Date`/`Error`，但**缩小了键访问面**：`err.token = 'x'`、类实例的 `password` 字段
+ * 从此不再被访问。修复轮 2 的复审把这一条列为「接进 `formatters.log` 之前的硬前置」。
+ *
+ * 现在第 4 类补上了这个缺口，做法是**保留原型地重建**：
+ * - `message`/`stack`/`name` 是 `Error` 的自有**非枚举**属性，逐个用属性描述符搬过去，
+ *   因此 `err instanceof Error` 成立、pino 的 `err` 序列化器照旧认它，栈一个字不丢；
+ * - 自有**可枚举**属性走与普通对象完全相同的键级规则（黑名单 / 邮箱掩码 / 递归）；
+ * - 用 `Object.defineProperty` 写入而不是赋值，避免撞上原型上的 setter。
+ *
+ * 为什么不是「就地改写原对象」：那会让 `logger.info({ user })` 把调用方手里那个对象的
+ * `password` 字段真的替换掉（日志是只读观察，不该有这种副作用）。
+ * 为什么没有自有可枚举属性时**返回原引用**：`Date`/`Buffer`/`Map`/没有自定义字段的类实例
+ * 都属于这一类，零拷贝、零风险，也让「不改变普通值的形状」这条承诺继续成立。
+ *
+ * ## 深度上界（Ruling 3）
+ *
+ * 超过 {@link MAX_DEPTH} 层降级为 `[MaxDepth]`，见该常量的说明。
+ *
+ * ## 三处诚实的局限
+ *
+ * 1. 它**只认键名**，值里的敏感信息（如 URL query 上的 token、错误消息里夹的邮箱）
+ *    不会被它发现——所以脱敏不是唯一防线，另一道是「不要把这些东西放进日志」。
+ * 2. 不透明内建类型（`Date`/`Map`/…）是整体透传的，见 {@link OPAQUE_BUILTINS}。
+ * 3. 自有可枚举属性若由 **getter** 提供，读取时必然触发它（脱敏值之后以数据属性写入）。
+ *    这与「只认键名」同源：本函数没有能力在不求值的前提下知道它是什么。
+ */
+export function redact<T>(value: T): T {
+  return redactValue(value, new Set<object>(), 0) as T;
+}
+
+function redactValue(value: unknown, seen: Set<object>, depth: number): unknown {
+  // 原始值与函数（`typeof 'function'`）不参与递归，也与深度无关
+  if (value === null || typeof value !== 'object') return value;
+  if (depth > MAX_DEPTH) return MAX_DEPTH_MARKER;
+
   if (Array.isArray(value)) {
     if (seen.has(value)) return CIRCULAR;
     seen.add(value);
-    const out = value.map((item) => redactValue(item, seen));
+    const out = value.map((item) => redactValue(item, seen, depth + 1));
     seen.delete(value);
     return out;
   }
 
-  if (!isPlainObject(value)) return value;
+  if (isPlainObject(value)) {
+    if (seen.has(value)) return CIRCULAR;
+    seen.add(value);
+
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = redactEntry(k, v, seen, depth);
+
+    seen.delete(value);
+    return out;
+  }
+
+  return redactObject(value, seen, depth);
+}
+
+/** 键级规则：黑名单 → 邮箱掩码 → 递归。普通对象与非普通对象共用同一条规则。 */
+function redactEntry(key: string, value: unknown, seen: Set<object>, depth: number): unknown {
+  if (SENSITIVE_KEYS.has(key.toLowerCase())) return REDACTED;
+  if (key.toLowerCase().includes('email') && typeof value === 'string') return maskEmail(value);
+  return redactValue(value, seen, depth + 1);
+}
+
+/**
+ * 非纯对象（`Error`、类实例）的脱敏：**保留原型**重建，只碰自有属性。
+ *
+ * `seen` 的语义与纯对象分支一致：进入时加入、离开时移除，因此只检测**当前路径上的环**，
+ * 同一个对象出现在两个兄弟分支仍会被完整脱敏。
+ */
+function redactObject(value: object, seen: Set<object>, depth: number): unknown {
+  const enumerableKeys = Object.keys(value);
+  // 没有自有可枚举属性 ⇒ 没有任何「挂在对象上的自定义字段」可脱敏 ⇒ 原样返回（保持引用）。
+  // Date / Buffer / Map / Set / RegExp / 没有自定义字段的类实例都落在这里。
+  if (enumerableKeys.length === 0 || isOpaqueBuiltin(value)) return value;
 
   if (seen.has(value)) return CIRCULAR;
   seen.add(value);
 
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(value)) {
-    if (REDACT_KEYS.some((rk) => k.toLowerCase() === rk.toLowerCase())) {
-      out[k] = '[REDACTED]';
-    } else if (k.toLowerCase().includes('email') && typeof v === 'string') {
-      out[k] = maskEmail(v);
+  const out = Object.create(Object.getPrototypeOf(value) as object | null) as Record<string, unknown>;
+
+  // 先搬自有**非枚举**属性（`Error` 的 `message`/`stack`/`name` 就在这里）：丢掉它们
+  // 等于把修复轮 1 救回来的东西又丢一次。用描述符搬运，保持「非枚举」这一性质，
+  // 于是 `JSON.stringify(err)` 的行为与原生一致（`err` 交给 pino 的 err 序列化器）。
+  for (const key of Object.getOwnPropertyNames(value)) {
+    if (enumerableKeys.includes(key)) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor) continue;
+    if (descriptor.get) {
+      // **访问器不能照搬描述符**：V8 的 `err.stack` 是一个惰性 getter，真正的数据在
+      // `[[ErrorData]]` 内部槽位里，而 `Object.create(Error.prototype)` 造出来的副本
+      // 没有那个槽位——实测照搬描述符后 `out.err.stack === undefined`，栈又丢了。
+      // 因此这里在原对象上求值一次，落成一个普通数据属性（值就是那一刻的栈字符串）。
+      Object.defineProperty(out, key, {
+        value: (value as Record<string, unknown>)[key],
+        writable: true,
+        enumerable: descriptor.enumerable,
+        configurable: true,
+      });
     } else {
-      out[k] = redactValue(v, seen);
+      Object.defineProperty(out, key, descriptor);
     }
+  }
+
+  // 可枚举属性：与普通对象同一套键级规则
+  for (const key of enumerableKeys) {
+    Object.defineProperty(out, key, {
+      value: redactEntry(key, (value as Record<string, unknown>)[key], seen, depth),
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
   }
 
   seen.delete(value);
