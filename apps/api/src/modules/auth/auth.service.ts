@@ -3,7 +3,10 @@ import type { Request } from 'express';
 import { PrismaService } from '../../db/prisma.service.js';
 import { PasswordService } from './password.service.js';
 import { SessionService } from './session.service.js';
-import { AuditService } from '../audit/audit.service.js';
+// 同上：经 `audit` 模块的对外接口取服务，不深引 `audit.service.js`。
+// （接口的入参类型 `AuditRecordInput` 同样在 `../audit/index.js` 上导出，本文件构造字面量时
+// 用不到它，故不 import——不留未使用的导入。）
+import { AuditService } from '../audit/index.js';
 import type { LoginDto, RegisterDto } from './dto.js';
 /**
  * 登录失败时用来「空跑一次」的 Argon2id 哈希。

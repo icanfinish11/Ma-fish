@@ -3,7 +3,7 @@ import { Controller, Get, Module, type INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { createTestApp } from '../helpers/app.js';
 import { PolicyModule } from '@vca/api/common/policy/policy.module.js';
-import { PolicyRegistry } from '@vca/api/common/policy/policy.registry.js';
+import { RouteDeclarationRegistry } from '@vca/api/common/policy/route-declaration.registry.js';
 import { Policy, Public } from '@vca/api/common/policy/policy.decorator.js';
 
 /**
@@ -77,7 +77,7 @@ describe('每个路由都必须有策略声明（§9 / 验收 13.2）', () => {
   it('生产 AppModule 中不存在未声明的路由', async () => {
     const app = await createTestApp();
     await withApp(app, () => {
-      const registry = app.get(PolicyRegistry);
+      const registry = app.get(RouteDeclarationRegistry);
 
       // 顺序是刻意的：**门自己的断言排第一**，这样「漏声明」失败时给出的永远是那句可执行的信息
       // （列出是哪个 controller、哪个方法、哪条路径），而不是一条辅助断言的措辞。
@@ -89,7 +89,7 @@ describe('每个路由都必须有策略声明（§9 / 验收 13.2）', () => {
       // ——后者（DiscoveryModule 没接上、scanner 行为变化）会让这道门永远绿灯。
       // 第二条用例从另一个方向堵同一个洞（注册表对「未声明」是否敏感）。
       const health = registry.find('HealthController', 'live');
-      expect(health, 'PolicyRegistry 未能发现 HealthController.live，覆盖率门形同虚设').toMatchObject({
+      expect(health, 'RouteDeclarationRegistry 未能发现 HealthController.live，覆盖率门形同虚设').toMatchObject({
         path: '/health',
         isPublic: true,
         decl: null,
@@ -108,7 +108,7 @@ describe('每个路由都必须有策略声明（§9 / 验收 13.2）', () => {
     const app = mod.createNestApplication();
     await app.init();
     await withApp(app, () => {
-      expect(app.get(PolicyRegistry).listUndeclaredRoutes()).toEqual([
+      expect(app.get(RouteDeclarationRegistry).listUndeclaredRoutes()).toEqual([
         'CoverageProbeController.undeclared  /__coverage-probe/undeclared',
       ]);
     });

@@ -18,30 +18,36 @@ export interface RouteEntry {
 }
 
 /**
- * 策略声明的**发现**层：枚举「应用里到底有哪些路由、各自声明了什么」。
+ * 路由声明的**发现**层：枚举「应用里到底有哪些路由、各自声明了什么」。
  *
- * 它只服务于一个消费者：CI 的覆盖率门（`tests/security/policy-route-coverage.test.ts`）。
- * 运行期的放行判定**不**经过这里——`PolicyGuard` 直接读装饰器元数据，那是每个请求的热路径，
+ * 它只服务于一个消费者：CI 的覆盖率门（`tests/security/policy-route-coverage.test.ts` 与
+ * `tests/security/rate-limit-coverage.test.ts`）。运行期的放行判定**不**经过这里——
+ * `PolicyGuard` / `ThrottlerGuard` 直接读装饰器元数据，那是每个请求的热路径，
  * 不该付「遍历全部 controller」的代价。
  *
- * 两者读的是**同一个** `POLICY_KEY` / `PUBLIC_KEY`、同一套优先级（方法优先于类，见下），
- * 因此门禁看到的声明与守卫实际执行的声明不会漂移。
+ * 两侧读的是**同一个** `POLICY_KEY` / `PUBLIC_KEY` / `RATE_LIMIT_KEY`、同一套优先级
+ * （方法优先于类，见下），因此门禁看到的声明与守卫实际执行的声明不会漂移。
  *
  * ## 修复轮 1（C-4）：**同一个**注册表也报告限流声明，而不是再加一个并行的 walker
  *
- * 限流的覆盖率门（`tests/security/rate-limit-coverage.test.ts`）与策略门问的是同一个问题：
- * 「这条已注册的路由声明了它的安全归属吗」。再写一遍 `DiscoveryService` + `MetadataScanner`
- * 的遍历等于把「哪些是路由」这件事表达两次——两份实现迟早漂移，而漂移方向通常是
- * 「一条新路由被其中一份漏掉」，正是门要防的东西。因此这里扩展同一份 `RouteEntry`。
+ * 限流的覆盖率门与策略门问的是同一个问题：「这条已注册的路由声明了它的安全归属吗」。
+ * 再写一遍 `DiscoveryService` + `MetadataScanner` 的遍历等于把「哪些是路由」这件事
+ * 表达两次——两份实现迟早漂移，而漂移方向通常是「一条新路由被其中一份漏掉」，
+ * 正是门要防的东西。因此这里扩展同一份 `RouteEntry`。
  *
  * 声明本身仍由 `throttler.ts` 的 `readRateLimitDecl()` 读（守卫的 `skipIf` 用的是同一个函数），
  * 注册表只负责「枚举路由」这一件事。
  *
- * **名字保留 `PolicyRegistry`**：它是 Task 5 的既有名字，改名会波及既有断言面，
- * 属于修复轮之外的改动。它的职责应读作「路由声明的注册表」。
+ * ## 名字：`PolicyRegistry` → `RouteDeclarationRegistry`（Task 9 / Ruling 5）
+ *
+ * 旧名字在 Task 7 之后就不准了：它报告的是**路由的声明**（策略 + 限流两类），不再只是策略。
+ * 名字不准的代价是真实的——下一个要查「限流覆盖率是谁算的」的人会先去看 `throttler.ts`，
+ * 而真正的遍历在这里；而「两份实现」正是 Task 7 修复轮 1 特意避开的形状，
+ * 名字却反过来暗示它存在。改名波及的只有编译器能查到的引用面（文件、provider、断言里的
+ * `app.get(...)` 与失败文案），Task 9 一次改完。
  */
 @Injectable()
-export class PolicyRegistry {
+export class RouteDeclarationRegistry {
   constructor(
     private readonly discovery: DiscoveryService,
     private readonly scanner: MetadataScanner,

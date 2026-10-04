@@ -1,0 +1,143 @@
+name: CI
+
+# P0 的验收流水线（设计 §13.2 / §13.4）：安全边界、架构约束、数据库引导顺序，
+# 每一项都必须由**实际运行的命令**证明，而不是靠本地跑过一次的印象。
+on:
+  push: { branches: [main] }
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      # 迁移/DDL 用的真实 Postgres（**不是**测试用的那个：集成测试按设计自起 testcontainers，
+      # 见 tests/helpers/db.ts）。它在这里的作用是验证「全新的库 + 文档规定的引导顺序」
+      # 真的能建出可用且最小权限的运行期数据库——本地那种「已经迁过一次的卷」验证不了这件事。
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: vca_owner
+          POSTGRES_PASSWORD: owner_pw
+          POSTGRES_DB: vca
+          # C6（全 UTC）：与 infra/docker-compose.yml 同值，避免 CI 与本地行为分叉。
+          TZ: UTC
+          PGTZ: UTC
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U vca_owner -d vca"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 11.24.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22.19.0', cache: 'pnpm' }
+
+      # C18：allowBuilds 已在 pnpm-workspace.yaml 中（含 testcontainers 的可选传递依赖），
+      # 安装不应以非零码结束。
+      - run: pnpm install --frozen-lockfile
+
+      - name: 类型检查（K14：vitest 全绿不代表类型正确）
+        run: pnpm typecheck
+
+      - name: 安全 lint 门（C9：raw SQL / XSS / eval）
+        run: pnpm lint
+
+      - name: 架构守护（C5 / §3.3）
+        run: pnpm arch
+
+      # 显式装 psql，而不是假设 runner 镜像自带：GitHub 的 ubuntu 镜像内容随版本变化，
+      # 社区里出现过「连接串有了、却没有 psql 客户端」的情况。引导步骤是 P0 的验收路径，
+      # 不该押在镜像的偶然内容上（本地之所以不需要它，是因为 compose 把 psql 跑在容器里）。
+      - name: 安装 psql 客户端
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+
+      # ── 数据库引导：顺序是硬性的，换一下就会得到「看起来成功、其实零权限」的库 ──
+      #
+      # 1. `infra/db/roles.sql` 只做「建角色 + GRANT CONNECT」，**必须最先**：
+      #    后面的 GRANT 都要引用 app_user，角色不存在则直接报错。
+      #    它在 compose 侧挂在 docker-entrypoint-initdb.d 上，只在**空数据卷**时执行一次；
+      #    CI 的服务容器没有挂载任何初始化脚本，所以这里必须显式执行。
+      # 2. `prisma migrate deploy` 以属主 vca_owner 建 schema 与表。
+      # 3. `prisma generate` 生成客户端（测试进程要用）。
+      # 4. `infra/db/apply-grants.sql` **必须在迁移之后**：`GRANT` 只作用于执行那一刻
+      #    已存在的对象，新建的表不继承此前的 GRANT；这一步也承载 append-only 的
+      #    `REVOKE UPDATE, DELETE`（不变式 #5）。compose 侧**没有**它的入口，
+      #    所以本地是根脚本 `pnpm db:setup`，CI 是下面这段。
+      #
+      # 为什么不能省掉第 4 步：省掉之后 app_user 对这些表**一个权限都没有**
+      # （`GRANT ... ON ALL TABLES IN SCHEMA auth` 在空 schema 上是静默的零授予），
+      # 而这条流水线里唯一会碰这个库的就是本步骤——所以下一步专门来断言权限事实。
+      - name: 数据库引导（建角色 → 迁移 → 生成客户端 → 授权）
+        env:
+          MIGRATE_DATABASE_URL: postgresql://vca_owner:owner_pw@127.0.0.1:5432/vca
+        run: |
+          set -euo pipefail
+          psql "$MIGRATE_DATABASE_URL" -v ON_ERROR_STOP=1 -f infra/db/roles.sql
+          pnpm --filter @vca/api db:migrate:deploy
+          pnpm --filter @vca/api db:generate
+          psql "$MIGRATE_DATABASE_URL" -v ON_ERROR_STOP=1 -f infra/db/apply-grants.sql
+
+      # Ruling 1 的闭环：上一步「没报错」不等于「授权真的生效」。这里直接问 PostgreSQL
+      # 三件事——运行期角色**能用**什么、**不能用**什么、以及能不能碰到迁移台账。
+      # 期望值 t|t|f|f 的含义：auth 表可读写 / audit 表可 INSERT（append-only 的另一半）/
+      # audit 表**不可** UPDATE（不变式 #5）/ public._prisma_migrations 不可读（Task 3 修复）。
+      - name: 运行期角色的权限事实（不变式 #5 / Ruling 1）
+        env:
+          MIGRATE_DATABASE_URL: postgresql://vca_owner:owner_pw@127.0.0.1:5432/vca
+        run: |
+          set -euo pipefail
+          actual=$(psql "$MIGRATE_DATABASE_URL" -tA -v ON_ERROR_STOP=1 -c "
+            SELECT has_table_privilege('app_user','auth.users','SELECT'),
+                   has_table_privilege('app_user','audit.audit_logs','INSERT'),
+                   has_table_privilege('app_user','audit.audit_logs','UPDATE'),
+                   has_table_privilege('app_user','public._prisma_migrations','SELECT')")
+          echo "app_user: auth.users SELECT | audit_logs INSERT | audit_logs UPDATE | migrations SELECT = $actual"
+          if [ "$actual" != "t|t|f|f" ]; then
+            echo "::error::运行期角色权限不符合预期（期望 t|t|f|f）：$actual"
+            echo "::error::多半是引导顺序错了（授权跑在迁移之前 → 对空 schema 静默授予零个对象），或 append-only 的 REVOKE 被删。"
+            exit 1
+          fi
+
+      # ── 测试 ──
+      #
+      # `unit` **必须整跑，不要加 `-t parseEnv` 之类的过滤**。
+      # brief 的验收表把「缺失/占位密钥时进程拒绝启动」写成
+      # `pnpm vitest run --project unit -t parseEnv`，Task 2 的复审已**实测证伪**那条命令的
+      # 判别力：被过滤出来的用例只断言 `envSchema.parse({})` 会抛错——那是 schema **自己**
+      # 保证的性质，与「进程是否真的因此起不来」无关。把 `ConfigModule` 从
+      # `app.module.ts` 的 imports 里整个删掉（= 关掉 C10 的全部 fail-fast），
+      # `-t parseEnv` **照样全绿**。Task 2 因此补了真正的接线用例
+      # （`tests/unit/config/bootstrap-guard.test.ts` 的「引导期 fail-fast 接线」：
+      # 删掉必填密钥后 import `app.module`，必须观察到拒绝启动）。
+      # 那条例用**不在** `-t parseEnv` 的匹配范围内，所以这里整跑 unit project。
+      - name: 单元测试（含 C10 引导期 fail-fast 接线）
+        run: pnpm vitest run --project unit
+
+      # Ruling 3：安全与架构两个 project 必须**自证不是空的**。
+      # 直接 `vitest run --project X` 时，一个测试文件都没匹配到会让 vitest 自己失败；
+      # 但「某个测试文件被改名/删除」它不会报警——那正是门被悄悄削弱的方式。
+      # `scripts/assert-tests-ran.mjs` 用 json reporter 读出**实际执行条数**并与登记的下限比对。
+      # 它内部跑的仍是不带 `--passWithNoTests` 的那条命令（Task 9 也把该标志从
+      # `test:security` / `test:arch` 两个脚本上摘掉了，理由见 scripts 里的注释）。
+      - name: 安全测试（默认拒绝 / 越权矩阵 / CSP / CSRF / 限流）
+        run: node scripts/assert-tests-ran.mjs security
+
+      - name: 架构守护测试（C5 / 验收 13.4）
+        run: node scripts/assert-tests-ran.mjs architecture
+
+      # 真 Postgres + 真 Redis（testcontainers，绝不 mock 数据库；§12）。
+      # 已知的偶发抖动点是容器启动（曾观测到一次，重跑即绿）；刻意**不加 retry**：
+      # 加重试会把「容器起不来」这类真实的基础设施问题一并掩盖掉。
+      - name: 集成测试（testcontainers）
+        run: pnpm vitest run --project integration
+
+      # 威胁 #14（供应链）。
+      #
+      # 已知的 3 条（Prisma CLI 子树：deepmerge-ts / mysql2）已在 `pnpm-workspace.yaml` 的
+      # `auditConfig.ignoreGhsas` 里**逐条书面豁免**并写明理由与移除条件。因此这一步现在的语义是
+      # 「不许**新增** high/critical」——豁免是显式的、进 code review 的，而不是把阈值调高。
+      - name: 依赖审计（威胁 #14）
+        run: |
+          pnpm audit --audit-level high || \
+            (echo "::error::存在新增的 high/critical 依赖漏洞：要么修复，要么在 pnpm-workspace.yaml 的 auditConfig.ignoreGhsas 里逐条豁免（附理由与移除条件）" && exit 1)

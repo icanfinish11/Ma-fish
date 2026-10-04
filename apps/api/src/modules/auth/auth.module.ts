@@ -1,7 +1,10 @@
 import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { Env } from '../../config/env.schema.js';
-import { AuditModule } from '../audit/audit.module.js';
+// 跨模块引用**一律**经对方的 `index.ts`（设计 §3.3 第 2 条）。深引 `../audit/audit.module.js`
+// 曾经能工作，但那绕过了模块的对外接口；由 `.dependency-cruiser.cjs` 的
+// `no-cross-module-internals` 守着（Task 9）。
+import { AuditModule } from '../audit/index.js';
 import { RedisModule } from '../../db/redis.module.js';
 import { AuthController } from './auth.controller.js';
 import { AuthService } from './auth.service.js';

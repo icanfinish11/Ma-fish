@@ -3,7 +3,7 @@ import { Controller, Get, Module, Post, type INestApplication } from '@nestjs/co
 import { Test } from '@nestjs/testing';
 import { createTestApp } from '../helpers/app.js';
 import { PolicyModule } from '@vca/api/common/policy/policy.module.js';
-import { PolicyRegistry } from '@vca/api/common/policy/policy.registry.js';
+import { RouteDeclarationRegistry } from '@vca/api/common/policy/route-declaration.registry.js';
 import { RateLimited, SkipRateLimit } from '@vca/api/common/security/throttler.js';
 
 /**
@@ -99,7 +99,7 @@ describe('每个路由都必须有明确的限流归属（修复轮 1 / C-4）',
   it('生产 AppModule 中不存在「既未声明层、也未标有意不限流」的路由', async () => {
     const app = await createTestApp();
     await withApp(app, () => {
-      const registry = app.get(PolicyRegistry);
+      const registry = app.get(RouteDeclarationRegistry);
 
       // 顺序是刻意的：**门自己的断言排第一**，这样失败时给出的永远是那句可执行的信息
       // （哪个 controller、哪个方法、哪条路径、该补什么），而不是辅助断言的措辞。
@@ -111,7 +111,7 @@ describe('每个路由都必须有明确的限流归属（修复轮 1 / C-4）',
 
       // 非空转前提：发现层确实读到了已知的两条路由及其声明。
       // 没有这一步，「gaps 为空」既可能是「全都声明了」，也可能是「一条都没扫到」。
-      expect(registry.find('AuthController', 'register'), 'PolicyRegistry 未能发现 AuthController.register').toMatchObject({
+      expect(registry.find('AuthController', 'register'), 'RouteDeclarationRegistry 未能发现 AuthController.register').toMatchObject({
         path: '/auth/register',
         rateLimit: 'register',
         rateLimitSkipped: false,
@@ -137,7 +137,7 @@ describe('每个路由都必须有明确的限流归属（修复轮 1 / C-4）',
     const app = mod.createNestApplication();
     await app.init();
     await withApp(app, () => {
-      const gaps = app.get(PolicyRegistry).listRateLimitGaps();
+      const gaps = app.get(RouteDeclarationRegistry).listRateLimitGaps();
       expect(gaps).toHaveLength(2);
 
       // **不**按下标断言（修复轮 2 改正）：`gaps[0]`/`gaps[1]` 依赖

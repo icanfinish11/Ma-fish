@@ -3,6 +3,23 @@
 # **两者都不是生产形态**：口令是明文的本地固定值，生产运行时一律来自环境变量（C10）。
 # 这里的 `vca_owner` 是**迁移属主**角色，不是运行时角色；应用连库必须用 `app_user`
 # （见 `infra/db/roles.sql` 与 `apps/api/prisma.config.ts` 的注释）。
+#
+# ## 从零开始（以及「为什么我的库看起来是旧的」）
+#
+#     pnpm db:setup      # = db:up → prisma migrate deploy → 从容器里跑 apply-grants.sql
+#
+# 顺序是硬性的：建角色 → 迁移 → **授权**。授权必须在迁移之后（`GRANT` 只作用于执行那一刻
+# 已存在的对象），而 compose 侧没有它的入口，所以由根脚本 `pnpm db:grants` 在迁移后执行。
+#
+# **注意数据卷**：`docker-entrypoint-initdb.d` 只在**数据卷为空**时执行一次，迁移台账也留在
+# 卷里。因此本机若已有旧的 `vca` 卷（上一次会话留下的），会出现两种「看着像新库、其实不是」
+# 的失败：① `roles.sql` 的改动不会再生效；② 迁移被重新生成过时，在已迁过的卷上会与台账冲突
+# （Task 3 实测踩到过）。遇到这两类现象，先清卷再重建：
+#
+#     pnpm db:down       # = docker compose down -v（**会删掉本地库里的全部数据**）
+#     pnpm db:setup
+#
+# CI 不受此影响：那边每次都是一个全新的库（见 `.github/workflows/ci.yml`）。
 services:
   postgres:
     image: postgres:16-alpine

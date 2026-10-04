@@ -67,7 +67,7 @@ const RATE_LIMIT_SKIP_KEY = 'vca:rate-limit-skip';
  * **静默不限流**，没有任何测试会红。这与本仓库已经抓到过的四次缺陷同一形状
  * （空操作的 `REVOKE`、漏掉 `.tsx` 的扫描器、死代码规则、恒真断言）。
  *
- * `tests/security/rate-limit-coverage.test.ts` 是那道门：它用 `PolicyRegistry` 枚举
+ * `tests/security/rate-limit-coverage.test.ts` 是那道门：它用 `RouteDeclarationRegistry` 枚举
  * 全部已注册路由，要求每条路由**要么**声明了某一层、**要么**打了这个标。
  * 于是「漏写」在 CI 里就是一条列出「哪个 controller、哪个方法、哪条路径」的失败，
  * 而不是线上一个不限流的接口。
@@ -108,7 +108,7 @@ type RouteTarget = Parameters<Reflector['getAllAndOverride']>[1][number];
  * 读一条路由的限流声明。
  *
  * **两处消费者共用这一个函数**是刻意的：运行期的 `skipIf` 与 CI 的覆盖率门
- * （`PolicyRegistry.listRateLimitGaps()`）若各读各的元数据、各写一套优先级，
+ * （`RouteDeclarationRegistry.listRateLimitGaps()`）若各读各的元数据、各写一套优先级，
  * 两者迟早漂移——而漂移方向通常是「门看到的是声明了的、守卫看到的是没声明」，
  * 也就是门绿灯而线上不限流。方法与类同时存在时方法优先（`getAllAndOverride`）。
  */
@@ -202,7 +202,7 @@ function accountKey(body: unknown): string {
  * 负载均衡因此会把整个实例判死）。
  *
  * 采纳的是与 Task 5 策略声明**同一形状**的覆盖率门：
- * `tests/security/rate-limit-coverage.test.ts` + `PolicyRegistry.listRateLimitGaps()`
+ * `tests/security/rate-limit-coverage.test.ts` + `RouteDeclarationRegistry.listRateLimitGaps()`
  * 要求**每条已注册路由**要么声明了某一层、要么显式标 `@SkipRateLimit()`，
  * 于是「漏写」在 CI 里变红并点名到「哪个 controller、哪个方法、哪条路径」。
  * 门本身也有对照用例（探针模块里故意漏一条、故意矛盾一条，必须恰好报出那两条）。

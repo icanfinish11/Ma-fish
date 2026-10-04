@@ -25,3 +25,32 @@ allowBuilds:
 # `The "pnpm" field in package.json is no longer read by pnpm`），override 只在此处生效。
 overrides:
   testcontainers: 12.0.4
+
+# ── 依赖审计的**书面豁免**（威胁 #14；验收 13.2 第 9 条）────────────────────────
+#
+# 背景：`pnpm audit --audit-level high` 在 Task 9 落地时**报红**，3 条全部来自
+# `prisma@7.10.0` 自己的依赖子树（`prisma` 既是 apps/api 的 devDependency，
+# 也是 `@prisma/client` 的依赖，所以这几包在 node_modules 里确实存在）：
+#
+#   high     GHSA-ggr8-5vv4-36mx  deepmerge-ts <8.0.0   （经 @prisma/config，CLI 合并配置用）
+#   high     GHSA-3f6p-5ww8-9rcr  mysql2      <3.22.0    （经 prisma CLI，连 MySQL 时才会加载）
+#   moderate GHSA-rgwj-5xj2-c3m3  mysql2      <=3.23.0
+#
+# 为什么**豁免**而不是在这里加 override：
+#   * 两条 high 的触发路径本项目都走不到——数据源是 PostgreSQL（`@prisma/adapter-pg`），
+#     mysql2 只在 Prisma 连 MySQL 时被加载；deepmerge-ts 只服务 CLI 读取我们自己的
+#     `prisma.config.ts`（内容由本仓库控制，不存在「递归对象图」这一输入）。
+#   * 真要修，`deepmerge-ts` 得跨**大版本**（7 → 8）塞进 `@prisma/config`。那等于把
+#     迁移工具（C7：属主连接串这条安全边界的执行者）换到一个 Prisma 从未测过的组合上，
+#     换掉一个走不到的风险，换来一个真实且高影响的故障面。这不是等价交换。
+#   * pnpm 的 `ignoreGhsas` 是**可审阅**的豁免：它写进仓库、逐条列出、被 code review 看见；
+#     而 `--audit-level` 调高或干脆不跑审计，则会把**将来新出现**的漏洞一并放行。
+#
+# 因此这里保留 CI 的 `pnpm audit --audit-level high` 门：**新增**的 high/critical 照样红。
+# 移除条件：Prisma 发布把这两包带上去的版本后，删掉下面任一条即可（先删再验，
+# 不要「留着以防万一」）。升级到 Prisma 大版本时**必须**重跑本条审计。
+auditConfig:
+  ignoreGhsas:
+    - GHSA-ggr8-5vv4-36mx
+    - GHSA-3f6p-5ww8-9rcr
+    - GHSA-rgwj-5xj2-c3m3

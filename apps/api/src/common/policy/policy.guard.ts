@@ -105,7 +105,7 @@ export class PolicyGuard implements CanActivate {
   }
 
   /**
-   * 读当前路由的声明。方法级优先于类级（`getAllAndOverride`），与 `PolicyRegistry.listRoutes`
+   * 读当前路由的声明。方法级优先于类级（`getAllAndOverride`），与 `RouteDeclarationRegistry.listRoutes`
    * 的取值优先级必须一致——否则 CI 门看到的声明会与运行期执行的声明不同。
    *
    * 注意「公开」判断排在策略判断**之前**，因此类级 `@Public()` 会覆盖其下所有方法，

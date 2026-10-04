@@ -47,11 +47,23 @@ export default defineConfig({
     environment: 'node',
     globalSetup,
     projects: [
+      // 根 `package.json` 的 `test:security` / `test:arch` 两个脚本**刻意不带**
+      // `--passWithNoTests`（其余 project 的脚本仍带，`property` 在 P1 之前本来就是空的）：
+      // 一个测试文件都没匹配到时，vitest 会在那种调用下以 0 退出——于是「安全门」变成
+      // 「什么都没检查，但一切正常」。CI 另有一道更严的门
+      // （`scripts/assert-tests-ran.mjs`：读 json reporter 的**实际执行条数**并要求不低于
+      // 登记的下限），这两处是同一个要求在不同入口上的落点。
       { resolve: { alias }, test: { name: 'unit', ...withTestEnv, include: ['tests/unit/**/*.test.ts'] } },
       { resolve: { alias }, test: { name: 'integration', ...withTestEnv, include: ['tests/integration/**/*.test.ts'], testTimeout: 120_000, hookTimeout: 180_000 } },
       { resolve: { alias }, test: { name: 'security', ...withTestEnv, include: ['tests/security/**/*.test.ts'], testTimeout: 120_000, hookTimeout: 180_000 } },
       { resolve: { alias }, test: { name: 'property', ...withTestEnv, include: ['tests/property/**/*.test.ts'], testTimeout: 300_000 } },
-      { resolve: { alias }, test: { name: 'architecture', ...withTestEnv, include: ['tests/architecture/**/*.test.ts'] } },
+      // 架构守护 project 需要显式的超时：`tests/architecture/module-boundaries.test.ts`
+      // 会**起一个子进程**跑 depcruise（整棵 apps/ + packages/ 的静态分析）。单独跑约 1 秒，
+      // 但 `pnpm test`（不带 `--project`）会把 5 个 project 一起开来，同时 testcontainers
+      // 还在起 Postgres/Redis 容器——实测在那种负载下它超过了 vitest 的 5 秒默认值并以
+      // 「Test timed out in 5000ms」失败（不是规则违规）。默认值在这里量错了对象：
+      // 它测的是机器有多忙，不是架构有没有被破坏。
+      { resolve: { alias }, test: { name: 'architecture', ...withTestEnv, include: ['tests/architecture/**/*.test.ts'], testTimeout: 120_000 } },
     ],
   },
 });
