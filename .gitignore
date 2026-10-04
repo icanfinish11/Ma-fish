@@ -1,0 +1,28 @@
+# 依赖与构建产物
+node_modules/
+dist/
+build/
+.next/
+out/
+coverage/
+
+# 环境与密钥 —— 绝不入库
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# 制品本地存储卷
+storage/
+data/
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+logs/
