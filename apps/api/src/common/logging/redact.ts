@@ -7,10 +7,19 @@
  * 威胁 #6：「任何界面，含管理端，都不得暴露」）。这里是**提前放进黑名单**，
  * 而不是提前造抽象：黑名单条目是 deny-list 的一项，成本为零；
  * 将来漏了它的代价却是一封密封标价被打进日志。故保留。
+ *
+ * `sessionId` / `session_id` 是**修复轮 2 新增的纵深防御**：会话 id 本身就是完整的
+ * bearer 凭证（见 `modules/auth/session.service.ts`），而它天然会出现在请求头
+ * （`x-session-id`）、URL 查询串或调试负载里。真正的运行期防线是「不要把它写进日志」
+ * 与 pino 的 `req` 序列化器（只输出 `method`/`url`）——**本函数今天没有运行时调用方**，
+ * 所以这两条不是「已经生效的过滤」，只是把 C11 的意图写进 deny-list：
+ * 将来 `redact()` 被接进日志路径时，它们立刻生效。
+ * 注意 `cookie` 已在列表中，因此 `req.headers.cookie` 这一类早已被挡。
  */
 const REDACT_KEYS = [
   'password', 'passwordHash', 'password_hash', 'token', 'accessToken', 'refreshToken',
   'authorization', 'cookie', 'set-cookie', 'secret', 'clientSecret', 'apiKey',
+  'sessionId', 'session_id',
   'proxyCeiling', 'proxy_ceiling',
 ];
 

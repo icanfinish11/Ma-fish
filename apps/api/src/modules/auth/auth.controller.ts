@@ -56,6 +56,11 @@ export class AuthController {
   }
 
   @Public()
+  // 与 `logout` 同一条理由（修复轮 2 补齐）：POST 的 Nest 默认状态码是 **201 Created**，
+  // 而登录没有创建任何**可寻址的资源**——它换回的是一个会话，凭证在 `Set-Cookie` 里。
+  // 201 会让「按状态码分支」的客户端与日志/监控把它当成一次资源创建。
+  // `register` **保留 201**：那条路径确实新建了一个 User 资源。
+  @HttpCode(HttpStatus.OK)
   @Post('login')
   async login(
     @Body() body: LoginDto,

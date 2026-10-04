@@ -58,13 +58,21 @@ export class SessionService {
   async create(userId: string, meta: { ip: string; userAgent: string }): Promise<{ sessionId: string }> {
     // 256 位随机，不可猜测
     const sessionId = randomBytes(32).toString('base64url');
-    await this.redis.hset(KEY(sessionId), {
-      userId,
-      authAt: String(Date.now()),
-      ip: meta.ip,
-      userAgent: meta.userAgent,
-    });
-    await this.redis.expire(KEY(sessionId), IDLE_TTL_SECONDS);
+    // `HSET` 与 `EXPIRE` **必须是一条原子命令**（修复轮 2）：分两次发的话，
+    // 进程在两条命令之间崩掉（或连接断开）会留下一个**没有 TTL 的会话哈希**——
+    // 它**永不过期**，于是 C13 的「空闲 7 天」在这条记录上静默失效，
+    // 而外部表现（会话一直有效）看起来完全正常，不会有任何报错。
+    // `multi().exec()` 把两者包进一个 MULTI/EXEC 事务：要么都生效，要么都不生效。
+    await this.redis
+      .multi()
+      .hset(KEY(sessionId), {
+        userId,
+        authAt: String(Date.now()),
+        ip: meta.ip,
+        userAgent: meta.userAgent,
+      })
+      .expire(KEY(sessionId), IDLE_TTL_SECONDS)
+      .exec();
     return { sessionId };
   }
 

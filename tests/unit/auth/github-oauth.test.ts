@@ -27,16 +27,35 @@ describe('GitHub OAuth PKCE（§4.2）', () => {
     expect(url.origin + url.pathname).toBe('https://github.com/login/oauth/authorize');
 
     const q = url.searchParams;
+    // 逐项取值（更细的失败信息：哪一项错了直接体现在消息里）
     expect(q.get('client_id')).toBe('cid-123');
     expect(q.get('redirect_uri')).toBe('https://api.example.com/auth/github/callback');
     expect(q.get('state')).toBe('state-abc');
     expect(q.get('code_challenge')).toBe('challenge-xyz');
     // 没有这一项，GitHub 会按 `plain` 解读 challenge ⇒ PKCE 退化成「明文回显 verifier」
     expect(q.get('code_challenge_method')).toBe('S256');
-    // scope 只要身份所需的两项：多要一项就是多一份授权面
     expect(q.get('scope')).toBe('read:user user:email');
-    // 授权码流不使用 implicit：换成 token 就直接把令牌暴露在 URL 里了
-    expect(q.get('response_type')).not.toBe('token');
+    // 精确**键集合**（值与上面重复，是刻意的：上面的断言回答「值对不对」，
+    // 这两条回答「有没有多/少参数」——`response_type=token` 只可能被后者抓到）
+    const params = Object.fromEntries(q.entries());
+    expect(params).toEqual({
+      client_id: 'cid-123',
+      redirect_uri: 'https://api.example.com/auth/github/callback',
+      scope: 'read:user user:email',
+      state: 'state-abc',
+      code_challenge: 'challenge-xyz',
+      code_challenge_method: 'S256',
+    });
+    // 授权码流不使用 implicit：把「不得出现 `response_type=token`」显式写成键集合的一部分，
+    // 因此它不再是「只要 URL 里没有这个键就通过」的空断言——多出**任何**参数都会红。
+    expect(Object.keys(params).sort()).toEqual([
+      'client_id',
+      'code_challenge',
+      'code_challenge_method',
+      'redirect_uri',
+      'scope',
+      'state',
+    ]);
   });
 
   it('newPkce 的 challenge 是 verifier 的 SHA-256（base64url），且每次不同', () => {

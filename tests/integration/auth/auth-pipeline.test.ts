@@ -14,7 +14,9 @@ import { Policy } from '@vca/api/common/policy/policy.decorator.js';
 import { SESSION_COOKIE } from '@vca/api/common/http/cookie.js';
 import { GithubOauthService } from '@vca/api/modules/auth/github-oauth.service.js';
 import { AuditService } from '@vca/api/modules/audit/audit.service.js';
+import { Prisma } from '@vca/api/generated/prisma/client.js';
 import type { User } from '@vca/api/generated/prisma/client.js';
+import { createTestApp } from '../../helpers/app.js';
 
 /**
  * 认证管线的**端到端接线**验证（本任务 Step 0 的交付物，不在 brief 里）。
@@ -152,6 +154,7 @@ interface UsedPrisma {
   auditLog: {
     create: (args: { data: AuditRow }) => Promise<unknown>;
   };
+  $transaction: <T>(fn: (tx: unknown) => Promise<T>) => Promise<T>;
 }
 
 interface AuditRow {
@@ -163,10 +166,39 @@ interface AuditRow {
   metadata?: unknown;
 }
 
-function createFakePrisma(): { prisma: PrismaService; users: User[]; audits: AuditRow[] } {
+/**
+ * 假 Prisma 的两个**可注入行为**，只为覆盖真实库才有、而内存数组天然没有的路径。
+ *
+ * 两者都不是「为了测试方便而放宽实现」，而是让测试能模拟**真实数据库确实会发生**的时序：
+ * `create` 撞唯一约束（并发注册）、以及批量插入时审计行随业务行进同一个事务。
+ */
+interface FakePrismaBehaviour {
+  /**
+   * 唯一约束是否生效。**默认 `false`**：本文件绝大多数用例用的是「先查再建」的
+   * 正常时序，让假实现也生效不会改变它们的结果（它们本来就不会插重复邮箱），
+   * 但会让别的假设（例如误插）立刻暴露。需要竞态语义的用例显式打开。
+   */
+  uniqueEmail?: boolean;
+  /**
+   * `user.create` 之前执行的钩子（可抛错）。用来模拟「预检查与 `create` 之间，
+   * 另一个并发请求已经插入了同一个邮箱」这一刻。
+   */
+  beforeUserCreate?: () => Promise<void> | void;
+  /** 审计行是否随业务行一起落库（见 `runTx` 注释）。默认 `true`。 */
+  auditInTransaction?: boolean;
+}
+
+function createFakePrisma(behaviour: FakePrismaBehaviour = {}): {
+  prisma: PrismaService;
+  users: User[];
+  audits: AuditRow[];
+} {
   const users: User[] = [];
   const audits: AuditRow[] = [];
+  const auditInTransaction = behaviour.auditInTransaction ?? true;
   let seq = 0;
+  // 事务期间**暂存**的审计行：只有 `$transaction` 正常返回才并入 `audits`。
+  let stagedAudits: AuditRow[] = [];
 
   const impl: UsedPrisma = {
     user: {
@@ -186,6 +218,16 @@ function createFakePrisma(): { prisma: PrismaService; users: User[]; audits: Aud
         return hit;
       },
       create: async (args) => {
+        await behaviour.beforeUserCreate?.();
+        // 唯一约束用**真实的** Prisma 错误类构造：`AuthService` 按 `code === 'P2002'` 识别，
+        // 而这个对象是从应用实际使用的生成客户端里 `new` 出来的，不是手搓的 `{code:'P2002'}`。
+        if (behaviour.uniqueEmail && users.some((u) => u.email === args.data.email)) {
+          throw new Prisma.PrismaClientKnownRequestError('Unique constraint failed on the fields: (`email`)', {
+            code: 'P2002',
+            clientVersion: '7.10.0',
+            meta: { modelName: 'User', target: ['email'] },
+          });
+        }
         seq += 1;
         const now = new Date('2026-10-04T00:00:00.000Z');
         const user: User = {
@@ -203,9 +245,18 @@ function createFakePrisma(): { prisma: PrismaService; users: User[]; audits: Aud
     },
     auditLog: {
       create: async (args) => {
-        audits.push(args.data);
+        (auditInTransaction ? audits : stagedAudits).push(args.data);
         return args.data;
       },
+    },
+    $transaction: async (fn) => {
+      // 真实的 `$transaction` 语义：回调正常返回才提交。**刻意不实现回滚**——
+      // 假实现里没有「写一半」的中间态可回滚（数组 push 要么发生要么没发生），
+      // 而回滚本身是 Prisma 的职责，由 Task 3 的真库用例覆盖。
+      const result = await fn(impl as unknown as Prisma.TransactionClient);
+      audits.push(...stagedAudits);
+      stagedAudits = [];
+      return result;
     },
   };
 
@@ -338,13 +389,13 @@ describe('认证管线接线（Step 0：会话中间件 + 顺序）', () => {
    * 探针路由声明了 `condition: 'alwaysAllow'`，而 `PolicyGuard` 对**任何**非 `@Public()`
    * 的声明都先要求身份（方案 B），因此匿名的正确结果是 403——这不是中间件在拦。
    *
-   * 区分「谁拦的」靠两条可观测证据，而不是靠读代码：
-   * 1. 响应体是守卫的措辞 `需要登录`（若中间件自己抛错，会是 500 或另一条消息）；
-   * 2. `x-trace-id` **照常回写**——说明请求正常穿过 `TraceMiddleware` 与
-   *    `SessionMiddleware` 到达了守卫。中间件若「自己 403」，第 2 条仍可能成立，
-   *    所以第 1 条不可省；两条一起才能把「中间件不参与授权判定」这件事钉住。
+   * 区分「谁拦的」**靠的是响应体是守卫的措辞 `需要登录`**——这一条才有判别力。
+   * `x-trace-id` **不**承担这个职责（修复轮 2 收窄上一版的过度声明）：
+   * 它由 `TraceMiddleware` 写在请求最外层，即便会话中间件自己短路掉请求它**照样**会被回写，
+   * 因此它只能证明「请求穿过了 trace 中间件」，不能证明「它穿过了会话中间件并到达守卫」。
+   * 保留它是因为它还有第二个用途：钉住 trace 头在每个响应上都存在（Task 4 的契约）。
    */
-  it('匿名请求下会话中间件放行，403 来自守卫（措辞与 trace 头可区分）', async () => {
+  it('匿名请求下会话中间件放行，403 来自守卫（措辞可区分）', async () => {
     const res = await request(app.getHttpServer()).get('/__auth-wiring-probe').set('x-trace-id', 'trace-anon');
     expect(res.status).toBe(403);
     expect(res.body).toMatchObject({ message: '需要登录' });
@@ -390,6 +441,16 @@ describe('认证管线接线（Step 0：会话中间件 + 顺序）', () => {
     // 清 cookie 的响应头也带上（双保险）
     expect(String(out.headers['set-cookie'])).toContain(`${SESSION_COOKIE}=;`);
 
+    // **审计里不得出现会话 id**（修复轮 2）：`audit_log` 是 append-only、不可 UPDATE/DELETE 的
+    // 表，写进去就永久留档，而 `sessionId` 是完整的 bearer 凭证（C11）。
+    // 归属人由 `actorId` 承载，`resourceId` 放的是**用户**。
+    // 这一条同时给出「修复前后有区别」的证据：修复前这里会是那个 43 字符的会话 id。
+    const logoutRow = fake.audits.find((a) => a.action === 'auth.logout');
+    expect(logoutRow).toBeDefined();
+    expect(logoutRow?.actorId).toBe(reg.body.userId);
+    expect(logoutRow?.resourceId).toBe(reg.body.userId);
+    expect(JSON.stringify(fake.audits)).not.toContain(sid);
+
     const after = await request(app.getHttpServer()).get('/auth/me').set('Cookie', cookies);
     expect(after.status).toBe(403);
   });
@@ -402,6 +463,103 @@ describe('认证管线接线（Step 0：会话中间件 + 顺序）', () => {
     const second = await request(app.getHttpServer()).post('/auth/register').send(body);
     expect(second.status).toBe(409);
     expect(fake.users.length).toBe(usersAfterFirst);
+  });
+
+  /**
+   * **check-then-create 的竞态**：并发注册同一个邮箱时，败者的 `create` 撞唯一约束并抛
+   * Prisma `P2002`。`P2002` 不是 `HttpException`，若不显式映射，Nest 会回
+   * `500 Internal server error`——一个客户端可触发的输入冲突被报成服务端故障，
+   * 与 409 契约不一致，还凭空制造 500 告警。
+   *
+   * ## 这条用例为什么是**确定性**的，而不是「两个并发请求碰运气」
+   *
+   * 真正并发发两个请求既慢又不稳（取决于调度，可能两个都撞上预检查、也可能不撞），
+   * 红/绿会随机器变化。这里改成**把竞态的那一瞬间直接摆出来**：在预检查返回 `null`
+   * **之后**、`create` **之前**插入重复行——正是另一个请求在这两行之间提交。
+   *
+   * 三个条件都必须在同一次请求里成立，缺一不可，因此它测的确实是那条 catch 分支：
+   * 1. 预检查必须**返回 null**，否则走的是上面那条 409 分支，根本到不了 `create`；
+   * 2. `create` 必须**真的抛 P2002**（由假实现的 `uniqueEmail` 用真实 Prisma 错误类构造）；
+   * 3. 响应必须是 **409 且消息与预检查逐字相同**（同因同果，不泄露走了哪条路径）。
+   *
+   * 为了排除「这一枪打空」的可能，本用例**单独编译一个应用**并断言每个前置条件：
+   * 预检查被绕过（「竞争者」确实是在它之后写入的）、`create` 确实抛了 P2002、最终 409。
+   * 本 describe 的主应用**不**开 `uniqueEmail`，因此其余用例的假数据库行为一字未变。
+   */
+  it('并发注册撞唯一约束：P2002 映射为 409（而不是 500）', async () => {
+    const fakeRace = createFakePrisma({ uniqueEmail: true });
+    const containerRace = await new RedisContainer('redis:7-alpine').start();
+    const redisRace = newTestRedis(containerRace.getConnectionUrl());
+
+    const body = { email: 'race@example.com', password: 'a-strong-passphrase' };
+    // 「竞争者」：模拟另一个并发请求在本请求的预检查**之后**插入同一个邮箱。
+    let preCheckMissed = false;
+    let createThrew = false;
+    fakeRace.users.push({
+      id: '00000000-0000-7000-8000-0000000000ff',
+      email: body.email,
+      passwordHash: null,
+      role: 'USER',
+      creditScore: 100,
+      createdAt: new Date('2026-10-04T00:00:00.000Z'),
+      updatedAt: new Date('2026-10-04T00:00:00.000Z'),
+    });
+
+    // 手工替换方法（而不是 `vi.spyOn(...).mockImplementation(...)`）。
+    // 两个原因，都是实测踩出来的：
+    // ① `vi.spyOn(X).mockImplementation(fn)` 让 `fn` 的参数被推断成 `never`
+    //    （Prisma 的方法是泛型重载，一个具体函数签名无法满足它），直接写是 TS2345；
+    // ② 在 `mockImplementation` 里调用「原方法」时必须**先**把原方法绑定到局部变量，
+    //    否则调用的是那个已被替换的属性——即自己，实测报
+    //    `RangeError: Maximum call stack size exceeded`，整个 worker 以退出码 7 崩掉
+    //    （不是一条红用例，而是套件不可用）。这里用一个可换的委托变量把这件事写死。
+    type Delegating = (...args: never[]) => Promise<unknown>;
+    const userTable = fakeRace.prisma.user as unknown as Record<string, Delegating>;
+    const findOriginal = (fakeRace.prisma.user.findUnique as unknown as Delegating).bind(fakeRace.prisma.user);
+    const createOriginal = (fakeRace.prisma.user.create as unknown as Delegating).bind(fakeRace.prisma.user);
+    const findDelegate: { fn: Delegating } = { fn: findOriginal };
+    const createDelegate: { fn: Delegating } = { fn: createOriginal };
+
+    userTable.findUnique = async (args) => {
+      // 只在**按邮箱查**的那次上放行一次「未命中」：那正是竞态窗口的入口。
+      // （`findUnique` 还被 `me()` 用 id 查，不能一概返回 null。）
+      if ((args as { where: { email?: string | null } }).where.email === body.email) {
+        preCheckMissed = true;
+        return null;
+      }
+      return findDelegate.fn(args);
+    };
+    userTable.create = async (args) => {
+      try {
+        return await createDelegate.fn(args);
+      } catch (err) {
+        if ((err as { code?: string }).code === 'P2002') createThrew = true;
+        throw err;
+      }
+    };
+
+    const raceApp = await createTestApp({
+      overrides: [
+        (b) => b.overrideProvider(PrismaService).useValue(fakeRace.prisma),
+        (b) => b.overrideProvider(REDIS).useValue(redisRace),
+      ],
+    });
+
+    try {
+      const res = await request(raceApp.getHttpServer()).post('/auth/register').send(body);
+
+      // 前置条件（防止这条用例静默地测了别的东西）：
+      expect(preCheckMissed).toBe(true);
+      expect(createThrew).toBe(true);
+      // 断言本身：同因同果的 409，且不创建第二个用户
+      expect(res.status).toBe(409);
+      expect(res.body).toMatchObject({ message: '该邮箱无法注册' });
+      expect(fakeRace.users).toHaveLength(1);
+    } finally {
+      vi.restoreAllMocks();
+      await raceApp.close();
+      await containerRace.stop();
+    }
   });
 
   /**
@@ -451,7 +609,10 @@ describe('认证管线接线（Step 0：会话中间件 + 顺序）', () => {
     expect(bad.headers['set-cookie']).toBeUndefined();
 
     const ok = await request(app.getHttpServer()).post('/auth/login').send(body);
-    expect(ok.status).toBe(201);
+    // **200 而不是 201**（修复轮 2）：登录没有创建可寻址资源，凭证在 Set-Cookie 里。
+    // 这条断言此前把 201 钉死了——那正是「用测试把缺陷固化下来」的形态。
+    // `register` 仍是 201（它确实新建了一个 User），见本文件第一条用例。
+    expect(ok.status).toBe(200);
     const me = await request(app.getHttpServer()).get('/auth/me').set('Cookie', ok.headers['set-cookie'] as unknown as string[]);
     expect(me.status).toBe(200);
     expect(me.body).toMatchObject({ email: 'login@example.com' });
@@ -579,9 +740,19 @@ describe('登录的计时侧信道（§4.2 / 威胁 #13）', () => {
     expect(verifyCalls[0]?.hash).toMatch(/^\$argon2id\$v=19\$m=19456,t=2,p=1\$/);
   });
 
-  it('「用户不存在」与「口令错误」两条路径耗时同阶（真实 HTTP，允许 ≥25ms 抖动）', async () => {
-    // 用真实的 60ms 固定开销把两条路径的**结构性**差异放大：若其中一条根本不走哈希，
-    // 差异就是 60ms 量级，远大于下面 25ms 的容差；反之两条都走哈希时差异≈0。
+  /**
+   * **两次采样 → 三条采样取中位数**（修复轮 2）。
+   *
+   * 上一版每条路径只测**一次**、容差 25ms。假绿方向守得住（真有一条路径不走哈希时，
+   * 差异是 60ms 量级），但**假红方向没有任何防护**：单次采样只要撞上一次 GC 停顿或
+   * 宿主机抢占，差就超过 25ms，套件在负载高的 CI 上会随机变红——而随机变红的测试
+   * 比没有测试更糟（它会训练人忽略红）。
+   *
+   * 现在每条路径采样 3 次取**中位数**：中位数对单次离群值免疫，而两条路径的结构性差异
+   * （60ms）远大于中位数抖动（个位数 ms）。容差同时放宽到 40ms——
+   * 仍然**低于**注入的 60ms 固定开销，因此「其中一条路径根本不走哈希」这种退化照旧会红。
+   */
+  it('「用户不存在」与「口令错误」两条路径耗时同阶（各 3 次取中位数，容差 40ms）', async () => {
     const password = 'a-strong-passphrase';
     const measure = async (email: string, pw: string): Promise<number> => {
       const t0 = performance.now();
@@ -590,27 +761,47 @@ describe('登录的计时侧信道（§4.2 / 威胁 #13）', () => {
       expect(res.status).toBe(401);
       return dt;
     };
+    const median = async (email: string, pw: string): Promise<number> => {
+      const samples: number[] = [];
+      for (let i = 0; i < 3; i += 1) samples.push(await measure(email, pw));
+      samples.sort((a, b) => a - b);
+      return samples[1] ?? 0;
+    };
 
-    const unknownUser = await measure('still-nobody@example.com', password);
-    const wrongPassword = await measure('timing@example.com', 'definitely-wrong-pw');
+    const unknownUser = await median('still-nobody@example.com', password);
+    const wrongPassword = await median('timing@example.com', 'definitely-wrong-pw');
 
-    expect(Math.abs(unknownUser - wrongPassword)).toBeLessThan(25);
+    // 容差 40ms < 注入的 60ms：任一条路径退化成「不跑哈希」，中位数差就是 60ms 量级 ⇒ 变红。
+    expect(Math.abs(unknownUser - wrongPassword)).toBeLessThan(40);
   });
 });
 
+/**
+ * 这两段**不**手工编译模块（修复轮 2）：引导序列（testcontainer + `overrideProvider`
+ * + `createNestApplication` + `cookieParser` + `app.init`）此前在本文件里抄了 4 份，
+ * 现在两份能走 helper 的都改用 `createTestApp()`（`tests/helpers/app.ts`）。
+ *
+ * 为什么另外两个 describe 仍各自持有自己的 testcontainer（据实记录，不是漏改）：
+ * 它们验的是**不同的接线形态**——「认证管线接线」注入 `WiringProbeModule` 并给守卫注册
+ * `alwaysAllow` 条件，「计时侧信道」在编译**之前** spy `PasswordService.prototype.verify`
+ * 并需要一个空的 `verifyCalls`。把它们合并成一个 describe 会共享：
+ * ① 一个应用与一份假 Prisma（其中有一条用例会**清空用户表**，
+ * 因此它被刻意放在该 describe 的**最后**）；② `AuthController` 的注册限流后续会按 IP 计数。
+ * 合并的收益远小于「一条用例污染其余用例」的风险——那正是最难查的测试缺陷。
+ * 而且 testcontainer 的启动成本大部分被 vitest 的并行文件执行吸收
+ * （实测新增一个容器对套件总时长的影响在秒级）。
+ */
 describe('GitHub OAuth 服务的接线（不做外部网络调用）', () => {
   it('AuthModule 用 ConfigService 的凭据构造 GithubOauthService（no speculative fallback）', async () => {
     const container = await new RedisContainer('redis:7-alpine').start();
     const redisClient = newTestRedis(container.getConnectionUrl());
     const fake = createFakePrisma();
-    const mod = await Test.createTestingModule({ imports: [AppModule] })
-      .overrideProvider(PrismaService)
-      .useValue(fake.prisma)
-      .overrideProvider(REDIS)
-      .useValue(redisClient)
-      .compile();
-    const app = mod.createNestApplication();
-    await app.init();
+    const app = await createTestApp({
+      overrides: [
+        (b) => b.overrideProvider(PrismaService).useValue(fake.prisma),
+        (b) => b.overrideProvider(REDIS).useValue(redisClient),
+      ],
+    });
     try {
       const svc = app.get(GithubOauthService);
       // 凭据来自 env 夹具（GITHUB_CLIENT_ID=test-client-id / GITHUB_CALLBACK_URL=…）
@@ -630,14 +821,12 @@ describe('AuditService（Ruling 1：本任务交付的最小实现）', () => {
     const fake = createFakePrisma();
     const container = await new RedisContainer('redis:7-alpine').start();
     const redisClient = newTestRedis(container.getConnectionUrl());
-    const mod = await Test.createTestingModule({ imports: [AppModule] })
-      .overrideProvider(PrismaService)
-      .useValue(fake.prisma)
-      .overrideProvider(REDIS)
-      .useValue(redisClient)
-      .compile();
-    const app = mod.createNestApplication();
-    await app.init();
+    const app = await createTestApp({
+      overrides: [
+        (b) => b.overrideProvider(PrismaService).useValue(fake.prisma),
+        (b) => b.overrideProvider(REDIS).useValue(redisClient),
+      ],
+    });
     try {
       const audit = app.get(AuditService);
       const { runInContext } = await import('@vca/api/common/context/request-context.js');
