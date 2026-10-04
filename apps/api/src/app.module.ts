@@ -1,5 +1,6 @@
 import { Module, type MiddlewareConsumer, type NestModule } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
+import { ThrottlerGuard } from '@nestjs/throttler';
 import { ConfigModule } from './config/config.module.js';
 import { DbModule } from './db/db.module.js';
 import { RedisModule } from './db/redis.module.js';
@@ -7,6 +8,9 @@ import { AppLoggerModule } from './common/logging/logger.module.js';
 import { TraceMiddleware } from './common/logging/trace.middleware.js';
 import { PolicyGuard } from './common/policy/policy.guard.js';
 import { PolicyModule } from './common/policy/policy.module.js';
+import { CsrfGuard } from './common/security/csrf.guard.js';
+import { CsrfMiddleware } from './common/security/csrf.middleware.js';
+import { SecurityModule } from './common/security/security.module.js';
 import { AuditModule } from './modules/audit/audit.module.js';
 import { AuthModule } from './modules/auth/auth.module.js';
 import { SessionMiddleware } from './modules/auth/session.middleware.js';
@@ -33,6 +37,14 @@ import { HealthModule } from './modules/health/health.module.js';
  * - 唯一不带的是 pino 中间件体内部那一类「入口行」，而当前配置**不产生**这种行
  *   （默认只有完成行）。
  *
+ * **Task 7 补记（Ruling 3）：这句话在 Task 7 之前是假的。** 全仓没有任何地方调用
+ * `app.useLogger`，因此 Nest 自己的 `ConsoleLogger` 直接写 stdout、**绕过 pino**：
+ * `PolicyGuard` 的默认拒绝告警就是「有输出、但没有结构化字段也没有 traceId」的行。
+ * 现在 `bootstrap.ts` 的 `configureApp` 里有一条 `app.useLogger(app.get(PinoLogger))`，
+ * 这句话才成立；守护它的用例是 `tests/unit/bootstrap.test.ts` 的第二条
+ * （跑真实引导，断言 Nest 的静态 logger 确实把消息交给了 nestjs-pino 的 `Logger`）。
+ * 删掉那一行会让该用例变红——不要把它当成「多余的一行」删掉。
+ *
  * 因此注册顺序在当下不是承重的；这里仍按「身份先于日志」的语义把它放在根模块。
  *
  * ## 顺序从 Task 6 起**是**承重的（对请求上下文而言）
@@ -52,20 +64,30 @@ import { HealthModule } from './modules/health/health.module.js';
  * 它是 `undefined`，用例立刻红。（对照上一节：pino 中间件那种「谁在外层」的问题
  * 当年只能靠临时探针取证，这里有一条常驻回归。）
  *
- * ## 全局守卫的顺序（Task 7 起承重，先记在这里）
+ * ## 全局守卫的顺序（Task 7 起承重，且顺序即语义）
  *
- * `APP_GUARD` 的**数组顺序**就是执行顺序，因此未来的 `CsrfGuard` 必须排在 `PolicyGuard`
- * **之前**（计划 Task 7 原文：`[{ provide: APP_GUARD, useClass: CsrfGuard },
- * { provide: APP_GUARD, useExisting: PolicyGuard }]`）：CSRF 是「请求是否可信」，
- * 授权是「这个身份能不能」，前者更便宜也更靠前，且不该让一次跨站请求走到条件判定里。
+ * `APP_GUARD` 的**数组顺序**就是执行顺序，现在的链条是：
  *
- * ## 为什么是 `useExisting` 而不是 `useClass`
+ * 1. **`ThrottlerGuard`（限流）** —— 最便宜，且不依赖身份与令牌。暴力破解（威胁 #13）
+ *    在这一步就被挡住，请求不会走到后面任何一层。若它排在 CSRF 之后，
+ *    攻击者可以用一堆「无令牌」请求把别人的登录额度刷满（每次都先过一遍 CSRF 比较）；
+ * 2. **`CsrfGuard`（请求是否可信）** —— 一次字符串比较，先于任何授权判定。
+ *    排在这里而不是最后，是为了**不让一次跨站请求走进资源级条件判定**：条件要查库
+ *    （「这是不是他的 Asset」），而入口处一个比较就能挡掉它；
+ * 3. **`PolicyGuard`（这个身份能不能）** —— 仍然放在最后，理由同 Task 5。
  *
- * `PolicyGuard` 由 `@Global()` 的 `PolicyModule` 提供并导出，本处只是**指向同一个实例**。
- * 若写成 `useClass`，Nest 会为 `APP_GUARD` 另造一个守卫实例，而各业务模块注入到的仍是
- * `PolicyModule` 那一个——它们 `registerCondition` 注册的条件就永远到不了真正拦截请求的守卫上，
- * 表现为「条件全部未注册 ⇒ 相关路由全部 403」。该不变量由
- * `tests/security/policy-default-deny.test.ts` 的「同一实例」用例钉住。
+ * ## 为什么 `CsrfGuard` 可以是 `useClass`，而 `PolicyGuard` 必须 `useExisting`
+ *
+ * `CsrfGuard` 是**无状态**的（没有任何可注册的配置），因此给 `APP_GUARD` 另造一个实例
+ * 与别处注入到的实例行为完全一致，`useClass` 没有代价。
+ *
+ * `PolicyGuard` **有状态**：条件用 `PolicyGuard.registerCondition` 注册在**实例**上
+ * （`private readonly conditions = new Map(...)`）。写成 `useClass` 时，Nest 会为
+ * `APP_GUARD` 另造一个实例，而各业务模块注入到的仍是 `PolicyModule` 导出的那一个——
+ * 它们注册的条件永远到不了真正拦截请求的守卫上，表现为「条件全部未注册 ⇒ 相关路由全部 403」。
+ * Task 5 已用「条件放行」用例实测过这一点（当时整条用例变红），
+ * 常驻回归在 `tests/security/policy-default-deny.test.ts` 的「同一实例」用例里。
+ * 这里只是**指向同一个实例**，因此用 `useExisting`。
  */
 @Module({
   imports: [
@@ -74,6 +96,7 @@ import { HealthModule } from './modules/health/health.module.js';
     DbModule,
     RedisModule,
     PolicyModule,
+    SecurityModule,
     AuditModule,
     AuthModule,
     HealthModule,
@@ -86,14 +109,18 @@ import { HealthModule } from './modules/health/health.module.js';
     // `Nest can't resolve dependencies of the SessionMiddleware`。
     // （`AuthModule` 已**不再**是 `@Global()`：实测移除后全绿，见 auth.module.ts。）
     SessionMiddleware,
+    // 顺序即语义（见类注释）：限流 → CSRF → 授权。
+    { provide: APP_GUARD, useClass: ThrottlerGuard },
+    { provide: APP_GUARD, useClass: CsrfGuard },
     { provide: APP_GUARD, useExisting: PolicyGuard },
   ],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer): void {
-    // 顺序即语义，且这里是**唯一**能看到两者相对顺序的地方：
+    // 顺序即语义，且这里是**唯一**能看到三者相对顺序的地方：
     // 1. `TraceMiddleware` 建立含 traceId 的 ALS 上下文；
-    // 2. `SessionMiddleware` 在该上下文里补 userId/sessionId（继承而非替换）。
+    // 2. `SessionMiddleware` 在该上下文里补 userId/sessionId（继承而非替换）；
+    // 3. `CsrfMiddleware` 在安全方法上下发双提交令牌（只读/写 cookie，不依赖 ALS）。
     //
     // 为什么 `SessionMiddleware` 不写在 `AuthModule.configure` 里（直觉写法）：
     // 中间件的执行顺序由 `MiddlewareModule` 按 `moduleRef.distance`（距根模块的图深度）
@@ -106,7 +133,13 @@ export class AppModule implements NestModule {
     // `run()` 自己的上下文，trace id 被整个丢掉（Task 4 验收 13.4 静默失效）。
     // 写在这里则没有这层条件依赖：根模块 `distance === 0` 排第一，两条中间件的相对顺序
     // 就是**书写顺序**，顺序语义也留在能看到全局顺序的同一个文件里。
+    //
+    // `CsrfMiddleware`（Task 7）同样写在这里，理由多一条：它属于 `@Global()` 的
+    // `SecurityModule`，若注册在那边就会因同一条 distance 规则**跳到最前**，
+    // 那时它读到的 `req.cookies` 还没被 cookie-parser 填充（那个在 express 层，不受影响）
+    // ——但顺序语义会散在两个文件里，这正是本文件要避免的。
     consumer.apply(TraceMiddleware).forRoutes('*');
     consumer.apply(SessionMiddleware).forRoutes('*');
+    consumer.apply(CsrfMiddleware).forRoutes('*');
   }
 }

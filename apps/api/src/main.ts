@@ -1,30 +1,26 @@
 import 'reflect-metadata';
-import cookieParser from 'cookie-parser';
-import { NestFactory } from '@nestjs/core';
-import { AppModule } from './app.module.js';
+import { runBootstrap } from './bootstrap.js';
 
-async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create(AppModule);
-
-  /**
-   * 必须在 Nest 的中间件链**之前**挂上（`app.use` 注册于 express 实例，
-   * 先于 `app.init()` 时注册的 Nest 中间件执行）。
-   *
-   * 为什么必需：`/auth/**` 的处理器与 `SessionMiddleware` 都读 `req.cookies`。
-   * 没有它时 `req.cookies` 恒为 `undefined` ⇒ 会话永远「不存在」⇒
-   * `/auth/me` 与 `/auth/logout` 对任何人都 403。这与 Task 6 的会话中间件
-   * 是**两件**缺一不可的事：cookieParser 把 cookie 变成可读数据，
-   * 会话中间件把数据变成身份。
-   *
-   * `cookieParser()` 不带 secret：**不以签名 cookie 作凭证**。
-   * 签名只防「客户端改 cookie」，而本方案的 cookie 里只有会话 id；
-   * 改一个 id 只会得到一个不存在的会话（服务端 `verify` 返回 null）。
-   * 引入 secret 反而会让人误以为「cookie 不可改」是安全边界，真正的边界是
-   * 「服务端没有这个 id 就不认」。
-   */
-  app.use(cookieParser());
-
-  app.enableShutdownHooks();
-  await app.listen(Number(process.env.PORT ?? 3000));
-}
-void bootstrap();
+/**
+ * 进程入口。
+ *
+ * ## 全部引导逻辑在 `bootstrap.ts`（Ruling 3）
+ *
+ * 本文件此前是 `void bootstrap();`——**没有 `.catch`**：配置校验失败、端口被占、
+ * 依赖连不上时，进程打印一条未经 pino 的未处理拒绝，而 `process.exitCode` 仍是 **0**，
+ * 容器编排与 CI 都会把它当成一次成功的启动。现在：
+ *
+ * - 失败经**应用 logger**（同一份 `buildLoggerOptions`）记录，且保留原始错误对象（含栈）；
+ * - 退出码由 `runBootstrap` 设成 **1**；
+ * - 中间件栈（每请求 CSP nonce + helmet + cookie-parser）与 `trust proxy = 1`
+ *   在 `configureApp` 里安装——那是与测试 `helpers/app.ts` **共用**的同一个函数，
+ *   两边的安装顺序不会漂移。
+ *
+ * ## 为什么这里仍然是 `void` 而不是 `.catch(...)`
+ *
+ * `runBootstrap` **内部**已经处理了全部失败（它不 rethrow，见其注释），
+ * 因此这里没有可 catch 的东西；`void` 只是表明「有意不 await 顶层 promise」。
+ * 写成 `void runBootstrap()` 与旧的 `void bootstrap()` 形状相同、含义完全不同：
+ * 区别在于被调用的那个函数有没有兜住自己的失败。
+ */
+void runBootstrap();

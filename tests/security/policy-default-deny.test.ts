@@ -16,7 +16,7 @@ import { APP_GUARD } from '@nestjs/core';
 import { PolicyGuard, type PolicyContext } from '@vca/api/common/policy/policy.guard.js';
 import { Policy, Public } from '@vca/api/common/policy/policy.decorator.js';
 import { runInContext, type RequestContext } from '@vca/api/common/context/request-context.js';
-import { AppModule } from '@vca/api';
+import { createTestApp } from '../helpers/app.js';
 
 /**
  * PolicyGuard 的默认拒绝矩阵（威胁 #1 / 设计 §9 / 验收 13.2）。
@@ -277,10 +277,15 @@ describe('PolicyGuard 默认拒绝（威胁 #1）', () => {
     // 在一个不含任何守卫的探针模块里声明条件，把条件注册到「从真实 AppModule 注入来的」实例上，
     // 再看真实 `APP_GUARD` 是否认这个条件。
     // 若 AppModule 写成 `useClass`，全局守卫是另一个实例 ⇒ 条件永远未注册 ⇒ 403 而不是 200。
-    const mod = await Test.createTestingModule({ imports: [AppModule, WiringProbeModule] }).compile();
-    const wiredApp = mod.createNestApplication();
-    wiredApp.get(PolicyGuard).registerCondition('alwaysAllow', () => true);
-    await wiredApp.init();
+    //
+    // Task 7：这条用例的引导改走**共用**的 `createTestApp()`（`extraModules` + `conditions`），
+    // 此前它自己抄了一份 `Test.createTestingModule({ imports: [AppModule, …] })`。
+    // 抄件的代价在 Task 7 现形：那份引导不会随生产接线演进（不装安全中间件栈、
+    // 不随全局守卫链变化），于是「生产接线是否正确」变成了「抄件是否正确」。
+    const wiredApp = await createTestApp({
+      extraModules: [WiringProbeModule],
+      conditions: [{ name: 'alwaysAllow', fn: () => true }],
+    });
     try {
       const res = await request(wiredApp.getHttpServer()).get('/wiring/conditional').set('x-test-user', 'user-1');
       expect(res.status).toBe(200);

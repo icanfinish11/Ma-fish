@@ -1,9 +1,10 @@
 import 'reflect-metadata';
 import cookieParser from 'cookie-parser';
 import { Test, type TestingModuleBuilder } from '@nestjs/testing';
-import type { INestApplication, NestMiddleware } from '@nestjs/common';
+import type { DynamicModule, INestApplication, NestMiddleware, Type } from '@nestjs/common';
 import { AppModule } from '@vca/api';
 import { PolicyGuard, type PolicyCondition } from '@vca/api/common/policy/policy.guard.js';
+import { applySecurityMiddleware } from '@vca/api/common/security/security-stack.js';
 
 /**
  * Express 的三个中间件参数（`req` / `res` / `next`）的**类型**，从 Nest 自己的签名里取。
@@ -48,6 +49,12 @@ export type ExpressNext = Parameters<NestMiddleware['use']>[2];
  * 测试与生产**只在两处**不同：测试不调 `listen()`，且不读 `.env`（由 `tests/helpers/env.ts`
  * 夹具提供）。`AppModule`、中间件接线与顺序、全局守卫全部共用同一个模块，
  * 因此这里刻意**不**复刻一份接线，免得「测试接线是否正确」变成「抄件是否正确」。
+ *
+ * Task 7 起这条约束也覆盖**安全中间件栈**：`withSecurity`（默认开）调的是生产那个
+ * `applySecurityMiddleware`（`apps/api/src/common/security/security-stack.ts`），
+ * 而不是在测试里重写一遍 `helmet + cookieParser` 的安装顺序。brief 里那个
+ * `createSecureTestApp()` 因此**没有**被加进来——那会是第二套引导。
+ * 需要探针路由时用 `extraModules`，不要另起一个 `Test.createTestingModule`。
  */
 export interface CreateTestAppOptions {
   /**
@@ -57,8 +64,28 @@ export interface CreateTestAppOptions {
    * `.useValue(v)` 才返回 builder），所以这里直接借用它的类型。
    */
   overrides?: readonly ((builder: TestingModuleBuilder) => TestingModuleBuilder)[];
-  /** 是否挂 `cookieParser()`（默认 `true`，与 `main.ts` 一致）。 */
+  /**
+   * 是否安装**生产同款**的浏览器安全中间件栈（每请求 nonce + helmet + cookie-parser）。
+   *
+   * 默认 `true`：`main.ts` 的引导路径装了它，测试就该跑同一个栈，否则
+   * 「安全断言全绿」只能证明「测试里那份抄件是绿的」。默认开启也让绝大多数测试
+   * 不必关心它——只有真的需要「没装」这一对照态时才传 `false`。
+   *
+   * 关掉时退回旧的 `withCookieParser` 语义（只装 cookie-parser），保留它是为了
+   * 不破坏 Task 6 已有的调用面：那时还没有安全头。
+   */
+  withSecurity?: boolean;
+  /** 是否挂 `cookieParser()`（默认 `true`，与 `main.ts` 一致）。`withSecurity` 为真时它由安全栈负责。 */
   withCookieParser?: boolean;
+  /**
+   * 额外的、**测试专用**的模块（探针控制器等）。
+   *
+   * 为什么放在这里而不是让各测试文件自己 `Test.createTestingModule({ imports: [AppModule, …] })`：
+   * 那样会造出**第二套引导**——它不会随生产接线一起演进（漏装中间件、漏挂全局守卫都能通过），
+   * 而评审已经在另一处测试文件里点名过这种重复。需要探针路由时用本选项，
+   * 引导路径仍然只有这一条。
+   */
+  extraModules?: readonly (Type<unknown> | DynamicModule)[];
   /**
    * `PolicyGuard` 的命名条件，在 `init()` 之前注册。
    *
@@ -70,12 +97,19 @@ export interface CreateTestAppOptions {
 }
 
 export async function createTestApp(options: CreateTestAppOptions = {}): Promise<INestApplication> {
-  let builder = Test.createTestingModule({ imports: [AppModule] });
+  let builder = Test.createTestingModule({
+    imports: [AppModule, ...(options.extraModules ?? [])],
+  });
   for (const apply of options.overrides ?? []) builder = apply(builder);
 
   const moduleRef = await builder.compile();
   const app = moduleRef.createNestApplication();
-  if (options.withCookieParser !== false) app.use(cookieParser());
+  if (options.withSecurity !== false) {
+    // 与 `main.ts` **同一个函数**：测试与生产的差别只有 `isProduction` 这一个入参。
+    applySecurityMiddleware(app, { isProduction: false });
+  } else if (options.withCookieParser !== false) {
+    app.use(cookieParser());
+  }
   for (const { name, fn } of options.conditions ?? []) {
     app.get(PolicyGuard).registerCondition(name, fn);
   }

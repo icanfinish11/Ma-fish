@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import type { Request, Response } from 'express';
 import { Public, Policy } from '../../common/policy/policy.decorator.js';
 import { SESSION_COOKIE, sessionCookieOptions } from '../../common/http/cookie.js';
+import { RateLimited } from '../../common/security/throttler.js';
 import type { Env } from '../../config/env.schema.js';
 import { AuthService } from './auth.service.js';
 import { loginSchema, parseOrBadRequest, registerSchema, type LoginDto, type RegisterDto } from './dto.js';
@@ -26,6 +27,17 @@ import { loginSchema, parseOrBadRequest, registerSchema, type LoginDto, type Reg
  * `NODE_ENV` 走 `ConfigService` 而不是 `process.env`（K6 的一致性要求）：
  * 同一个进程里「这份配置的值」只有一个来源，直读 `process.env` 会绕过
  * `ConfigModule` 的校验与缓存，在测试里还会读到被覆写后的值。
+ *
+ * ## 限流声明（Task 7 / 威胁 #13）
+ *
+ * `register` 与 `login` 是本模块里**唯一**两条按设计文档 §4.1 限流的路由
+ * （`RATE_LIMITS.register` 3 次/小时按 IP；`RATE_LIMITS.login` 5 次/15 分钟按 IP+账号）。
+ * `@RateLimited(...)` 同时写入「本路由属于哪一层」与那一层的数值覆盖；
+ * **漏写它 = 该路由不限流**（见 `throttler.ts` 里对 `skipIf` 的实测说明），
+ * 因此每条新加的写路由都该问一次「它属于哪一层」。
+ *
+ * 端到端判别性断言在 `tests/security/rate-limit.test.ts`：注册第 4 次必须 429，
+ * 登录第 6 次必须 429，而**换一个账号必须仍然放行**（证明分桶真的含账号）。
  */
 @Controller('auth')
 export class AuthController {
@@ -40,6 +52,7 @@ export class AuthController {
   }
 
   @Public()
+  @RateLimited('register')
   @Post('register')
   async register(
     @Body() body: RegisterDto,
@@ -56,6 +69,7 @@ export class AuthController {
   }
 
   @Public()
+  @RateLimited('login')
   // 与 `logout` 同一条理由（修复轮 2 补齐）：POST 的 Nest 默认状态码是 **201 Created**，
   // 而登录没有创建任何**可寻址的资源**——它换回的是一个会话，凭证在 `Set-Cookie` 里。
   // 201 会让「按状态码分支」的客户端与日志/监控把它当成一次资源创建。

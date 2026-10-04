@@ -1,15 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import request from 'supertest';
 import { Controller, Get, Module, type INestApplication } from '@nestjs/common';
-import { Test } from '@nestjs/testing';
 import { RedisContainer, type StartedRedisContainer } from '@testcontainers/redis';
 import { Redis } from 'ioredis';
-import { AppModule } from '@vca/api';
 import { PrismaService } from '@vca/api/db/prisma.service.js';
 import { REDIS, SessionService } from '@vca/api/modules/auth/session.service.js';
 import { PasswordService } from '@vca/api/modules/auth/password.service.js';
 import { currentContext } from '@vca/api/common/context/request-context.js';
-import { PolicyGuard } from '@vca/api/common/policy/policy.guard.js';
 import { Policy } from '@vca/api/common/policy/policy.decorator.js';
 import { SESSION_COOKIE } from '@vca/api/common/http/cookie.js';
 import { GithubOauthService } from '@vca/api/modules/auth/github-oauth.service.js';
@@ -17,6 +14,8 @@ import { AuditService } from '@vca/api/modules/audit/audit.service.js';
 import { Prisma } from '@vca/api/generated/prisma/client.js';
 import type { User } from '@vca/api/generated/prisma/client.js';
 import { createTestApp } from '../../helpers/app.js';
+import { csrfHeaders, fetchCsrfToken } from '../../helpers/csrf.js';
+import { disableRateLimit } from '../../helpers/rate-limit.js';
 
 /**
  * 认证管线的**端到端接线**验证（本任务 Step 0 的交付物，不在 brief 里）。
@@ -300,26 +299,38 @@ describe('认证管线接线（Step 0：会话中间件 + 顺序）', () => {
   let redisClient: Redis;
   let app: INestApplication;
   let fake: ReturnType<typeof createFakePrisma>;
+  /**
+   * 双提交令牌（Task 7 / C13）：全局 `CsrfGuard` 要求**所有**写操作都带它。
+   * 本文件里所有 `POST` 都通过 `csrfHeaders(csrf)` 带上「cookie + 请求头」这一对，
+   * 与真实前端做的事逐字一致——CSRF 校验本身**没有**被关掉（见 `helpers/csrf.ts`）。
+   */
+  let csrf: string;
 
   beforeAll(async () => {
     container = await new RedisContainer('redis:7-alpine').start();
     redisClient = newTestRedis(container.getConnectionUrl());
     fake = createFakePrisma();
 
-    const mod = await Test.createTestingModule({ imports: [AppModule, WiringProbeModule] })
-      .overrideProvider(PrismaService)
-      .useValue(fake.prisma)
-      .overrideProvider(REDIS)
-      .useValue(redisClient)
-      .compile();
-    app = mod.createNestApplication();
-    // 与 `main.ts` 逐字一致：`/auth/**` 的处理器读 `req.cookies`，没有这一步全会 401。
-    // （顺序不是承重点：`app.use` 注册在 Nest 中间件链**之前**，已由下一个用例断言
-    //   SessionMiddleware 确实读到了 cookie。）
-    const { default: cookieParser } = await import('cookie-parser');
-    app.use(cookieParser());
-    app.get(PolicyGuard).registerCondition('alwaysAllow', () => true);
-    await app.init();
+    // Task 7 起这条引导走**共用**的 helper（`tests/helpers/app.ts`）：
+    // 它跑真实 `AppModule` + 生产同款的安全中间件栈（每请求 nonce/helmet + cookie-parser）
+    // + 全局守卫链（限流 → CSRF → 授权）。此前这里是**手抄**的一份引导
+    // （`Test.createTestingModule` + 手工 `app.use(cookieParser())`），
+    // 那份抄件不会随生产接线演进——评审点名过这种重复。
+    //
+    // `disableRateLimit`：本文件在**同一个 IP** 上注册十几个真实用户，而注册层是
+    // 「3 次/小时，按 IP」——真实阈值下从第 4 次起会 429（限流按设计生效）。
+    // 关掉的只是**这一个套件**的计数；限流本身由 `tests/security/rate-limit.test.ts`
+    // 用真实存储断言（第 4 次注册必须 429）。理由与取舍见 `helpers/rate-limit.ts`。
+    app = await createTestApp({
+      extraModules: [WiringProbeModule],
+      overrides: [
+        disableRateLimit,
+        (b) => b.overrideProvider(PrismaService).useValue(fake.prisma),
+        (b) => b.overrideProvider(REDIS).useValue(redisClient),
+      ],
+      conditions: [{ name: 'alwaysAllow', fn: () => true }],
+    });
+    csrf = await fetchCsrfToken(app);
   }, 180_000);
 
   afterAll(async () => {
@@ -330,6 +341,7 @@ describe('认证管线接线（Step 0：会话中间件 + 顺序）', () => {
     // 注册一个真实用户：走真实 Argon2id 哈希 + 真实 SessionService + 真 Redis
     const reg = await request(app.getHttpServer())
       .post('/auth/register')
+      .set(csrfHeaders(csrf))
       .send({ email: 'me-200@example.com', password: 'a-strong-passphrase' });
     expect(reg.status).toBe(201);
 
@@ -361,6 +373,7 @@ describe('认证管线接线（Step 0：会话中间件 + 顺序）', () => {
   it('会话中间件把 userId/sessionId 写进上下文，且 traceId 存活（中间件顺序）', async () => {
     const reg = await request(app.getHttpServer())
       .post('/auth/register')
+      .set(csrfHeaders(csrf))
       .send({ email: 'probe@example.com', password: 'a-strong-passphrase' });
     const cookies = reg.headers['set-cookie'] as unknown as string[];
     const sid = cookieValue(reg, SESSION_COOKIE);
@@ -405,6 +418,7 @@ describe('认证管线接线（Step 0：会话中间件 + 顺序）', () => {
   it('会话 cookie：HttpOnly + SameSite=Lax + Path=/ + 7 天 Max-Age（C13）', async () => {
     const reg = await request(app.getHttpServer())
       .post('/auth/register')
+      .set(csrfHeaders(csrf))
       .send({ email: 'cookie-flags@example.com', password: 'a-strong-passphrase' });
     const flags = readSetCookie(reg, SESSION_COOKIE);
 
@@ -426,6 +440,7 @@ describe('认证管线接线（Step 0：会话中间件 + 顺序）', () => {
   it('登出后会话在服务端被销毁，同一 cookie 不再可用', async () => {
     const reg = await request(app.getHttpServer())
       .post('/auth/register')
+      .set(csrfHeaders(csrf))
       .send({ email: 'logout@example.com', password: 'a-strong-passphrase' });
     const cookies = reg.headers['set-cookie'] as unknown as string[];
     const sid = cookieValue(reg, SESSION_COOKIE);
@@ -433,7 +448,7 @@ describe('认证管线接线（Step 0：会话中间件 + 顺序）', () => {
 
     await expect(SERVICE.verify(sid)).resolves.not.toBeNull();
 
-    const out = await request(app.getHttpServer()).post('/auth/logout').set('Cookie', cookies);
+    const out = await request(app.getHttpServer()).post('/auth/logout').set(csrfHeaders(csrf, cookies));
     expect(out.status).toBe(200);
     expect(out.body).toEqual({ ok: true });
     // 服务端记录已删（不是「只清了客户端 cookie」）
@@ -457,10 +472,10 @@ describe('认证管线接线（Step 0：会话中间件 + 顺序）', () => {
 
   it('重复邮箱注册返回 409，且不创建第二个用户', async () => {
     const body = { email: 'dup@example.com', password: 'a-strong-passphrase' };
-    const first = await request(app.getHttpServer()).post('/auth/register').send(body);
+    const first = await request(app.getHttpServer()).post('/auth/register').set(csrfHeaders(csrf)).send(body);
     expect(first.status).toBe(201);
     const usersAfterFirst = fake.users.length;
-    const second = await request(app.getHttpServer()).post('/auth/register').send(body);
+    const second = await request(app.getHttpServer()).post('/auth/register').set(csrfHeaders(csrf)).send(body);
     expect(second.status).toBe(409);
     expect(fake.users.length).toBe(usersAfterFirst);
   });
@@ -546,7 +561,9 @@ describe('认证管线接线（Step 0：会话中间件 + 顺序）', () => {
     });
 
     try {
-      const res = await request(raceApp.getHttpServer()).post('/auth/register').send(body);
+      // 每个应用实例的令牌是独立的：raceApp 是另一个应用，必须重新取一次。
+      const raceCsrf = await fetchCsrfToken(raceApp);
+      const res = await request(raceApp.getHttpServer()).post('/auth/register').set(csrfHeaders(raceCsrf)).send(body);
 
       // 前置条件（防止这条用例静默地测了别的东西）：
       expect(preCheckMissed).toBe(true);
@@ -578,6 +595,7 @@ describe('认证管线接线（Step 0：会话中间件 + 顺序）', () => {
   it('非法入参返回 400 并指出出错字段，而不是 500', async () => {
     const weak = await request(app.getHttpServer())
       .post('/auth/register')
+      .set(csrfHeaders(csrf))
       .send({ email: 'weak@example.com', password: 'short' });
     expect(weak.status).toBe(400);
     expect(weak.body.message).toBe('请求参数校验失败');
@@ -589,26 +607,28 @@ describe('认证管线接线（Step 0：会话中间件 + 顺序）', () => {
 
     const badEmail = await request(app.getHttpServer())
       .post('/auth/register')
+      .set(csrfHeaders(csrf))
       .send({ email: 'not-an-email', password: 'a-strong-passphrase' });
     expect(badEmail.status).toBe(400);
 
     // 空请求体同样不能变成 500，且要一次列全所有问题字段（运维不必「修一个报一个」）
-    const empty = await request(app.getHttpServer()).post('/auth/login').send({});
+    const empty = await request(app.getHttpServer()).post('/auth/login').set(csrfHeaders(csrf)).send({});
     expect(empty.status).toBe(400);
     expect(empty.body.errors.map((e: { path: string }) => e.path).sort()).toEqual(['email', 'password']);
   });
 
   it('登录：正确口令 200 并下发新会话；错误口令 401 且不下发 cookie', async () => {
     const body = { email: 'login@example.com', password: 'a-strong-passphrase' };
-    await request(app.getHttpServer()).post('/auth/register').send(body);
+    await request(app.getHttpServer()).post('/auth/register').set(csrfHeaders(csrf)).send(body);
 
     const bad = await request(app.getHttpServer())
       .post('/auth/login')
+      .set(csrfHeaders(csrf))
       .send({ ...body, password: 'wrong-passphrase-here' });
     expect(bad.status).toBe(401);
     expect(bad.headers['set-cookie']).toBeUndefined();
 
-    const ok = await request(app.getHttpServer()).post('/auth/login').send(body);
+    const ok = await request(app.getHttpServer()).post('/auth/login').set(csrfHeaders(csrf)).send(body);
     // **200 而不是 201**（修复轮 2）：登录没有创建可寻址资源，凭证在 Set-Cookie 里。
     // 这条断言此前把 201 钉死了——那正是「用测试把缺陷固化下来」的形态。
     // `register` 仍是 201（它确实新建了一个 User），见本文件第一条用例。
@@ -621,12 +641,13 @@ describe('认证管线接线（Step 0：会话中间件 + 顺序）', () => {
   it('审计：登录成功/失败都留痕，且 traceId 取自请求上下文（Task 8 之前唯一的落库审计）', async () => {
     fake.audits.length = 0;
     const body = { email: 'audit@example.com', password: 'a-strong-passphrase' };
-    await request(app.getHttpServer()).post('/auth/register').send(body);
+    await request(app.getHttpServer()).post('/auth/register').set(csrfHeaders(csrf)).send(body);
     await request(app.getHttpServer())
       .post('/auth/login')
+      .set(csrfHeaders(csrf))
       .set('x-trace-id', 'trace-audit-login')
       .send(body);
-    await request(app.getHttpServer()).post('/auth/login').send({ ...body, password: 'nope-nope-nope' });
+    await request(app.getHttpServer()).post('/auth/login').set(csrfHeaders(csrf)).send({ ...body, password: 'nope-nope-nope' });
 
     const actions = fake.audits.map((a) => a.action);
     expect(actions).toContain('auth.register');
@@ -662,6 +683,7 @@ describe('认证管线接线（Step 0：会话中间件 + 顺序）', () => {
   it('会话有效但用户已不存在：401（而非 200 空响应体）', async () => {
     const reg = await request(app.getHttpServer())
       .post('/auth/register')
+      .set(csrfHeaders(csrf))
       .send({ email: 'ghost@example.com', password: 'a-strong-passphrase' });
     const cookies = reg.headers['set-cookie'] as unknown as string[];
     // 会话仍然有效（Redis 里还在）
@@ -686,6 +708,8 @@ describe('登录的计时侧信道（§4.2 / 威胁 #13）', () => {
   let app: INestApplication;
   let fake: ReturnType<typeof createFakePrisma>;
   const verifyCalls: { hash: string; plain: string }[] = [];
+  /** 本 describe 自己那个应用的双提交令牌（每个应用实例的令牌是独立的）。 */
+  let csrf: string;
 
   beforeAll(async () => {
     container = await new RedisContainer('redis:7-alpine').start();
@@ -700,20 +724,19 @@ describe('登录的计时侧信道（§4.2 / 威胁 #13）', () => {
       return hash.startsWith('$argon2id$v=19$m=19456,t=2,p=1$') && plain === 'a-strong-passphrase';
     });
 
-    const mod = await Test.createTestingModule({ imports: [AppModule] })
-      .overrideProvider(PrismaService)
-      .useValue(fake.prisma)
-      .overrideProvider(REDIS)
-      .useValue(redisClient)
-      .compile();
-    app = mod.createNestApplication();
-    const { default: cookieParser } = await import('cookie-parser');
-    app.use(cookieParser());
-    await app.init();
+    const mod = await createTestApp({
+      overrides: [
+        (b) => b.overrideProvider(PrismaService).useValue(fake.prisma),
+        (b) => b.overrideProvider(REDIS).useValue(redisClient),
+      ],
+    });
+    app = mod;
+    csrf = await fetchCsrfToken(app);
 
     // 建一个真实存在的用户（其口令哈希来自真实 Argon2id）
     const reg = await request(app.getHttpServer())
       .post('/auth/register')
+      .set(csrfHeaders(csrf))
       .send({ email: 'timing@example.com', password: 'a-strong-passphrase' });
     expect(reg.status).toBe(201);
     verifyCalls.length = 0;
@@ -729,6 +752,7 @@ describe('登录的计时侧信道（§4.2 / 威胁 #13）', () => {
     verifyCalls.length = 0;
     const res = await request(app.getHttpServer())
       .post('/auth/login')
+      .set(csrfHeaders(csrf))
       .send({ email: 'nobody-here@example.com', password: 'a-strong-passphrase' });
 
     expect(res.status).toBe(401);
@@ -756,7 +780,7 @@ describe('登录的计时侧信道（§4.2 / 威胁 #13）', () => {
     const password = 'a-strong-passphrase';
     const measure = async (email: string, pw: string): Promise<number> => {
       const t0 = performance.now();
-      const res = await request(app.getHttpServer()).post('/auth/login').send({ email, password: pw });
+      const res = await request(app.getHttpServer()).post('/auth/login').set(csrfHeaders(csrf)).send({ email, password: pw });
       const dt = performance.now() - t0;
       expect(res.status).toBe(401);
       return dt;
@@ -777,19 +801,28 @@ describe('登录的计时侧信道（§4.2 / 威胁 #13）', () => {
 });
 
 /**
- * 这两段**不**手工编译模块（修复轮 2）：引导序列（testcontainer + `overrideProvider`
- * + `createNestApplication` + `cookieParser` + `app.init`）此前在本文件里抄了 4 份，
- * 现在两份能走 helper 的都改用 `createTestApp()`（`tests/helpers/app.ts`）。
+ * 这几段**不**手工编译模块：引导序列（testcontainer + `overrideProvider`
+ * + `createNestApplication` + `cookieParser` + `app.init`）此前在本文件里抄了 4 份。
+ *
+ * **Task 7 补记**：任务开始时这里是「两份走 helper、两份仍手抄」。现在四份**全部**
+ * 走 `createTestApp()`（`tests/helpers/app.ts`）——那正是评审点名过的重复引导。
+ * 手工引导的另一半代价在这一轮暴露得很清楚：它不会随生产接线演进，
+ * 于是 Task 7 装上全局 `CsrfGuard` 之后，手抄引导的那两段里的写请求**照样**按旧形态发，
+ * 表现为一堆 403——故障定位的成本全落在「测试与生产不是同一个栈」这件事上。
  *
  * 为什么另外两个 describe 仍各自持有自己的 testcontainer（据实记录，不是漏改）：
  * 它们验的是**不同的接线形态**——「认证管线接线」注入 `WiringProbeModule` 并给守卫注册
  * `alwaysAllow` 条件，「计时侧信道」在编译**之前** spy `PasswordService.prototype.verify`
  * 并需要一个空的 `verifyCalls`。把它们合并成一个 describe 会共享：
  * ① 一个应用与一份假 Prisma（其中有一条用例会**清空用户表**，
- * 因此它被刻意放在该 describe 的**最后**）；② `AuthController` 的注册限流后续会按 IP 计数。
+ * 因此它被刻意放在该 describe 的**最后**）；② `AuthController` 的注册限流会按 IP 计数。
  * 合并的收益远小于「一条用例污染其余用例」的风险——那正是最难查的测试缺陷。
  * 而且 testcontainer 的启动成本大部分被 vitest 的并行文件执行吸收
  * （实测新增一个容器对套件总时长的影响在秒级）。
+ *
+ * ② 那一项在 Task 7 已不再是隐患：主 describe 用 `disableRateLimit` 关掉了计数
+ * （它注册十几个用户，而注册层是 3 次/小时按 IP），见 `helpers/rate-limit.ts`。
+ * 「计时侧信道」describe 的注册/登录次数都在阈值以内，因此照旧带**真实**限流跑。
  */
 describe('GitHub OAuth 服务的接线（不做外部网络调用）', () => {
   it('AuthModule 用 ConfigService 的凭据构造 GithubOauthService（no speculative fallback）', async () => {
