@@ -7,7 +7,7 @@
     "node": ">=22.19.0"
   },
   "scripts": {
-    "typecheck": "pnpm -r typecheck",
+    "typecheck": "pnpm -r typecheck && tsc -p tsconfig.node.json",
     "lint": "eslint .",
     "test": "vitest run",
     "test:unit": "vitest run --project unit",
@@ -20,7 +20,9 @@
     "db:down": "docker compose -f infra/docker-compose.yml down -v"
   },
   "devDependencies": {
+    "@types/node": "22.20.5",
     "eslint": "10.12.0",
+    "typescript": "6.0.3",
     "typescript-eslint": "8.71.0",
     "vitest": "5.0.3"
   }

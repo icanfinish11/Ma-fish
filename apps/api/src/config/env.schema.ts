@@ -1,15 +1,25 @@
 import { z } from 'zod';
 
 /**
- * 一律拒绝的占位值（威胁 #15）。两层判定，缺一不可：
+ * 一律拒绝的占位值（威胁 #15）。两层判定：
  *
- * 1. `PLACEHOLDERS` —— 逐字相等。**注意它单独存在时是死代码**：这些词都短于下游长度门
- *    （SESSION_SECRET ≥ 32、主密钥 64 位 hex），长度门会先拒绝，占位规则永远轮不到执行；
- *    保留它只为不改变既有语义（并覆盖 `GITHUB_CLIENT_SECRET` 这种无长度门的下游）。
+ * 1. `PLACEHOLDERS` —— 逐字相等。
  * 2. `PLACEHOLDER_SUBSTRINGS` —— 子串包含。真实占位值几乎总带后缀或前缀
  *    （`CHANGE_ME_AT_LEAST_32_CHARS_LONG`、`please-changeme`），逐字相等匹配不到，
  *    而它们**又长于**长度门，所以能一路通过生产校验。下面这份清单专门堵这个缺口，
  *    只收「一旦出现就绝无可能属于真实密钥」的占位家族词。
+ *
+ * **两层的分工（判据是「结果」而非「先后」）**：`nonPlaceholder` 是 `.pipe` 的**左侧**，
+ * 因此它先执行，一旦命中就短路掉下游，报错文案也由它给出。但对 `SESSION_SECRET`
+ * （下游 ≥ 32）与 `MASTER_ENCRYPTION_KEY`（下游 64 位 hex）而言，逐字相等层命中的每个词
+ * 都**同时**被下游拒绝，所以第 1 层**不改变接受/拒绝的结果，只改变报错文案**。
+ * 第 1 层真正承担结果的是 `GITHUB_CLIENT_SECRET`（下游只有 `min(1)`）：`test`、`secret`、
+ * `password`、`xxx` 这类词**只**被逐字相等层拦住。
+ *
+ * **第 1 层不覆盖 `.env.example` 的 `GITHUB_CLIENT_SECRET=CHANGE_ME`。** `CHANGE_ME`
+ * 归一化后是 `change_me`——它在 `PLACEHOLDER_SUBSTRINGS` 里，却**不在** `PLACEHOLDERS` 里
+ * （那里只有 `changeme` 与 `change-me`）。拦住模板自身这个值的是**子串层**：
+ * 删掉子串层就会重新放行它，切勿因为「有逐字相等层」而删。
  *
  * 刻意**不**把 `secret` / `password` / `test` 这类通用标识词放进 PLACEHOLDER_SUBSTRINGS：
  * 它们会命中 `GITHUB_CLIENT_SECRET`、`X_TEST_TOKEN` 等合法密钥，造成误拒。

@@ -1,0 +1,16 @@
+{
+  // 根配置文件的类型检查入口。`pnpm -r typecheck` 只覆盖三个 workspace 包，
+  // 根目录不是包，所以 `vitest.config.ts` 此前**不被任何 tsconfig 覆盖**——
+  // 它现在 import 了 `tests/helpers/env.ts`，一个拼写错误就会让**所有**测试项目起不来，
+  // 却只会在运行期暴露。本文件把这个缺口关上。
+  //
+  // 范围刻意保持最小：只含根配置。`vitest.config.ts` import 的 `tests/helpers/env.ts`
+  // 会被 TypeScript 顺带纳入（它本来就是配置的一部分）；app / tests 源码仍由各包
+  // 自己的 tsconfig 负责，不在此重复检查。
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "noEmit": true
+  },
+  "include": ["vitest.config.ts"]
+}

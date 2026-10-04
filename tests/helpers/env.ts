@@ -11,11 +11,19 @@
  * `vitest.config.ts` 从这里 import 同一份值，供全部 project 使用；
  * 它位于仓库根部、在 Vitest 读取配置时求值，正好早于模块图加载。
  *
- * ## 唯一的登记处（single source of truth）
+ * ## 唯一的登记处（但并非唯一一处副本）
  *
- * Task 3–9 每加一个**必填**环境变量，都只在本文件加一处。不要再往
- * `vitest.config.ts` 内联字面量、也不要各测试文件自行 set：那样会散成多份
- * 互相看不出关系的副本，遗漏时排查成本极高。
+ * **应用侧只有这一处**：不要再往 `vitest.config.ts` 内联字面量、也不要各测试文件自行 set：
+ * 那样会散成多份互相看不出关系的副本，遗漏时排查成本极高。
+ *
+ * **但「Task 3–9 新增必填变量只改这一处」是不准确的**，据实记载：另有两处**手写的完整
+ * 合法环境**，它们刻意不 import 本文件（一处要构造非法变体、一处要显式覆写 `NODE_ENV`）：
+ *
+ * - `tests/unit/config/env.schema.test.ts` 的 `VALID`
+ * - `tests/unit/config/placeholder-boundary.test.ts` 的 `VALID`
+ *
+ * 新增必填变量时**这三处都要改**；漏改的表现是那两个文件里的断言变红（快速失败，
+ * 不会静默放行）。
  *
  * ## 为什么这不削弱 fail-fast（C10）
  *
@@ -37,10 +45,15 @@
  *
  * - **不要在 shell 里设这些变量来「验证拒绝行为」**：夹具会把它们覆盖掉，测试照旧全绿。
  *   要断言拒绝，必须在测试体内显式覆写（如 `parseEnv({ ... })` 或 `process.env.X = 'bad'`）。
- * - 测试因而不受开发者本机环境变量影响（自足/hermetic），这是刻意的。
- * - 另见 `config.module.ts` 的 `ignoreEnvFile`：非开发环境连 `.env` 文件都不读。
+ * - 测试因而不受开发者本机环境变量影响（自足/hermetic）——**但仅限本文件登记过的键**
+ *   （已实测）。`test.env` 只是**叠加**，未登记的变量会从 shell 原样透传：将来在 schema 里
+ *   新增必填变量却忘了登记到本文件时，开发机 shell 里的同名变量会悄悄把它填上，
+ *   于是「本机能过、CI 挂掉」。这就是上一节要求「三处同步改」的原因。
+ * - 另见 `config.module.ts` 的 `ignoreEnvFile`：非开发环境连 `.env` 文件都不读（已实测）。
  */
-export const testEnv = {
+// `as const` 只给**编译期**只读类型，运行期照样可写；`Object.freeze` 才把它真正钉死，
+// 免得某个测试顺手改写这份「唯一登记处」而污染同进程的其他用例（vitest 的 `env` 是共享的）。
+export const testEnv = Object.freeze({
   NODE_ENV: 'test',
   DATABASE_URL: 'postgresql://app_user:test_pw@127.0.0.1:5432/vca_test',
   REDIS_URL: 'redis://127.0.0.1:6379',
@@ -51,4 +64,4 @@ export const testEnv = {
   GITHUB_CALLBACK_URL: 'http://localhost:3000/auth/github/callback',
   MAIL_FROM: 'no-reply@example.com',
   SMTP_URL: 'smtp://127.0.0.1:1025',
-} as const satisfies Partial<NodeJS.ProcessEnv>;
+} as const satisfies Partial<NodeJS.ProcessEnv>);
