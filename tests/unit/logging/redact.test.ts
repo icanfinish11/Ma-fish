@@ -66,4 +66,75 @@ describe('日志脱敏（C11 / 威胁 #15）', () => {
   it('无敏感键时原样返回（不因脱敏改变普通值的形状）', () => {
     expect(redact({ id: 'x', n: 1, ok: true, nil: null })).toEqual({ id: 'x', n: 1, ok: true, nil: null });
   });
+
+  /**
+   * 下面五条是修复轮 1 补的。理由：上面那条「形状不变」只用了原始值（字符串/数字/布尔/null），
+   * 因此它证明不了它声称的东西——旧实现把所有 `typeof === 'object'` 的值都重建一遍，
+   * 这条断言照样全绿，而 `Date` 会变成 `{}`、`Error` 会丢掉 message、环引用会抛 `RangeError`。
+   * 断言形状保持**必须拿非纯对象来断**。
+   */
+  it('Date 原样保留：Prisma 的 createdAt/updatedAt 不会被吃成 {}', () => {
+    const createdAt = new Date('2026-10-04T00:00:00.000Z');
+
+    const out = redact({ id: 'x', createdAt, nested: { updatedAt: createdAt } });
+
+    expect(out.createdAt).toBeInstanceOf(Date);
+    expect(out.createdAt).toBe(createdAt); // 连引用都不变，更别说值
+    expect(out.createdAt.toISOString()).toBe('2026-10-04T00:00:00.000Z');
+    expect(out.nested.updatedAt).toBe(createdAt);
+  });
+
+  it('Error 原样保留：message 与 stack 不丢', () => {
+    const err = new Error('boom');
+
+    const out = redact({ err });
+
+    expect(out.err).toBe(err);
+    expect(out.err.message).toBe('boom');
+    expect(out.err.stack).toBeTruthy();
+  });
+
+  it('Buffer / Map / Set 等非纯对象原样返回（不重建、不掏空）', () => {
+    const buf = Buffer.from('abc');
+    const map = new Map([['k', 'v']]);
+    const set = new Set([1]);
+
+    const out = redact({ buf, map, set });
+
+    expect(out.buf).toBe(buf);
+    expect(out.buf.toString()).toBe('abc');
+    expect(out.map).toBe(map);
+    expect(out.map.get('k')).toBe('v');
+    expect(out.set).toBe(set);
+  });
+
+  it('环引用不抛 RangeError，命中处替成 [Circular]（脱敏自己不能把日志变成 500）', () => {
+    const node: Record<string, unknown> = { id: 'n1', password: 'x' };
+    node.self = node;
+
+    const out = redact(node) as Record<string, unknown>;
+
+    expect(out.id).toBe('n1');
+    expect(out.password).toBe('[REDACTED]'); // 有环也照常脱敏
+    expect(out.self).toBe('[Circular]');
+  });
+
+  it('同一对象出现在兄弟分支（DAG）不算环，两处都被完整脱敏', () => {
+    const shared = { token: 't', email: 'alice@example.com' };
+
+    const out = redact({ a: shared, b: shared });
+
+    expect(out.a).toEqual({ token: '[REDACTED]', email: 'a***@example.com' });
+    expect(out.b).toEqual({ token: '[REDACTED]', email: 'a***@example.com' });
+  });
+
+  it('数组自身的环同样降级为 [Circular]', () => {
+    const arr: unknown[] = [1];
+    arr.push(arr);
+
+    const out = redact({ arr });
+
+    expect(out.arr[0]).toBe(1);
+    expect(out.arr[1]).toBe('[Circular]');
+  });
 });
