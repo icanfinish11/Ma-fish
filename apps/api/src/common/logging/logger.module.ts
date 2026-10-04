@@ -118,8 +118,12 @@ export function buildLoggerOptions(env: LoggerEnv): LoggerOptions {
       res: (r: { statusCode: number }) => ({ statusCode: r.statusCode }),
     },
     /**
-     * **第一层防线**（C11）：每条记录在交给 serializers 与 JSON 序列化**之前**先过一遍
+     * **记录级脱敏**（C11）：每条记录在交给 serializers 与 JSON 序列化**之前**先过一遍
      * `redact`（Task 8 接线；Task 4 的复审把这一步转派给本任务，并写明顺序依赖）。
+     *
+     * 它与上面两层的关系：`serializers` 管「请求/响应对象怎么压缩」、`redact.paths`
+     * 管「几个已知路径不落盘」，而这一层管**任意业务负载**（键名黑名单、邮箱掩码、
+     * 环与深度的降级）——三者是互补的，不是同一件事的三份。
      *
      * ## 为什么必须排在 serializers 之前、为什么这不成问题
      *
