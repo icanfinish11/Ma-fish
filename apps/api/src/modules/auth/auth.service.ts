@@ -128,6 +128,13 @@ export class AuthService {
       where: { id: s.userId },
       select: { id: true, email: true, role: true, creditScore: true },
     });
+    // 会话有效但用户已不存在（账号被删、或数据被清理）。**必须抛 401，不能返回 undefined**：
+    // Nest 在处理器返回 `undefined` 时会回 `200` + **空响应体**——调用方拿到的是
+    // 「成功但没有内容」，而不是「你的会话已失效」。两者的客户端行为完全不同
+    // （前者会渲染一个空白页面并继续认为自己已登录），而这里正是唯一能区分的地方。
+    // 它同时是「会话是指向用户的引用，不是用户本身」这条事实的落点：
+    // 服务端会话能被即时撤销（删 Redis 键），但用户记录也可能先于会话消失。
+    if (!user) throw new UnauthorizedException('未登录');
     return user;
   }
 }

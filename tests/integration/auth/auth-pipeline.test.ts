@@ -487,6 +487,31 @@ describe('认证管线接线（Step 0：会话中间件 + 顺序）', () => {
     expect(JSON.stringify(fake.audits)).not.toContain('argon2');
   });
 
+  /**
+   * **本 describe 的最后一条**：它会把假的用户表清空（模拟「账号被删」）。
+   * 放在这里而不是中间，是因为 `fake` 在整个 describe 内共享——
+   * 清空用户表会让后面所有依赖已注册用户的用例一起变红，而那种红是指向测试自身的，
+   * 不是产品缺陷。
+   *
+   * 语义：会话有效但**用户已不存在**时必须 401，而不是 200 空响应体。
+   * `AuthService.me` 里 `findUnique` 可能返回 `null`，而 Nest 在处理器返回 `undefined` 时
+   * 回的是 **200 + 空 body**——调用方拿到「成功但没有内容」，会继续认为自己已登录
+   * 并渲染一张空白页。这条用例把那个分支钉住。
+   */
+  it('会话有效但用户已不存在：401（而非 200 空响应体）', async () => {
+    const reg = await request(app.getHttpServer())
+      .post('/auth/register')
+      .send({ email: 'ghost@example.com', password: 'a-strong-passphrase' });
+    const cookies = reg.headers['set-cookie'] as unknown as string[];
+    // 会话仍然有效（Redis 里还在）
+    expect(await app.get(SessionService).verify(cookieValue(reg, SESSION_COOKIE))).not.toBeNull();
+    // 但用户记录消失了（只在用户表里删，不清会话——这正是本用例要区分的状态）
+    fake.users.length = 0;
+
+    const res = await request(app.getHttpServer()).get('/auth/me').set('Cookie', cookies);
+    expect(res.status).toBe(401);
+  });
+
   it('断言真的落在可注入的 PrismaService 上（override 生效，而不是连了库）', async () => {
     // 没有这条，上面所有 `fake.users` 断言都可能是在断言一个**没人用过**的数组。
     expect(app.get(PrismaService)).toBe(fake.prisma);
