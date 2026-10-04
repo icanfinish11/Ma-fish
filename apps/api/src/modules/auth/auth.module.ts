@@ -1,4 +1,4 @@
-import { Global, Module } from '@nestjs/common';
+import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { Env } from '../../config/env.schema.js';
 import { AuditModule } from '../audit/audit.module.js';
@@ -12,41 +12,62 @@ import { SessionService } from './session.service.js';
 /**
  * 认证模块（Ruling 2：brief 的 Files 列表漏了本文件，其代码块又要求它存在）。
  *
- * ## 为什么 `@Global()`，以及它是**被实测逼出来的**而不是顺手加的
+ * ## 为什么**不再**是 `@Global()`（Fix 2：移除后实测，结论是「不承重」）
  *
- * `SessionMiddleware` 由 `AppModule.configure` 注册（见下「顺序」一节），而
- * `forRoutes('*')` 会让 Nest 把它当作**根模块**的中间件提供者去**静态**解析依赖
- * （`MiddlewareContainer` → `Injector.lookupComponentInParentModules`，从根模块向上找）。
- * 根模块的注入器**看不见子模块的 providers**——即使 `AuthModule` 把 `SessionService`
- * 导出也看不见（导出只影响「谁可以 import 我」的解析，不影响这条向上查找的路径）。
+ * 本模块曾标 `@Global()`，理由是「中间件的依赖解析看不见子模块的 providers」。
+ * 该理由经**受控实验**检验后不成立，标注已移除（C16：全局 provider 命名空间是真实成本，
+ * 不承重就不该有）。实测证据：
  *
- * 实测症状（**不是**猜测）：应用**根本起不来**，`Test.createTestingModule` 抛
- * `Nest can't resolve dependencies of the SessionMiddleware (?)`。
- * 把 `AuthModule` 标 `@Global()` 后，`SessionService` 进入「全局可见」集合，
- * 这条向上查找才命中它。这与 `DbModule`/`RedisModule` 用 `@Global()` 是**同一个理由**
- * （横切依赖不该逼每个使用方都 import 一次），只是这里的驱动力来自中间件的解析路径。
+ * - 移除 `@Global()` 后 `pnpm vitest run` 全绿（18 文件 / 104 用例，含用真实 Redis
+ *   启动应用并走完登录→`/auth/me` 200 的集成用例）；
+ * - 用**生产引导路径**（`NestFactory.create(AppModule)` + 真实 HTTP + 真实 Redis）启动：
+ *   `/health` 200、`/auth/me` 无 cookie 403、`/auth/me` 带伪造 cookie 403（而不是 500）
+ *   ——后者说明 `SessionMiddleware` 确实解析到了 `SessionService` 并查了 Redis。
+ *
+ * ## 中间件的依赖到底从哪来（读 Nest 12.1.2 源码 + 三组受控变体实测）
+ *
+ * `Injector.loadMiddleware` 传给解析器的是**该模块的中间件集合**，不是它的 providers
+ * （`injector.js` 第 87–94 行）；失败后走 `lookupComponentInParentModules` →
+ * `lookupComponentInImports`（第 343–385 行），只在该模块 **imports** 里的模块的
+ * **exports** 中查找。因此中间件的依赖只有两个来源：
+ *
+ * 1. **注册它的那个模块自己的 providers**（实测变体：模块自己注册中间件、依赖是自己的
+ *    provider、非全局 → 依赖被正常注入，断言的是真实拿到的实例而不是「启动没报错」）；
+ * 2. **该模块 import 进来的模块所 exports 的 providers**（实测变体 A）。
+ *
+ * 两者都不满足才会抛错（阴性对照变体 E：
+ * `Nest can't resolve dependencies of the Mw (?). Please make sure that the argument Dep
+ * at index [0] is available in the FeatureE module.`）。
+ *
+ * **本模块属于第 2 种**：`SessionMiddleware` 由 `AppModule.configure` 注册，而
+ * `AppModule` import 了本模块、本模块又 `exports: [SessionService]`——这条边已经足够，
+ * 不需要全局可见性。**请勿**为了「少写一行 imports」把本模块重新标成 `@Global()`：
+ * 那会重新引入下面的顺序陷阱。
  *
  * ## 顺序：为什么 `SessionMiddleware` **不**在本模块 `configure` 里注册
  *
- * 直觉写法是在这里 `consumer.apply(SessionMiddleware).forRoutes('*')`，但那样顺序不可控：
- * `MiddlewareModule.registerMiddleware` 按 `moduleRef.distance` 排序，
- * 而**全局模块的 `distance` 是 `Number.MAX_VALUE`，排序时被显式提到最前**
- * （`middleware-module.js` 第 82–97 行）。`AuthModule` 一旦是 `@Global()`，
- * 它注册的中间件就会排到根模块的 `TraceMiddleware` **之前**——于是
- * `SessionMiddleware` 在没有 `traceId` 的上下文里 `run()` 自己的上下文，
- * **把 trace id 整个丢掉**（Task 4 的验收 13.4 直接失效）。
+ * `MiddlewareModule.registerMiddleware` 按 `moduleRef.distance` 排序，**非全局模块**按
+ * distance 升序、**全局模块被显式排到最前**（`middleware-module.js` 第 82–97 行）。
+ * 而 distance 是**距根模块的图深度**，全局模块在计算时被跳过、因而恒为
+ * `Number.MAX_VALUE`（`scanner.js` 第 219–224 行）。
  *
- * 放在 `AppModule.configure` 里则没有这个歧义：根模块 `distance === 0`，排第一，
+ * 于是把 `SessionMiddleware` 写进任何**子模块**的 `configure` 都会让它排到根模块的
+ * `TraceMiddleware` **之后**——注意这条推论与全局与否无关，是「子模块 distance > 0」造成的；
+ * 而若那个子模块还是 `@Global()`，它会排到根模块**之前**，更糟：`SessionMiddleware` 在
+ * 没有 `traceId` 的上下文里 `run()` 自己的上下文，**把 trace id 整个丢掉**
+ * （Task 4 的验收 13.4 直接失效）。
+ *
+ * 放在 `AppModule.configure` 里则没有这个歧义：根模块 `distance === 0` 排第一，
  * 两条中间件的相对顺序就是**书写顺序**。并且它把「身份必须建立在 trace 之后」
  * 这条语义留在了能看到全局顺序的那一个文件里。
  *
- * ## `SessionService` 为何导出
+ * ## `SessionService` 为何导出（现在它是**承重**的）
  *
- * 会话是**跨模块**的能力（Task 7 的限流按 `userId` 分桶、Task 8 的审计按会话追溯），
- * 但它们拿到的必须是同一个 Redis 连接与同一套键规则。导出一个服务比让每个模块
- * 自己 `new Redis(...)` 少一类「键规则漂移」的故障。
+ * 一是上文的中间件解析路径（`AppModule` 通过 export 拿它）；二是会话本身是**跨模块**的
+ * 能力（Task 7 的限流按 `userId` 分桶、Task 8 的审计按会话追溯），它们拿到的必须是同一个
+ * Redis 连接与同一套键规则——在 `imports` 里写上本模块即可，比让每个模块自己
+ * `new Redis(...)` 少一类「键规则漂移」的故障。
  */
-@Global()
 @Module({
   imports: [RedisModule, AuditModule],
   controllers: [AuthController],

@@ -44,7 +44,7 @@ import { HealthModule } from './modules/health/health.module.js';
  * 两条中间件都在**本文件的 `configure`** 里注册，顺序即书写顺序，理由（**实测**得出，
  * 不是从直觉推的）见 `configure` 内的注释：`MiddlewareModule` 按 `moduleRef.distance`
  * 排序，全局模块（`distance === Number.MAX_VALUE`）被显式排到最前，因此把
- * `SessionMiddleware` 写进 `@Global()` 的 `AuthModule.configure` 会让它跑到
+ * `SessionMiddleware` 写进当时还是 `@Global()` 的 `AuthModule.configure` 会让它跑到
  * `TraceMiddleware` **之前**，把 trace id 丢掉。
  *
  * 顺序由 `tests/integration/auth/auth-pipeline.test.ts` 的用例钉住：发一个带
@@ -79,9 +79,12 @@ import { HealthModule } from './modules/health/health.module.js';
     HealthModule,
   ],
   providers: [
-    // `SessionMiddleware` 必须在这里声明为提供者：`forRoutes('*')` 让 Nest 把它当作
-    // **本模块**的中间件去静态解析依赖（向上查找，见 auth.module.ts 的说明），
-    // 而 `SessionService` 因 `AuthModule` 是 `@Global()` 而全局可见，故两者能接上。
+    // `SessionMiddleware` 必须在这里声明为提供者：Nest 在**注册中间件的那个模块**里解析
+    // 它的依赖（`loadMiddleware` 传的是该模块的中间件集合，见 auth.module.ts 的说明）。
+    // `SessionService` 来自本模块 `imports` 里的 `AuthModule` 的 `exports`，这条边是**承重**的：
+    // 删掉 `AuthModule` 的 import 或它的 export，启动期就会抛
+    // `Nest can't resolve dependencies of the SessionMiddleware`。
+    // （`AuthModule` 已**不再**是 `@Global()`：实测移除后全绿，见 auth.module.ts。）
     SessionMiddleware,
     { provide: APP_GUARD, useExisting: PolicyGuard },
   ],
@@ -93,10 +96,16 @@ export class AppModule implements NestModule {
     // 2. `SessionMiddleware` 在该上下文里补 userId/sessionId（继承而非替换）。
     //
     // 为什么 `SessionMiddleware` 不写在 `AuthModule.configure` 里（直觉写法）：
-    // `MiddlewareModule` 按 `moduleRef.distance` 排序，**全局模块的 distance 是
-    // `Number.MAX_VALUE`，被显式排到最前**。`AuthModule` 是 `@Global()`，
-    // 因此它的中间件会跑到 `TraceMiddleware` **前面**，把 trace id 丢掉。
-    // 根模块 `distance === 0` 排第一，写在这里时两条中间件的顺序就是书写顺序。
+    // 中间件的执行顺序由 `MiddlewareModule` 按 `moduleRef.distance`（距根模块的图深度）
+    // 排序决定——根模块排第一、子模块排其后，而**全局模块被显式排到最前**
+    // （`middleware-module.js` 第 82–97 行；distance 的算法见 `scanner.js` 第 219–224 行，
+    // 全局模块在计算时被跳过、恒为 `Number.MAX_VALUE`）。
+    // 写进子模块时顺序就**脱离了本文件的控制**：子模块里它排在 `TraceMiddleware` 之后
+    // （恰好是想要的顺序），但那个子模块一旦被标 `@Global()`——本案就发生过一次——
+    // 它会翻到 `TraceMiddleware` **之前**，`SessionMiddleware` 于是在没有 traceId 的上下文里
+    // `run()` 自己的上下文，trace id 被整个丢掉（Task 4 验收 13.4 静默失效）。
+    // 写在这里则没有这层条件依赖：根模块 `distance === 0` 排第一，两条中间件的相对顺序
+    // 就是**书写顺序**，顺序语义也留在能看到全局顺序的同一个文件里。
     consumer.apply(TraceMiddleware).forRoutes('*');
     consumer.apply(SessionMiddleware).forRoutes('*');
   }
