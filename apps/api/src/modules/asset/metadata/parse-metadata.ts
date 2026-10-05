@@ -3,6 +3,11 @@ import type { Readable } from 'node:stream';
 import { Parser, type ReadEntry } from 'tar';
 import { fromRandomAccessReader, type Entry, type RandomAccessReader, type ZipFile } from 'yauzl';
 import type { EncryptedArtifactReader } from '../store/random-access-reader.js';
+import {
+  scoreCompleteness,
+  type CompletenessFacts,
+  type CompletenessWeights,
+} from './completeness.js';
 
 /**
  * 静态元数据解析（P1 / Task 6；设计 D9）。
@@ -61,20 +66,33 @@ export interface ParsedMetadata {
   fileTreeTruncated: boolean;
 }
 
+export interface ParseMetadataOptions {
+  /**
+   * 完整度评分的权重（设计 §6.2 的「权重可配置」）。
+   *
+   * 省略即 DEFAULT_COMPLETENESS_WEIGHTS（设计 §6.2 的默认权重）。今天没有第二个调用方传它
+   * ——它在这里是为了**兑现设计那句「可配置」**，并且让用例能把七项**逐项**隔离出来
+   * （只给某一项权重，其余为 0）。
+   */
+  readonly weights?: CompletenessWeights;
+}
+
 /**
  * 解析一份（已校验的）归档的元数据。
  *
  * @param reader 明文随机访问读取器（Task 3）。**绝不写入、绝不执行**其中的任何内容。
  * @param kind 已经过嗅探确认的归档类型（D7）。本函数不重新判定类型。
+ * @param options 可选：完整度评分的权重。
  */
 export async function parseMetadata(
   reader: EncryptedArtifactReader,
   kind: 'zip' | 'tar.gz',
+  options: ParseMetadataOptions = {},
 ): Promise<ParsedMetadata> {
   const scanner = new MetadataScanner();
   if (kind === 'zip') await scanZip(reader, reader.plaintextLength, scanner);
   else await scanTarGz(reader, reader.plaintextLength, scanner);
-  return scanner.result();
+  return scanner.result(options.weights);
 }
 
 // ── 内容读取的上限（**唯一的例外**：只有下面这几类文件会被读进内存）────────────
@@ -215,12 +233,107 @@ const MAX_MANIFEST_FILES = 8;
  */
 const MAX_DEPENDENCIES = 500;
 
+/**
+ * 是不是 LICENSE（设计 §6.2 的第 2 项）。
+ *
+ * 三个写法覆盖了绝大多数仓库：`LICENSE` / `LICENSE.md` / `LICENSE.txt`、英式 `LICENCE`、
+ * 以及 GNU 系仓库习惯的 `COPYING`。`NOTICE` 之类**不算**（那是声明文件，不是许可证）。
+ */
+const LICENSE_BASE_NAME = /^(license|licence|copying)(\..+)?$/i;
+
+/**
+ * 截图 / 录屏的扩展名（设计 §6.2 的第 6 项）。
+ *
+ * 判据是**扩展名**而不是内容：平台不解析图片 / 视频（C2：不碰需要解析的格式）。
+ * 代价明说：一张 `icon.png` 也会让这一项成立——它是质量信号，不是安全控制。
+ */
+const MEDIA_EXTENSIONS: ReadonlySet<string> = new Set([
+  'png',
+  'jpg',
+  'jpeg',
+  'gif',
+  'webp',
+  'bmp',
+  'mp4',
+  'mov',
+  'webm',
+  'avi',
+  'mkv',
+]);
+
+/**
+ * 「入口 / 构建脚本」的**文件名**判据（设计 §6.2 的第 4 项）。
+ *
+ * 另一半判据在 `package.json` 里（`scripts` / `main` / `bin`，见 `parsePackageJson`）。
+ * 这一半只看**最后一段名字**、不看深度——`src/main.ts` 与 `main.ts` 都算。
+ */
+const ENTRY_OR_BUILD_FILE_NAMES: ReadonlySet<string> = new Set([
+  'Makefile',
+  'makefile',
+  'GNUmakefile',
+  'Justfile',
+  'Dockerfile',
+  'docker-compose.yml',
+  'docker-compose.yaml',
+  'CMakeLists.txt',
+  'Cargo.toml',
+  'pom.xml',
+  'build.gradle',
+  'build.gradle.kts',
+  'Procfile',
+  'index.html',
+  'index.js',
+  'index.ts',
+  'index.tsx',
+  'index.mjs',
+  'main.js',
+  'main.ts',
+  'main.tsx',
+  'main.py',
+  'app.py',
+  'manage.py',
+  'main.go',
+  'main.rs',
+]);
+
+/**
+ * 「代码行数」不数的语言：标记 / 数据 / 样式（设计 §6.2 的第 7 项说的是**代码**）。
+ *
+ * 判据**不是**另立一张扩展名表（那会与 `LANGUAGE_BY_EXTENSION` 漂移），而是
+ * 「先按扩展名归类，再看这个语言是不是上面这几类」；未归类（`other`）的一律不数——
+ * 一个不认识的扩展名不该被算成代码。
+ */
+const NON_CODE_LANGUAGES: ReadonlySet<string> = new Set([
+  'JSON',
+  'Markdown',
+  'CSS',
+  'Sass',
+  'Less',
+  'HTML',
+  'XML',
+  'YAML',
+  'TOML',
+]);
+
+/**
+ * 代码行数扫描的两条上限（**下界**的来源，明说在这里与用例里）。
+ *
+ * 32 个文件 × 每个最多 64 KiB = 最多 2 MiB 的内容被读进内存。这两个数一起构成
+ * 「元数据解析会读多少内容」的上界，而它**与归档大小无关**。
+ * 代价：代码行数可能被**低估**（第 33 个代码文件之后的不数、单个文件 64 KiB 之后的不数），
+ * 而 §6.2 的门槛是 `> 200` —— 有两条专门用例把这个方向钉成可判定的行为。
+ */
+const CODE_LINE_SCAN_MAX_FILES = 32;
+const CODE_READ_BYTES_PER_FILE = 64 * 1024;
+
 /** 一个条目需要读内容时给出的请求（`cap` 是允许读进内存的字节数）。 */
 type ContentRequest =
   /** README：第一个匹配。 */
   | { readonly kind: 'readme'; readonly cap: number }
   /** 依赖清单：`ecosystem` 由文件名决定（`need` 里算一次）。 */
-  | { readonly kind: 'manifest'; readonly ecosystem: string; readonly cap: number };
+  | { readonly kind: 'manifest'; readonly ecosystem: string; readonly cap: number }
+  /** 代码文件：只读前 `cap` 字节用来数行数（见 `CODE_LINE_SCAN_MAX_FILES`）。 */
+  | { readonly kind: 'code'; readonly cap: number };
 
 /**
  * 一趟扫描的**唯一**累加器：两个 walker 都只经它记账。
@@ -244,10 +357,26 @@ class MetadataScanner {
   private readonly dependencyKeys = new Set<string>();
   /** README 的原始字节；`null` = 到扫描结束都没遇到过 README。 */
   private readme: Buffer | null = null;
+  /** 完整度事实（§6.2）：这几项都只看**条目名**，一个字节内容都不读。 */
+  private hasLicense = false;
+  private hasMedia = false;
+  private hasConventionalEntryFile = false;
+  /** 清单解析成功过几次（§6.2 的「存在且可解析」——解析不了的不算，见 `take`）。 */
+  private manifestFilesParsed = 0;
+  /** 清单里有没有构建 / 入口信号（`package.json` 的 scripts / main / bin）。 */
+  private manifestEntryOrBuildScript = false;
+  /** 代码行数扫描的账：已扫描的文件数、已计入的行数（下界，见常量注释）。 */
+  private codeFilesScanned = 0;
+  private codeLines = 0;
 
   /** 遇到一个**文件**条目（walker 已排除目录）。 */
   addFile(path: string, bytes: number): void {
     this.fileCount += 1;
+    const base = baseNameOf(path);
+    // 三项只按名字判定（不读内容）：LICENSE / 截图录屏 / 入口构建文件。
+    if (LICENSE_BASE_NAME.test(base)) this.hasLicense = true;
+    if (MEDIA_EXTENSIONS.has(extensionOf(base))) this.hasMedia = true;
+    if (ENTRY_OR_BUILD_FILE_NAMES.has(base)) this.hasConventionalEntryFile = true;
     // 语言分布按**全量**累计（不受树的两条上限影响：它是聚合量，不是列表）。
     // 0 字节文件不进分布：它对「按字节的占比」没有任何贡献，建一个 0 字节的桶只会多一行噪音。
     if (bytes > 0) {
@@ -274,6 +403,10 @@ class MetadataScanner {
       const ecosystem = MANIFEST_ECOSYSTEM_BY_NAME[baseNameOf(path)];
       if (ecosystem !== undefined) return { kind: 'manifest', ecosystem, cap: MANIFEST_READ_BYTES };
     }
+    // 代码行数扫描：上限一到就不再读**内容**（条目名照样早就记进树与分布里了）。
+    if (bytes > 0 && this.codeFilesScanned < CODE_LINE_SCAN_MAX_FILES && isCodePath(path)) {
+      return { kind: 'code', cap: CODE_READ_BYTES_PER_FILE };
+    }
     return null;
   }
 
@@ -283,9 +416,16 @@ class MetadataScanner {
       this.readme = content;
       return;
     }
+    if (request.kind === 'code') {
+      this.codeFilesScanned += 1;
+      this.codeLines += countLines(content.toString('utf8'));
+      return;
+    }
     this.manifestFiles += 1;
     const parsed = parseManifest(request.ecosystem, content);
     if (parsed === null) return; // 解析不了就是解析不了：不产出依赖，也不让整份解析失败
+    this.manifestFilesParsed += 1;
+    if (parsed.entryOrBuildScript) this.manifestEntryOrBuildScript = true;
     this.addDependencies(request.ecosystem, parsed.dependencies);
   }
 
@@ -307,15 +447,30 @@ class MetadataScanner {
     }
   }
 
-  /** 装配结果。 */
-  result(): ParsedMetadata {
+  /** 装配结果（`weights` 省略即设计 §6.2 的默认权重）。 */
+  result(weights?: CompletenessWeights): ParsedMetadata {
     return {
       readmeExcerpt: this.readme === null ? null : excerptOf(this.readme),
       fileTree: this.tree,
       languages: this.languageDistribution(),
       dependencies: this.dependencyList(),
-      completeness: 0,
+      completeness: scoreCompleteness(this.facts(), weights),
       fileTreeTruncated: this.treeTruncated,
+    };
+  }
+
+  /** 七条完整度事实（设计 §6.2）。 */
+  private facts(): CompletenessFacts {
+    return {
+      // 用**读到的**字符数：读取上限是 8192 字节，而门槛只有 200 字，
+      // 因此在门槛附近这两个数没有区别（多字节字符下 8192 字节 ≥ 2730 个汉字）。
+      readmeChars: this.readme === null ? 0 : this.readme.toString('utf8').length,
+      hasLicense: this.hasLicense,
+      manifestFilesParsed: this.manifestFilesParsed,
+      hasEntryOrBuildScript: this.manifestEntryOrBuildScript || this.hasConventionalEntryFile,
+      fileCount: this.fileCount,
+      hasMedia: this.hasMedia,
+      codeLines: this.codeLines,
     };
   }
 
@@ -350,10 +505,34 @@ function compareNames(left: string, right: string): number {
 
 /** 路径 → 语言名（扩展名小写后查表；没有扩展名或点开头的文件归 `other`）。 */
 function languageOf(path: string): string {
-  const base = baseNameOf(path);
+  return LANGUAGE_BY_EXTENSION[extensionOf(baseNameOf(path))] ?? OTHER_LANGUAGE;
+}
+
+/** 文件名的扩展名（小写；没有扩展名或点在开头 ⇒ 空串）。 */
+function extensionOf(base: string): string {
   const dot = base.lastIndexOf('.');
-  if (dot <= 0) return OTHER_LANGUAGE; // `Makefile`（无点）与 `.gitignore`（点在开头）都归 other
-  return LANGUAGE_BY_EXTENSION[base.slice(dot + 1).toLowerCase()] ?? OTHER_LANGUAGE;
+  return dot <= 0 ? '' : base.slice(dot + 1).toLowerCase();
+}
+
+/** 是不是**代码**文件（用于「代码行数」那一项，见 `NON_CODE_LANGUAGES`）。 */
+function isCodePath(path: string): boolean {
+  const language = languageOf(path);
+  return language !== OTHER_LANGUAGE && !NON_CODE_LANGUAGES.has(language);
+}
+
+/**
+ * 数行数：换行符个数，末尾不是换行就再加一行（`''` 是 0 行，`'a'` 是 1 行，`'a\n'` 也是 1 行）。
+ *
+ * 逐字符扫描而不是 `split('\n')`：一个 64 KiB 的文件用 `split` 会额外造出上万个字符串，
+ * 而这个函数会在扫描预算内被反复调用。
+ */
+function countLines(text: string): number {
+  let lines = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    if (text.charCodeAt(index) === 10) lines += 1;
+  }
+  if (text.length > 0 && text.charCodeAt(text.length - 1) !== 10) lines += 1;
+  return lines;
 }
 
 /** 路径的最后一段（`a/b/c.md` → `c.md`）。 */
@@ -391,14 +570,16 @@ function excerptOf(content: Buffer): string {
 /** 一个清单解析出来的东西。`null` = **解析不了**（今天只有「package.json 不是 JSON」一种）。 */
 interface ManifestFacts {
   readonly dependencies: readonly { name: string; version: string }[];
+  /** 清单里有没有「入口 / 构建脚本」信号（设计 §6.2 的第 4 项，只有 npm 清单有这个字段）。 */
+  readonly entryOrBuildScript: boolean;
 }
 
 /** 按 ecosystem 分发到对应的纯文本解析器。 */
 function parseManifest(ecosystem: string, content: Buffer): ManifestFacts | null {
   const text = content.toString('utf8');
   if (ecosystem === 'npm') return parsePackageJson(text);
-  if (ecosystem === 'pypi') return { dependencies: parseRequirements(text) };
-  return { dependencies: parseGoMod(text) };
+  if (ecosystem === 'pypi') return { dependencies: parseRequirements(text), entryOrBuildScript: false };
+  return { dependencies: parseGoMod(text), entryOrBuildScript: false };
 }
 
 /**
@@ -427,7 +608,33 @@ function parsePackageJson(text: string): ManifestFacts | null {
       if (typeof version === 'string') dependencies.push({ name, version });
     }
   }
-  return { dependencies };
+  return { dependencies, entryOrBuildScript: hasEntryOrBuildSignal(record) };
+}
+
+/**
+ * `package.json` 里有没有「入口 / 构建脚本」（设计 §6.2 的第 4 项）。
+ *
+ * 三类信号：`scripts` 里的 `build` / `start` / `dev` / `serve` 之一非空，
+ * 或 `main` 非空，或 `bin` 非空（`bin` 可以是字符串，也可以是「名字 → 路径」的对象）。
+ * 只看这几项，**不执行**任何一个脚本（C2）。
+ */
+function hasEntryOrBuildSignal(record: Record<string, unknown>): boolean {
+  const scripts = record['scripts'];
+  if (typeof scripts === 'object' && scripts !== null && !Array.isArray(scripts)) {
+    const table = scripts as Record<string, unknown>;
+    for (const key of ['build', 'start', 'dev', 'serve']) {
+      const value = table[key];
+      if (typeof value === 'string' && value.trim().length > 0) return true;
+    }
+  }
+  for (const key of ['main', 'bin']) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim().length > 0) return true;
+    if (typeof value === 'object' && value !== null && !Array.isArray(value) && Object.keys(value).length > 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**

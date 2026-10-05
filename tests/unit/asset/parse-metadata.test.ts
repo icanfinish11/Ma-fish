@@ -7,7 +7,13 @@ import { gunzipSync } from 'node:zlib';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ChildProcess, spawn, spawnSync } from 'node:child_process';
 import { EncryptedArtifactReader } from '@vca/api/modules/asset/store/random-access-reader.js';
-import { parseMetadata, type ParsedMetadata } from '@vca/api/modules/asset/metadata/parse-metadata.js';
+import { parseMetadata, type ParsedMetadata, type ParseMetadataOptions } from '@vca/api/modules/asset/metadata/parse-metadata.js';
+import {
+  DEFAULT_COMPLETENESS_WEIGHTS,
+  scoreCompleteness,
+  type CompletenessFacts,
+  type CompletenessWeights,
+} from '@vca/api/modules/asset/metadata/completeness.js';
 import { MemoryStore, fakeRing, seedArtifact } from '../../helpers/craft-encrypted-artifact.js';
 import { buildTarGz, buildZip } from '../../fixtures/archives/generate.js';
 
@@ -81,9 +87,13 @@ async function openReader(bytes: Buffer): Promise<{ store: MemoryStore; reader: 
 }
 
 /** 解析一份制品，返回元数据。 */
-async function parseOf(bytes: Buffer, kind: 'zip' | 'tar.gz'): Promise<ParsedMetadata> {
+async function parseOf(
+  bytes: Buffer,
+  kind: 'zip' | 'tar.gz',
+  options?: ParseMetadataOptions,
+): Promise<ParsedMetadata> {
   const { reader } = await openReader(bytes);
-  return await parseMetadata(reader, kind);
+  return await parseMetadata(reader, kind, options);
 }
 
 // ── Step 1：绝不执行（C2 / 判据 12）的样本 ─────────────────────────────────
@@ -618,6 +628,247 @@ describe('Task 6 · 元数据解析', () => {
       expect((await parseOf(bytes, 'tar.gz')).dependencies).toEqual([
         { ecosystem: 'npm', name: 'only', version: '1.0.0' },
       ]);
+    });
+  });
+
+  describe('Step 6：完整度评分（设计 §6.2 的七项默认权重，可配）', () => {
+    /** 七项全部命中的事实。 */
+    const FULL: CompletenessFacts = {
+      readmeChars: 200,
+      hasLicense: true,
+      manifestFilesParsed: 1,
+      hasEntryOrBuildScript: true,
+      fileCount: 10,
+      hasMedia: true,
+      codeLines: 201,
+    };
+    /** 七项全部不命中的事实。 */
+    const NONE: CompletenessFacts = {
+      readmeChars: 0,
+      hasLicense: false,
+      manifestFilesParsed: 0,
+      hasEntryOrBuildScript: false,
+      fileCount: 0,
+      hasMedia: false,
+      codeLines: 0,
+    };
+
+    it('默认权重合计**恰好** 100（否则「0–100 分」这句话是假的）', () => {
+      const total = Object.values(DEFAULT_COMPLETENESS_WEIGHTS).reduce((sum, weight) => sum + weight, 0);
+      expect(total).toBe(100);
+    });
+
+    it('七项全中 ⇒ 100；一项不中 ⇒ 0', () => {
+      expect(scoreCompleteness(FULL)).toBe(100);
+      expect(scoreCompleteness(NONE)).toBe(0);
+    });
+
+    it('每一项各自的边界（README 200 字 / 文件数 10 与 5000 / 代码 201 行）', () => {
+      const drop = (patch: Partial<CompletenessFacts>): number => scoreCompleteness({ ...FULL, ...patch });
+      // README：≥ 200 字才算（199 不算）
+      expect(drop({ readmeChars: 199 })).toBe(75);
+      expect(drop({ readmeChars: 200 })).toBe(100);
+      // 文件数：闭区间 10–5000
+      expect(drop({ fileCount: 9 })).toBe(90);
+      expect(drop({ fileCount: 10 })).toBe(100);
+      expect(drop({ fileCount: 5000 })).toBe(100);
+      expect(drop({ fileCount: 5001 })).toBe(90);
+      // 代码行数：**严格大于** 200
+      expect(drop({ codeLines: 200 })).toBe(90);
+      expect(drop({ codeLines: 201 })).toBe(100);
+      // 布尔三项
+      expect(drop({ hasLicense: false })).toBe(90);
+      expect(drop({ manifestFilesParsed: 0 })).toBe(85);
+      expect(drop({ hasEntryOrBuildScript: false })).toBe(85);
+      expect(drop({ hasMedia: false })).toBe(85);
+    });
+
+    it('自定义权重**真的**被用上（默认权重下 0 分的样本，换权重后是 100）', () => {
+      const onlyReadme: CompletenessWeights = {
+        readme: 100,
+        license: 0,
+        dependencyManifest: 0,
+        entryOrBuildScript: 0,
+        fileCount: 0,
+        media: 0,
+        codeLines: 0,
+      };
+      const readmeOnly: CompletenessFacts = { ...NONE, readmeChars: 500 };
+      expect(scoreCompleteness(readmeOnly)).toBe(25);
+      expect(scoreCompleteness(readmeOnly, onlyReadme)).toBe(100);
+    });
+
+    it('权重可配 ⇒ 总分可能越过 100 或变成负数：必须被夹在 0–100 且取整', () => {
+      const allBig: CompletenessWeights = {
+        readme: 50,
+        license: 50,
+        dependencyManifest: 50,
+        entryOrBuildScript: 50,
+        fileCount: 50,
+        media: 50,
+        codeLines: 50,
+      };
+      const allNegative: CompletenessWeights = {
+        readme: -50,
+        license: -50,
+        dependencyManifest: -50,
+        entryOrBuildScript: -50,
+        fileCount: -50,
+        media: -50,
+        codeLines: -50,
+      };
+      expect(scoreCompleteness(FULL, allBig)).toBe(100);
+      expect(scoreCompleteness(FULL, allNegative)).toBe(0);
+      // 分数是整数：小数权重不会漏到结果里（DB 那一列是整数）
+      const half: CompletenessWeights = { ...DEFAULT_COMPLETENESS_WEIGHTS, readme: 25.4 };
+      expect(Number.isInteger(scoreCompleteness({ ...NONE, readmeChars: 500 }, half))).toBe(true);
+    });
+  });
+
+  describe('Step 6b：完整度评分接在真实解析上（每一项都真的被算出来，权重可配）', () => {
+    /** 只给某一项 100 分、其余 0：这样解析出来的分数就是「这一项算出来了没有」的 0/100 信号。 */
+    function weightsOnly(key: keyof CompletenessWeights): CompletenessWeights {
+      return {
+        readme: key === 'readme' ? 100 : 0,
+        license: key === 'license' ? 100 : 0,
+        dependencyManifest: key === 'dependencyManifest' ? 100 : 0,
+        entryOrBuildScript: key === 'entryOrBuildScript' ? 100 : 0,
+        fileCount: key === 'fileCount' ? 100 : 0,
+        media: key === 'media' ? 100 : 0,
+        codeLines: key === 'codeLines' ? 100 : 0,
+      };
+    }
+
+    const scoreFor = async (bytes: Buffer, key: keyof CompletenessWeights): Promise<number> =>
+      (await parseOf(bytes, 'zip', { weights: weightsOnly(key) })).completeness;
+
+    it('README：199 字 ⇒ 0 分；200 字 ⇒ 100 分', async () => {
+      const short = buildZip([{ name: 'README.md', data: Buffer.from('a'.repeat(199)) }]);
+      const exact = buildZip([{ name: 'README.md', data: Buffer.from('a'.repeat(200)) }]);
+      expect(await scoreFor(short, 'readme')).toBe(0);
+      expect(await scoreFor(exact, 'readme')).toBe(100);
+    });
+
+    it('LICENSE：`LICENSE` / `LICENSE.txt` / `COPYING` 都算，`NOTICE` 不算', async () => {
+      const withLicense = buildZip([{ name: 'LICENSE.txt', data: Buffer.from('MIT\n') }]);
+      const copying = buildZip([{ name: 'COPYING', data: Buffer.from('GPL\n') }]);
+      const notice = buildZip([{ name: 'NOTICE', data: Buffer.from('hi\n') }]);
+      expect(await scoreFor(withLicense, 'license')).toBe(100);
+      expect(await scoreFor(copying, 'license')).toBe(100);
+      expect(await scoreFor(notice, 'license')).toBe(0);
+    });
+
+    it('依赖清单：可解析的 package.json ⇒ 100；**不是 JSON** 的 package.json ⇒ 0', async () => {
+      const good = buildZip([{ name: 'package.json', data: Buffer.from('{"dependencies":{"a":"1"}}') }]);
+      const bad = buildZip([{ name: 'package.json', data: Buffer.from('{ 坏掉的 JSON') }]);
+      expect(await scoreFor(good, 'dependencyManifest')).toBe(100);
+      expect(await scoreFor(bad, 'dependencyManifest')).toBe(0);
+    });
+
+    it('入口 / 构建脚本：`Makefile` 或 `package.json` 的 scripts.build 都算，两者都没有 ⇒ 0', async () => {
+      const makefile = buildZip([{ name: 'Makefile', data: Buffer.from('all:\n\techo hi\n') }]);
+      const script = buildZip([
+        { name: 'package.json', data: Buffer.from('{"scripts":{"build":"tsc -p ."}}') },
+      ]);
+      const neither = buildZip([{ name: 'src/util.ts', data: Buffer.from('export const x = 1;\n') }]);
+      expect(await scoreFor(makefile, 'entryOrBuildScript')).toBe(100);
+      expect(await scoreFor(script, 'entryOrBuildScript')).toBe(100);
+      expect(await scoreFor(neither, 'entryOrBuildScript')).toBe(0);
+    });
+
+    it('文件数：9 ⇒ 0 分；10 ⇒ 100 分；5000 ⇒ 100 分；5001 ⇒ 0 分', async () => {
+      const zipOf = (count: number): Buffer =>
+        buildZip(Array.from({ length: count }, (_unused, index) => ({ name: `f${index}.txt` })));
+      expect(await scoreFor(zipOf(9), 'fileCount')).toBe(0);
+      expect(await scoreFor(zipOf(10), 'fileCount')).toBe(100);
+      expect(await scoreFor(zipOf(5000), 'fileCount')).toBe(100);
+      expect(await scoreFor(zipOf(5001), 'fileCount')).toBe(0);
+    });
+
+    it('文件数按**全量**统计（深度超过树上限的文件也算进去）', async () => {
+      const deep = `${Array.from({ length: 12 }, (_unused, index) => `d${index}`).join('/')}/deep.txt`;
+      const bytes = buildZip([
+        ...Array.from({ length: 9 }, (_unused, index) => ({ name: `f${index}.txt` })),
+        { name: deep },
+      ]);
+      const metadata = await parseOf(bytes, 'zip', { weights: weightsOnly('fileCount') });
+      expect(metadata.fileTreeTruncated).toBe(true); // 树被截断了……
+      expect(metadata.completeness).toBe(100); // ……但文件数照样数到 10
+    });
+
+    it('截图 / 录屏：`.png` 算，`.txt` 不算', async () => {
+      const shot = buildZip([{ name: 'docs/shot.PNG', data: Buffer.from('x') }]);
+      const text = buildZip([{ name: 'docs/notes.txt', data: Buffer.from('x') }]);
+      expect(await scoreFor(shot, 'media')).toBe(100);
+      expect(await scoreFor(text, 'media')).toBe(0);
+    });
+
+    it('代码行数：200 行 ⇒ 0 分；201 行 ⇒ 100 分（只有代码扩展名被数）', async () => {
+      const code = (lines: number): Buffer =>
+        buildZip([
+          { name: 'src/main.ts', data: Buffer.from('const x = 1;\n'.repeat(lines)) },
+          { name: 'notes.md', data: Buffer.from('# t\n'.repeat(5000)) }, // Markdown 不是代码
+        ]);
+      expect(await scoreFor(code(200), 'codeLines')).toBe(0);
+      expect(await scoreFor(code(201), 'codeLines')).toBe(100);
+    });
+
+    it('代码行数扫描有界（最多 32 个文件）：第 33 个之后的代码文件不数——**低估**而不是高估', async () => {
+      // 前 32 个文件各 1 行（它们把预算用光），真正的 800 行在第 33、34 个文件里。
+      const bytes = buildZip([
+        ...Array.from({ length: 32 }, (_unused, index) => ({
+          name: `src/small${index}.ts`,
+          data: Buffer.from('const x = 1;\n'),
+        })),
+        { name: 'src/late1.ts', data: Buffer.from('const x = 1;\n'.repeat(400)) },
+        { name: 'src/late2.ts', data: Buffer.from('const x = 1;\n'.repeat(400)) },
+      ]);
+      // 32 行 ≤ 200 ⇒ 不得分；若不设上限则会数到 832 行 ⇒ 得分。这条差值就是上限的判别力。
+      expect(await scoreFor(bytes, 'codeLines')).toBe(0);
+    });
+
+    it('每个代码文件最多数前 64 KiB 的行——同样是**低估**', async () => {
+      // 第一个 64 KiB 是一整行（没有换行符），剩下的 1000 行在 64 KiB 之后。
+      const oneLongLine = `${'a'.repeat(64 * 1024 - 1)}\n`;
+      const rest = 'const x = 1;\n'.repeat(1000);
+      const bytes = buildZip([{ name: 'src/huge.ts', data: Buffer.from(oneLongLine + rest) }]);
+      expect(await scoreFor(bytes, 'codeLines')).toBe(0);
+    });
+
+    it('默认权重下的满分样本 ⇒ 恰好 100（七项同时成立）', async () => {
+      const bytes = buildZip([
+        { name: 'README.md', data: Buffer.from('r'.repeat(200)) },
+        { name: 'LICENSE', data: Buffer.from('MIT\n') },
+        { name: 'package.json', data: Buffer.from('{"dependencies":{"a":"1"},"scripts":{"build":"tsc"}}') },
+        { name: 'shot.png', data: Buffer.from('png') },
+        { name: 'src/main.ts', data: Buffer.from('const x = 1;\n'.repeat(201)) },
+        { name: 'docs/d0.txt', data: Buffer.from('x') },
+        { name: 'docs/d1.txt', data: Buffer.from('x') },
+        { name: 'docs/d2.txt', data: Buffer.from('x') },
+        { name: 'docs/d3.txt', data: Buffer.from('x') },
+        { name: 'docs/d4.txt', data: Buffer.from('x') },
+      ]);
+      const metadata = await parseOf(bytes, 'zip');
+      expect(metadata.dependencies).toHaveLength(1);
+      expect(metadata.fileTree).toHaveLength(10); // 七项里的「文件数在 10–5000 之间」靠它
+      expect(metadata.completeness).toBe(100);
+    });
+
+    it('要什么没什么的样本 ⇒ 0（默认权重）', async () => {
+      const bytes = buildZip([{ name: 'src/util.ts', data: Buffer.from('const x = 1;\n') }]);
+      expect((await parseOf(bytes, 'zip')).completeness).toBe(0);
+    });
+
+    it('tar.gz 侧同一判据（满分样本）', async () => {
+      const entries = [
+        { name: 'README.md', data: Buffer.from('r'.repeat(200)) },
+        { name: 'LICENSE', data: Buffer.from('MIT\n') },
+        { name: 'package.json', data: Buffer.from('{"dependencies":{"a":"1"},"scripts":{"build":"tsc"}}') },
+        { name: 'shot.png', data: Buffer.from('png') },
+        { name: 'src/main.ts', data: Buffer.from('const x = 1;\n'.repeat(201)) },
+        ...Array.from({ length: 5 }, (_unused, index) => ({ name: `docs/d${index}.txt`, data: Buffer.from('x') })),
+      ];
+      expect((await parseOf(buildTarGz(entries), 'tar.gz')).completeness).toBe(100);
     });
   });
 });
