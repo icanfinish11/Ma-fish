@@ -120,10 +120,33 @@ export async function inspectTarGz(
      * ## 这一段做了什么
      *
      * 监听 `'eof'`（tar 读到**结束标记**时就发，实测在第一个 16 KiB 数据块上就发出来了），
-     * 若此时**一个有效条目都没有**，立刻以**同一条判据、同一个代号**拒掉
-     * ——这正是 tar 自己在 DONE 时做的判断（`SAW_VALID_ENTRY === false`），
-     * 只是不必把整条流解完。**判据没有变、阈值没有变、八样本的期望没有变**：
-     * 变的是「这条判断什么时候给出」。
+     * 若此时**一个有效条目都没有**，立刻以**同一条判据、同一个代号**拒掉，
+     * 只是不必把整条流解完。**阈值没有变、八样本的期望没有变**：变的是「这条判断什么时候给出」。
+     *
+     * ## ⚠️ 它与 node-tar 自己的判断**不是逐字等价**（M3：上一版这句话是错的）
+     *
+     * 上一版写着「这正是 tar 自己在 DONE 时做的判断（`SAW_VALID_ENTRY === false`）」。**那句话不成立**，
+     * 按 `tar@7.5.22` 的源码（`dist/commonjs/parse.js`）逐段核对如下：
+     *
+     * - tar 的判据是 `STATE === 'begin' || SAW_VALID_ENTRY === false`（第 101–105 行），
+     *   而不是 `SAW_VALID_ENTRY === false` 单独一条；
+     * - `SAW_VALID_ENTRY` 在 **meta 条目上也置位**：置位发生在第 207–219 行，
+     *   位置在 `if (entry.meta)`（第 221 行）**之前**，注释原文是
+     *   「we do this for meta & ignored entries as well, because they are still valid tar」；
+     * - 而 `'entry'` 事件**只对非 meta 条目**发出：meta 走第 221 行那一支、从入队（第 252/256 行），
+     *   而发事件的是 `PROCESSENTRY`（第 279 行），它只消费队列。
+     *
+     * ⇒ 本段用的 `entryCount`（= `'entry'` 事件的条数）**比 tar 的判据更严**：
+     * 一份**只含 meta 条目**的 tar.gz（例如只有一个 pax 全局扩展头的归档）会被我们拒掉
+     * （`eof` 时 `entryCount === 0`），而 tar 自己认为它是合法归档
+     * （`SAW_VALID_ENTRY` 已置位 ⇒ DONE 不发 `TAR_BAD_ARCHIVE`）。
+     *
+     * **这是刻意的 fail-closed 一侧，据实记载**：D7 的 `mime === 'application/gzip'` 那一半会放行
+     * **任何** `.gz`，而「空归档」与「根本不是归档」在 tar 自己的信号里本就不易区分
+     * （两者在 DONE 时可能都只有一句警告）。放行前者等于给后者开一条路。
+     * 若将来确实需要与 node-tar 逐字对齐，改法是把这个判据从「`'entry'` 条数为 0」换成
+     * 「**解析出的头**为 0」（在 `'entry'` 之外另记一个「看到过任何被接受的头」的标志，
+     * meta 与 ignored 条目都算）——**不是**把这一段删掉。
      *
      * 反过来，**有**有效条目的归档照旧走 `'end'`：`entryCount > 0` 时这里直接返回。
      */
@@ -151,9 +174,11 @@ export async function inspectTarGz(
      * （实测 4–16 KiB 就拒）。两者共用同一个 `settle`，先到的结论说了算。
      *
      * 代价（据实记载）：一个**空 tar.gz**（只有两个全零块）也在这一类里
-     * （`SAW_VALID_ENTRY === false` ⇒ 同一条判断）⇒ 被拒。这是刻意 fail-closed 的一侧：
+     * （tar 的 DONE 判据 `STATE === 'begin' || SAW_VALID_ENTRY === false` 同样会拒它）⇒ 被拒。
+     * 这是刻意 fail-closed 的一侧：
      * 「空归档」与「根本不是归档」在 tar 自己的信号里无法区分，
      * 而放行前者就等于放行后者（任何 .gz 都能冒充 tar.gz）。
+     * （**不**等价的那一类——只含 meta 条目的 tar.gz——见上面 `'eof'` 那一段的 M3 记载。）
      */
     parser.on('warn', (code: string, message: string) =>
       settle({ ok: false, reason: `tar.gz 归档不合法（${code}）：${sanitizeReason(message)}` }),
