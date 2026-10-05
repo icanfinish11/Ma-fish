@@ -1,5 +1,6 @@
 import { afterEach, beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +9,7 @@ import { createGunzip } from 'node:zlib';
 import { fileTypeFromBuffer } from 'file-type';
 import { Parser, ReadEntry } from 'tar';
 import * as yauzl from 'yauzl';
+import type { RandomAccessReader } from 'yauzl';
 import {
   ARCHIVE_LIMITS,
   checkCompressionRatio,
@@ -342,6 +344,46 @@ function reasonOf(result: { ok: true } | { ok: false; reason: string }): string 
   return result.ok ? '' : result.reason;
 }
 
+/**
+ * yauzl `RandomAccessReader` 的测试替身：内存 + **同步**回调。
+ *
+ * 只服务一条用例（见 `zip：…` 那一节）：把「同步回调用真递归」这个形状**做出来**，
+ * 从而让 `inspectZip` 里的 `queueMicrotask` 成为可判定的东西。
+ * 它**不是**真实读取器的替代品——真实链路（Task 3 的读取器）是异步的，
+ * 而那条链路由八样本套件用真实制品覆盖。
+ */
+class SynchronousBufferReader extends EventEmitter implements RandomAccessReader {
+  constructor(private readonly bytes: Buffer) {
+    super();
+  }
+
+  _readStreamForRange(start: number, end: number): Readable {
+    return Readable.from([this.bytes.subarray(start, end)]);
+  }
+
+  createReadStream(options: { start: number; end: number }): Readable {
+    return Readable.from([this.bytes.subarray(options.start, options.end)]);
+  }
+
+  read(
+    buffer: Buffer,
+    offset: number,
+    length: number,
+    position: number,
+    callback: (err: Error | null) => void,
+  ): void {
+    this.bytes.copy(buffer, offset, position, position + length);
+    callback(null); // ← 同步。本替身存在的全部意义就是这一行
+  }
+
+  close(callback: (err: Error | null) => void): void {
+    callback(null);
+  }
+
+  ref(): void {}
+  unref(): void {}
+}
+
 describe('zip：只读中央目录 + 解析器抛错计为拒绝（D6 的两条实现约束、C19）', () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -383,6 +425,17 @@ describe('zip：只读中央目录 + 解析器抛错计为拒绝（D6 的两条�
     expect(result.ok).toBe(false);
     expect(reasonOf(result)).toContain('压缩比');
     expect(openReadStream).not.toHaveBeenCalled();
+  });
+
+  it('结构不合法（连中央目录都没有）⇒ open 阶段失败，仍然**返回拒绝**而不是抛异常', async () => {
+    // 这一条走的是 `inspectZip` 的 **catch 分支**（`fromRandomAccessReader` 直接失败），
+    // 与 zip-slip 走的「error 事件」分支**不是同一条**。
+    // 变异探针 M6 实测：只把 catch 里的 return 改成 throw，**当时 65 条用例仍然全绿**
+    // ——因为没有任何用例让 open 失败过。补上这一条，那个 catch 才有判别力。
+    const broken = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.alloc(64, 0x41)]);
+    const { result } = await inspectZipOf(broken);
+    expect(result.ok).toBe(false);
+    expect(reasonOf(result)).toContain('zip 解析失败');
   });
 
   it('flood：第 20,001 条触发条目数上限（并且不会把调用栈打爆）', async () => {
@@ -455,6 +508,20 @@ describe('zip：只读中央目录 + 解析器抛错计为拒绝（D6 的两条�
     const { result } = await inspectZipOf(zip);
     expect(result.ok).toBe(false);
     expect(reasonOf(result)).toContain('invalid characters');
+  });
+
+  it('读取器的回调**同步**时也照样判得出来（否则 flood 会把调用栈打爆）', async () => {
+    // 为什么要有这条用例（探针实测，见 evidence/t4-probe-archive-api.txt）：
+    // yauzl 的 `readEntry → emit('entry') → 处理 → readEntry` 在读取器的 `read` 回调
+    // **同步**时是一段**真递归**：20,001 条的 flood.zip 直接
+    // `RangeError: Maximum call stack size exceeded`（探针第一版就是这么炸的）。
+    // Task 3 的读取器走 `copyInto(...).then(callback)`，天然异步，所以这条坑在真实链路上
+    // 摸不到——`zip-inspector` 里的 `queueMicrotask` 是**第二道**保险。
+    // 用一个同步回调的读取器把这道保险变成可判定的：去掉它这条用例就红。
+    const zip = buildZip(Array.from({ length: 20_001 }, (_unused, index) => ({ name: `f${index}.txt` })));
+    const result = await inspectZip(new SynchronousBufferReader(zip), zip.length, ARCHIVE_LIMITS);
+    expect(result.ok).toBe(false);
+    expect(reasonOf(result)).toContain('条目数');
   });
 
   it('解析器吐回的条目名会被转义：拒绝理由里不出现裸控制字符', async () => {
