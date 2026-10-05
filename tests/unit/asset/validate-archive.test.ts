@@ -18,10 +18,20 @@ import {
 import { SNIFF_BYTES, sniffArchive } from '@vca/api/modules/asset/archive/sniff.js';
 import { inspectZip } from '@vca/api/modules/asset/archive/zip-inspector.js';
 import { inspectTarGz } from '@vca/api/modules/asset/archive/targz-inspector.js';
+import { validateArchive } from '@vca/api/modules/asset/archive/validate-archive.js';
+import { TAG_BYTES } from '@vca/api/modules/asset/crypto/artifact-format.js';
 import { EncryptedArtifactReader } from '@vca/api/modules/asset/store/random-access-reader.js';
 // 制品（密文外壳）的构造与观察住在 Task 3 的共享夹具里：Task 4 的输入是
 // `EncryptedArtifactReader`，因此这里的「样本」是**先加密成制品、再打开读取器**。
-import { MemoryStore, fakeRing, seedArtifact } from '../../helpers/craft-encrypted-artifact.js';
+// `truncateLastBlocks` 就是 Step 0b 要防的那件事（自洽的整块截断）的构造器。
+import {
+  MemoryStore,
+  at,
+  fakeRing,
+  recordRange,
+  seedArtifact,
+  truncateLastBlocks,
+} from '../../helpers/craft-encrypted-artifact.js';
 // 样本一律**代码生成**，不入库二进制（见生成器的文件头）。
 import { ARCHIVE_SAMPLES, BOMB_BYTES, buildTarGz, buildZip, gzip } from '../../fixtures/archives/generate.js';
 
@@ -583,5 +593,112 @@ describe('tar.gz：仅凭头部判定 + 提前中止（D8、C19）', () => {
     const blocks = Math.ceil(notATar.length / 4096);
     expect(blocks).toBeGreaterThan(500);
     expect(store.requests.length).toBeLessThanOrEqual(16);
+  });
+});
+
+describe('validateArchive：末块认证 → 嗅探 → 分发（Step 0b 五条 + Step 4）', () => {
+  it('合法 zip 与合法 tar.gz 分别返回 ok + kind', async () => {
+    const zipOpened = await openPlaintext(sampleBytes('ok.zip'));
+    expect(await validateArchive(zipOpened.reader)).toEqual({ ok: true, kind: 'zip' });
+    const tarOpened = await openPlaintext(sampleBytes('ok.tar.gz'));
+    expect(await validateArchive(tarOpened.reader)).toEqual({ ok: true, kind: 'tar.gz' });
+  });
+
+  it('PNG 字节（名字叫 .zip）⇒ kind 为 unknown 的拒绝，理由里带上认出的类型', async () => {
+    const { reader } = await openPlaintext(sampleBytes('fake-mime.zip'));
+    const verdict = await validateArchive(reader);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.kind).toBe('unknown');
+    expect(reasonOf(verdict)).toContain('png');
+  });
+
+  it('Step 0b-4：`plaintextLength === 0` 有明确定义的行为——拒绝「空制品」，且**一个字节都不读**', async () => {
+    // 几何允许 0 块制品（Task 3 的 R4），此时「认证末块」无定义：没有末块。
+    // 明确的处理是先于读任何字节给出结论（空制品不可能带 magic bytes）。
+    const { store, reader } = await openPlaintext(Buffer.alloc(0));
+    const verdict = await validateArchive(reader);
+    expect(verdict.ok).toBe(false);
+    expect(reasonOf(verdict)).toContain('空制品');
+    expect(store.requests).toHaveLength(0);
+  });
+
+  it('Step 0b-1（机制）：**第一个**存储请求就落在末块的记录上——1 个字节足以触发 isLast 认证', async () => {
+    // 块取 64 字节 ⇒ ok.zip（319 字节）有 5 块，末块与首块相隔很远，不可能混淆。
+    const store = new MemoryStore();
+    const seeded = await seedArtifact(store, sampleBytes('ok.zip'), { chunkSize: 64 });
+    const reader = await EncryptedArtifactReader.open(store, seeded.key, fakeRing());
+    store.reset();
+    expect(await validateArchive(reader)).toEqual({ ok: true, kind: 'zip' });
+    const lastEntry = at(seeded.entries, seeded.entries.length - 1);
+    // 逐字断言：**第一次**读就是末块那条记录（密文 + 16 字节 tag）的闭区间。
+    const first = store.requests[0];
+    expect(first).toEqual({ key: seeded.key, ...recordRange(lastEntry) });
+    // 而且那一次只取回**一条记录**的字节（读 1 个明文字节就够；不是把末块端出来做别的判断）
+    expect((first?.endInclusive ?? 0) - (first?.start ?? 0) + 1).toBe(lastEntry.ciphertextLength + TAG_BYTES);
+  });
+
+  it('Step 0b-2（端到端）：自洽的整块截断制品 ⇒ 拒绝、不返回任何元数据，且**在读到别处之前就停**', async () => {
+    // 构造：合法 zip 后面接 32 KiB 零字节填充，然后删掉末尾整块（连同索引记录、把尾部改小）
+    // ——这是**完全自洽**的截断，读取端 open() 的三条完整性校验全部满足。
+    //
+    // 一处据实记载（本用例的判别力到底在哪）：这份制品若**不**先认证末块，仍然会被拒——
+    // 嗅探读的是前 4100 字节（放行 zip），而 zip 校验要读明文**尾部**的 EOCD，
+    // 那正好落在被删块之后留下的那一块上 ⇒ 报「第 4 块认证失败」。
+    // 也就是说，判别力**不在**「拒还是放」上，而在**结论的形状**与**停在哪里**上：
+    // 先认证末块 ⇒ kind 是 unknown、理由指向末块、且只读了 1 次；
+    // 不认证 ⇒ kind 变成 zip、理由指向「第 4 块」、并且白读了嗅探与解析的若干次。
+    const padded = Buffer.concat([sampleBytes('ok.zip'), Buffer.alloc(32 * 1024)]);
+    const store = new MemoryStore();
+    const seeded = await seedArtifact(store, padded, { chunkSize: 4096 });
+    const key = store.seed(truncateLastBlocks(seeded.artifact, 4));
+    const reader = await EncryptedArtifactReader.open(store, key, fakeRing());
+    store.reset();
+
+    const verdict = await validateArchive(reader);
+    expect(verdict.ok).toBe(false);
+    // ① 结论里**没有元数据**：连类型都不给（没走到嗅探，就不该声称知道类型）
+    expect(Object.keys(verdict).sort()).toEqual(['kind', 'ok', 'reason']);
+    expect(verdict.kind).toBe('unknown');
+    // ② 理由指向**末块认证**，而不是走到 zip 解析之后才撞上的「第 N 块认证失败」
+    expect(reasonOf(verdict)).toContain('末块认证失败');
+    // ③ 只读了 1 次：认证末块那一次。后面两层压根没开始读
+    expect(store.requests).toHaveLength(1);
+  });
+
+  it('Step 0b-3（口径）：totalSize 取自读取器自称的 `plaintextLength`，不是对象的字节长度', async () => {
+    const store = new MemoryStore();
+    const seeded = await seedArtifact(store, sampleBytes('ok.zip'), { chunkSize: 64 });
+    const reader = await EncryptedArtifactReader.open(store, seeded.key, fakeRing());
+    store.reset();
+    const objectBytes = (await store.stat(seeded.key)).bytes;
+    // 两个数**确实不同**（密文外壳有头 + tag + 索引 + 尾部），因此「拿错一个」会立刻显现：
+    // 用对象长度当 totalSize 时 yauzl 找不到 EOCD，合法 zip 会被误拒。
+    expect(reader.plaintextLength).toBe(sampleBytes('ok.zip').length);
+    expect(reader.plaintextLength).toBeLessThan(objectBytes);
+    expect(await validateArchive(reader)).toEqual({ ok: true, kind: 'zip' });
+  });
+
+  it('Step 0b-5：带外长度与制品自称不符 ⇒ 拒绝（唯一非自称的长度载体）', async () => {
+    const { reader } = await openPlaintext(sampleBytes('ok.zip'));
+    const verdict = await validateArchive(reader, {
+      expectedPlaintextLength: reader.plaintextLength + 1,
+    });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.kind).toBe('unknown');
+    expect(reasonOf(verdict)).toContain('带外');
+  });
+
+  it('Step 0b-5：带外长度相符 ⇒ 照常放行（这条防「带外一律拒绝」的实现）', async () => {
+    const { reader } = await openPlaintext(sampleBytes('ok.zip'));
+    expect(await validateArchive(reader, { expectedPlaintextLength: reader.plaintextLength })).toEqual({
+      ok: true,
+      kind: 'zip',
+    });
+  });
+
+  it('带外长度在**读任何字节之前**就被核对（不符时零读取）', async () => {
+    const { store, reader } = await openPlaintext(sampleBytes('ok.zip'));
+    await validateArchive(reader, { expectedPlaintextLength: 1 });
+    expect(store.requests).toHaveLength(0);
   });
 });
