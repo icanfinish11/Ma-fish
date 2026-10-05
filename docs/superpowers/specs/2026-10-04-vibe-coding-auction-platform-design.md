@@ -564,6 +564,7 @@ vibe-coding-auction-web/
 | 高级检索（独立搜索引擎） | 视数据量 | 全文检索性能瓶颈是否出现 |
 | 自动截图沙箱 | P9 之后（需独立立项） | 是否必须自动化，且能否满足隔离要求 |
 | **GitHub OAuth 完整授权流** | **P1（与「发布」同批）** | P0 只交付了 `GithubOauthService`（授权 URL、PKCE、state 生成、令牌交换）及其单元测试。**尚缺**：`/auth/github` 与 `/auth/github/callback` 两条路由、`state` 与 PKCE verifier 的短期 Redis 存储、以及 `Identity` 表的写入方（`auth.identities` 至今无任何写入者）。因此 §4.2 的「校验 `state` 与 `nonce`」与 D4「发布者必须绑定 GitHub OAuth」在 P0 结束时**尚未在实质上满足**。延后理由：P0 没有发布功能，这道门暂时无物可守，为无消费者的流程建路由属于 §2.2 禁止的空抽象。**必须在 P1 落地，届时 D4 的门槛才成立。** |
+| **运行期角色校验扩展到 worker** | P1 | P0 交付的 `assertRuntimeDbRole`（`apps/api/src/db/runtime-role.ts`）在 API 引导期校验连接身份：若连的是迁移属主、或对 `audit.audit_logs` 有 `UPDATE`/`DELETE` 权限，则**拒绝启动**（§8.6 纪律 1 由此从文档变为强制）。**但它的生产调用点只有一处**（`bootstrap.ts`），worker 进程没有等价校验 —— 若 worker 被以属主角色启动，它不会自我拒绝（不过 API 会用同一份配置先响），且 worker 不写 append-only 表，故风险受限。**P1 应补 worker 侧同一校验。** 另有两处已知边界：校验是**一次性**的（库不可达或审计表尚未建时只记 warn，不阻断，故「先启动、后迁移」的部署不会被拒）；且现有测试无法把 `has_table_privilege` 分支与 superuser 分支分开证明（测试容器里属主同时是 superuser）。 |
 
 ---
 
