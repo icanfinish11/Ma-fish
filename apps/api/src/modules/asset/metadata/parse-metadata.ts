@@ -50,7 +50,15 @@ export interface ParsedMetadata {
   readmeExcerpt: string | null;
   /** 文件树摘要（**只有文件**，目录条目不计）：路径 + 未压缩字节数。深度与条目数都受限。 */
   fileTree: { path: string; bytes: number }[];
-  /** 语言分布：按扩展名归类、按字节降序；占比的分母是**所有文件**的字节合计。 */
+  /**
+   * 语言分布：按扩展名归类、按字节降序。
+   *
+   * 占比的分母是**非空文件**的字节合计（= 各语言桶的字节之和）：**0 字节文件既不进分子、
+   * 也不进分母**。这一条不是修辞——写成「所有文件的字节合计」会让下一个读代码的人以为
+   * 分母包含空文件，而照那个口径实现会让一份只有空文件的归档算出 `0/0`。口径的唯一
+   * 来源在 `MetadataScanner.addFile` 的 `bytes > 0` 那个条件上。
+   */
+
   languages: { name: string; bytes: number; ratio: number }[];
   /** 依赖清单（纯文本解析）：`package.json` / `requirements.txt` / `go.mod`。 */
   dependencies: { ecosystem: string; name: string; version: string }[];
@@ -378,7 +386,15 @@ class MetadataScanner {
     if (MEDIA_EXTENSIONS.has(extensionOf(base))) this.hasMedia = true;
     if (ENTRY_OR_BUILD_FILE_NAMES.has(base)) this.hasConventionalEntryFile = true;
     // 语言分布按**全量**累计（不受树的两条上限影响：它是聚合量，不是列表）。
-    // 0 字节文件不进分布：它对「按字节的占比」没有任何贡献，建一个 0 字节的桶只会多一行噪音。
+    //
+    // `bytes > 0` 这一个条件同时定了两件事，而它们其实是**同一件事**：
+    //   1. 0 字节文件不建桶（否则分布里多一行 0 字节的噪音）；
+    //   2. 0 字节文件不进 `languageDistribution` 的**分母**（分母 = 各桶字节之和）。
+    // 因此「分母是所有文件的字节合计」那句话是**错的**（修复轮 1 更正）：分母是
+    // **非空文件**的字节合计。空文件对按字节的占比本来就没有贡献，所以这个更正**不改变
+    // 任何数值**——它改的是下一个读代码的人据以推理的那句话。
+    // 反过来说，若分母真的照字面包含空文件，一份只有空文件的归档就会算 `0/0` ⇒ `NaN`
+    // （用例把这一点钉成 `languages` 是空数组，而不是一行 `NaN`）。
     if (bytes > 0) {
       const language = languageOf(path);
       this.languageBytes.set(language, (this.languageBytes.get(language) ?? 0) + bytes);
@@ -487,7 +503,11 @@ class MetadataScanner {
 
   /**
    * 语言分布：字节降序，同字节按语言名升序（**与归档顺序无关**，因此两次解析同一份归档
-   * 逐字节一致）。占比的分母是**全部文件**的字节合计。
+   * 逐字节一致）。
+   *
+   * **分母 = `languageBytes` 各桶之和 = 非空文件的字节合计**（0 字节文件在 `addFile` 里
+   * 就被排除，见那里的说明）。两条可判定的后果：各桶 `ratio` 之和恰好是 `1`；`entries`
+   * 为空时**没有任何除法发生**（返回空数组，而不是 `NaN`）。
    */
   private languageDistribution(): { name: string; bytes: number; ratio: number }[] {
     const entries = [...this.languageBytes.entries()].map(([name, bytes]) => ({ name, bytes }));

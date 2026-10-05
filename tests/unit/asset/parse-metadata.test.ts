@@ -387,7 +387,7 @@ describe('Task 6 · 元数据解析', () => {
   describe('Step 4：语言分布（按扩展名归类、按字节占比）', () => {
     const bytesOf = (size: number): Buffer => Buffer.alloc(size, 0x61);
 
-    it('按扩展名归类，占比的分母是全部文件的字节合计', async () => {
+    it('按扩展名归类，占比的分母是**非空文件**的字节合计（0 字节文件不参与，见下一条）', async () => {
       const bytes = buildZip([
         { name: 'src/a.ts', data: bytesOf(100) },
         { name: 'src/b.js', data: bytesOf(300) },
@@ -430,6 +430,32 @@ describe('Task 6 · 元数据解析', () => {
 
       const allEmpty = buildZip([{ name: 'a.ts', data: Buffer.alloc(0) }]);
       expect((await parseOf(allEmpty, 'zip')).languages).toEqual([]);
+    });
+
+    it('分母是**非空文件**的字节合计（口径写成可判定的行为，不是注释里的一句话）', async () => {
+      // 修复轮 1 的更正：实现一直是 `bytes > 0` 才累计（值不变），错的是**契约的表述**
+      // ——「分母是所有文件的字节合计」会让下一个读者以为空文件也在分母里。
+      // 这条用例把正确口径的三条后果钉住：
+      //   ⓐ 空文件不建桶 ⇒ 分布里不会多出一行 0 字节的记录；
+      //   ⓑ 分母只由非空文件构成 ⇒ 各桶 `ratio` 之和**恰好**是 1；
+      //   ⓒ 一份**只有**空文件的归档 ⇒ 空数组：若真把空文件算进分母，这里会是 0/0 = NaN。
+      const mixed = buildZip([
+        { name: 'a.ts', data: Buffer.alloc(0) },
+        { name: 'b.js', data: bytesOf(20) },
+        { name: 'c.ts', data: Buffer.alloc(0) },
+      ]);
+      const languages = (await parseOf(mixed, 'zip')).languages;
+      expect(languages).toEqual([{ name: 'JavaScript', bytes: 20, ratio: 1 }]);
+      expect(languages.reduce((sum, entry) => sum + entry.ratio, 0)).toBe(1);
+      expect(languages.every((entry) => Number.isFinite(entry.ratio))).toBe(true);
+
+      const allEmpty = buildZip([
+        { name: 'a.ts', data: Buffer.alloc(0) },
+        { name: 'b.js', data: Buffer.alloc(0) },
+      ]);
+      const empty = (await parseOf(allEmpty, 'zip')).languages;
+      expect(empty).toEqual([]); // 不是 [{ name: 'JavaScript', bytes: 0, ratio: NaN }]
+      expect(empty.every((entry) => Number.isFinite(entry.ratio))).toBe(true);
     });
 
     it('排序：字节降序；字节相同时按语言名升序（与归档顺序无关）', async () => {
