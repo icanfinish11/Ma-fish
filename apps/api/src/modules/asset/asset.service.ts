@@ -312,13 +312,15 @@ const CLEANUP_RETRY_DELAY_MS = 25;
  *
  * 审计行是 append-only 的：写进去就删不掉（`infra/db/apply-grants.sql`）。因此那一列**不能**
  * 是原始消息（可能带制品卷路径），也不能是**无界**的取值空间——否则「按理由分流」这件事
- * 会在数据层退化成「一行一个值」。这里给出三个有界取值：
+ * 会在数据层退化成「一行一个值」。取值只有两种：
  *
  * - 错误对象上的 `code`（`EACCES` / `EBUSY` / `ENOSPC` / `EIO`…）：`node:fs` 的错误都带它，
  *   而这正是本地卷上「删不掉」的全部现实理由；
- * - 网络型存储将来会把 HTTP 状态码放在 `status`/`statusCode` 上 ⇒ 归一成 `http:<状态码>`；
  * - 其余一律 `Error`。**刻意不返回 `error.name`**：那可以是任何自定义名字，取值空间无界，
- *   而 `errorName` 那一列已经如实地记着它了。
+ *   而 `errorName` 那一列已经如实地记着它了。也**刻意不**按 HTTP 状态码再分一档：
+ *   今天没有任何存储实现会抛带状态码的错误（本地卷不会），那会是一段**不可达也测不到**的
+ *   分支（C16）。网络型存储落地时，那个实现要么带 `code`（多数 SDK 都带），
+ *   要么那时再按它的错误形状加一档——**那时它才是被依赖逼出来的**。
  *
  * 今天唯一的调用点是 {@link AssetService.delete} 的失败分支（C16：不提前抽象），
  * 用例通过「注入带 `code` 的失败」把它钉住（`ingest.test.ts` 的删除失败处置组）。
@@ -326,12 +328,6 @@ const CLEANUP_RETRY_DELAY_MS = 25;
 function cleanupFailureClass(error: Error): string {
   const code = (error as { code?: unknown }).code;
   if (typeof code === 'string' && /^[A-Za-z0-9_.-]{1,32}$/.test(code)) return code;
-
-  const status = (error as { status?: unknown }).status ?? (error as { statusCode?: unknown }).statusCode;
-  if (typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599) {
-    return `http:${String(status)}`;
-  }
-
   return 'Error';
 }
 
