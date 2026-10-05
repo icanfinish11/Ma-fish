@@ -462,4 +462,162 @@ describe('Task 6 · 元数据解析', () => {
       ]);
     });
   });
+
+  describe('Step 5：依赖清单（纯文本解析）', () => {
+    const text = (value: string): Buffer => Buffer.from(value, 'utf8');
+
+    it('package.json：四类依赖都收，版本原样保留', async () => {
+      const bytes = buildZip([
+        {
+          name: 'package.json',
+          data: text(
+            JSON.stringify({
+              name: 'demo',
+              dependencies: { express: '^5.0.0' },
+              devDependencies: { vitest: '5.0.3' },
+              peerDependencies: { react: '>=19' },
+              optionalDependencies: { fsevents: '~2.3.2' },
+            }),
+          ),
+        },
+      ]);
+      expect((await parseOf(bytes, 'zip')).dependencies).toEqual([
+        { ecosystem: 'npm', name: 'express', version: '^5.0.0' },
+        { ecosystem: 'npm', name: 'fsevents', version: '~2.3.2' },
+        { ecosystem: 'npm', name: 'react', version: '>=19' },
+        { ecosystem: 'npm', name: 'vitest', version: '5.0.3' },
+      ]);
+    });
+
+    it('package.json 同名依赖出现在两处 ⇒ 只留第一条（dependencies 胜过 devDependencies）', async () => {
+      const bytes = buildZip([
+        {
+          name: 'package.json',
+          data: text(
+            JSON.stringify({
+              dependencies: { 'left-pad': '^1.3.0' },
+              devDependencies: { 'left-pad': '^1.2.0' },
+            }),
+          ),
+        },
+      ]);
+      expect((await parseOf(bytes, 'zip')).dependencies).toEqual([
+        { ecosystem: 'npm', name: 'left-pad', version: '^1.3.0' },
+      ]);
+    });
+
+    it('package.json 不是合法 JSON ⇒ 不产出依赖，但**整份解析照常成功**', async () => {
+      const bytes = buildZip([
+        { name: 'package.json', data: text('{ 这不是 JSON') },
+        { name: 'src/index.ts', data: text('export const x = 1;\n') },
+      ]);
+      const metadata = await parseOf(bytes, 'zip');
+      expect(metadata.dependencies).toEqual([]);
+      expect(metadata.fileTree.map((file) => file.path)).toContain('package.json');
+    });
+
+    it('requirements.txt：注释、-r 行、extras、环境标记、各种版本符', async () => {
+      const bytes = buildZip([
+        {
+          name: 'requirements.txt',
+          data: text(
+            [
+              '# 注释行',
+              '',
+              '-r base.txt',
+              '--index-url https://example.invalid/simple',
+              'flask==2.0.1',
+              'requests[security]>=2.0 ; python_version < "3.8"',
+              'numpy',
+              '  django~=4.2  ',
+            ].join('\n'),
+          ),
+        },
+      ]);
+      expect((await parseOf(bytes, 'zip')).dependencies).toEqual([
+        { ecosystem: 'pypi', name: 'django', version: '~=4.2' },
+        { ecosystem: 'pypi', name: 'flask', version: '==2.0.1' },
+        { ecosystem: 'pypi', name: 'numpy', version: '' },
+        { ecosystem: 'pypi', name: 'requests', version: '>=2.0' },
+      ]);
+    });
+
+    it('go.mod：require 块与单行都收，`// indirect` 跳过，module/go 行不算依赖', async () => {
+      const bytes = buildZip([
+        {
+          name: 'go.mod',
+          data: text(
+            [
+              'module example.com/demo',
+              '',
+              'go 1.22',
+              '',
+              'require github.com/single/pkg v1.0.0',
+              '',
+              'require (',
+              '\tgithub.com/foo/bar v1.2.3',
+              '\tgithub.com/baz/qux v0.9.0 // indirect',
+              ')',
+              '',
+            ].join('\n'),
+          ),
+        },
+      ]);
+      expect((await parseOf(bytes, 'zip')).dependencies).toEqual([
+        { ecosystem: 'go', name: 'github.com/foo/bar', version: 'v1.2.3' },
+        { ecosystem: 'go', name: 'github.com/single/pkg', version: 'v1.0.0' },
+      ]);
+    });
+
+    it('三个清单同时存在 ⇒ 三个 ecosystem 都在；嵌套路径的清单也认', async () => {
+      const bytes = buildZip([
+        { name: 'package.json', data: text(JSON.stringify({ dependencies: { a: '1' } })) },
+        { name: 'backend/requirements.txt', data: text('b==2') },
+        { name: 'tools/go.mod', data: text('module m\n\nrequire c v3\n') },
+      ]);
+      expect((await parseOf(bytes, 'zip')).dependencies).toEqual([
+        { ecosystem: 'go', name: 'c', version: 'v3' },
+        { ecosystem: 'npm', name: 'a', version: '1' },
+        { ecosystem: 'pypi', name: 'b', version: '==2' },
+      ]);
+    });
+
+    it('名字不是清单的文件不会被当成清单（`my-package.json` / `requirements.txt.bak`）', async () => {
+      const bytes = buildZip([
+        { name: 'my-package.json', data: text(JSON.stringify({ dependencies: { x: '1' } })) },
+        { name: 'requirements.txt.bak', data: text('y==1') },
+      ]);
+      expect((await parseOf(bytes, 'zip')).dependencies).toEqual([]);
+    });
+
+    it('清单文件数上限 8：第 9 个之后的清单一个字节都不读', async () => {
+      const bytes = buildZip(
+        Array.from({ length: 10 }, (_unused, index) => ({
+          name: `p${index}/package.json`,
+          data: text(JSON.stringify({ dependencies: { [`dep${index}`]: '1.0.0' } })),
+        })),
+      );
+      const names = (await parseOf(bytes, 'zip')).dependencies.map((dependency) => dependency.name);
+      expect(names).toEqual(['dep0', 'dep1', 'dep2', 'dep3', 'dep4', 'dep5', 'dep6', 'dep7']);
+    });
+
+    it('依赖条数上限 500（超出部分丢弃）', async () => {
+      const many: Record<string, string> = {};
+      for (let index = 0; index < 600; index++) many[`pkg${String(index).padStart(4, '0')}`] = '1.0.0';
+      const bytes = buildZip([{ name: 'package.json', data: text(JSON.stringify({ dependencies: many })) }]);
+      const dependencies = (await parseOf(bytes, 'zip')).dependencies;
+      expect(dependencies).toHaveLength(500);
+      expect(dependencies[0]?.name).toBe('pkg0000');
+      expect(dependencies[499]?.name).toBe('pkg0499');
+    });
+
+    it('tar.gz 侧同一判据', async () => {
+      const bytes = buildTarGz([
+        { name: 'package.json', data: text(JSON.stringify({ dependencies: { only: '1.0.0' } })) },
+      ]);
+      expect((await parseOf(bytes, 'tar.gz')).dependencies).toEqual([
+        { ecosystem: 'npm', name: 'only', version: '1.0.0' },
+      ]);
+    });
+  });
 });

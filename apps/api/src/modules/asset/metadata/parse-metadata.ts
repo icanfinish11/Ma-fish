@@ -183,11 +183,44 @@ const LANGUAGE_BY_EXTENSION: Readonly<Record<string, string>> = Object.freeze({
 /** 未归类语言的桶名（设计 D9：「未知归 `other`」）。 */
 const OTHER_LANGUAGE = 'other';
 
+/**
+ * 会被当作**依赖清单**读进来的文件名（精确匹配最后一段）。
+ *
+ * 只有这三个：设计 D9 点名了 `package.json` / `requirements.txt` / `go.mod`，
+ * 「等」字没有兑现成更多格式（C16：没有第二个调用方要它们，而每加一种格式就多一份解析器）。
+ */
+const MANIFEST_ECOSYSTEM_BY_NAME: Readonly<Record<string, string>> = Object.freeze({
+  'package.json': 'npm',
+  'requirements.txt': 'pypi',
+  'go.mod': 'go',
+});
+
+/**
+ * 清单文件的读取上限（字节）与**个数**上限。
+ *
+ * 64 KiB：`package.json` 里塞进 500 个依赖也只有十几 KB，64 KiB 足够；而它同时挡住了
+ * 「把一份 100 MB 的 package.json 当清单读进来」这一类。
+ * 8 个：清单是**按归档顺序**读的，前面几个就是项目自己的那一份；一个 vendored
+ * `node_modules` 里可能有上万个 `package.json`，没有个数上限就等于没有上限。
+ * 超出的清单**一个字节都不读**（不是读完丢掉）。
+ */
+const MANIFEST_READ_BYTES = 64 * 1024;
+const MAX_MANIFEST_FILES = 8;
+
+/**
+ * 依赖条数上限。
+ *
+ * 500：与文件树同量级（`MAX_TREE_ENTRIES`），一个正常项目的直接依赖远小于这个数；
+ * 没有它，一份 20000 条 `requirements.txt` 会把元数据整份撑大（上限仍是 D6 的 20000 条）。
+ */
+const MAX_DEPENDENCIES = 500;
+
 /** 一个条目需要读内容时给出的请求（`cap` 是允许读进内存的字节数）。 */
-interface ContentRequest {
-  readonly kind: 'readme';
-  readonly cap: number;
-}
+type ContentRequest =
+  /** README：第一个匹配。 */
+  | { readonly kind: 'readme'; readonly cap: number }
+  /** 依赖清单：`ecosystem` 由文件名决定（`need` 里算一次）。 */
+  | { readonly kind: 'manifest'; readonly ecosystem: string; readonly cap: number };
 
 /**
  * 一趟扫描的**唯一**累加器：两个 walker 都只经它记账。
@@ -204,6 +237,11 @@ class MetadataScanner {
   private treeTruncated = false;
   /** 语言 → 字节合计（全量累计，见 `addFile`）。 */
   private readonly languageBytes = new Map<string, number>();
+  /** 已经读进来的清单个数（`MAX_MANIFEST_FILES` 的账）。 */
+  private manifestFiles = 0;
+  /** 收集到的依赖（去重、限长都在 `addDependencies` 里）。 */
+  private readonly dependencies: { ecosystem: string; name: string; version: string }[] = [];
+  private readonly dependencyKeys = new Set<string>();
   /** README 的原始字节；`null` = 到扫描结束都没遇到过 README。 */
   private readme: Buffer | null = null;
 
@@ -229,15 +267,44 @@ class MetadataScanner {
    * 调用时机是**条目开始处**，且两个 walker 都是**顺序**处理的（读完上一条才处理下一条），
    * 因此这里的判断与 `take` 之间不会插进别的条目。
    */
-  need(path: string): ContentRequest | null {
+  need(path: string, bytes: number): ContentRequest | null {
     // 「第一个匹配」按**归档顺序**：先到先得，后面的 README 一律不再读。
     if (this.readme === null && isReadmePath(path)) return { kind: 'readme', cap: README_READ_BYTES };
+    if (bytes > 0 && this.manifestFiles < MAX_MANIFEST_FILES) {
+      const ecosystem = MANIFEST_ECOSYSTEM_BY_NAME[baseNameOf(path)];
+      if (ecosystem !== undefined) return { kind: 'manifest', ecosystem, cap: MANIFEST_READ_BYTES };
+    }
     return null;
   }
 
   /** 条目内容到手（**可能被截断到 `request.cap`**）。 */
   take(request: ContentRequest, content: Buffer): void {
-    if (request.kind === 'readme') this.readme = content;
+    if (request.kind === 'readme') {
+      this.readme = content;
+      return;
+    }
+    this.manifestFiles += 1;
+    const parsed = parseManifest(request.ecosystem, content);
+    if (parsed === null) return; // 解析不了就是解析不了：不产出依赖，也不让整份解析失败
+    this.addDependencies(request.ecosystem, parsed.dependencies);
+  }
+
+  /**
+   * 收集依赖：**按 `ecosystem|name` 去重，先到先得**，总数封顶 `MAX_DEPENDENCIES`。
+   *
+   * 去重是必须的：npm 允许同一个包同时出现在 `dependencies` 与 `devDependencies`
+   * （两处版本可以不同），不去重就会在列表里出现两行同名不同版本的记录。
+   * 先到先得 ⇒ `dependencies` 胜过 `devDependencies`（前者是运行期真正要装的）。
+   * 封顶之后**不再收集**（不是收集完再截断）——上限的意义就是别把它收进内存。
+   */
+  private addDependencies(ecosystem: string, items: readonly { name: string; version: string }[]): void {
+    for (const item of items) {
+      if (this.dependencies.length >= MAX_DEPENDENCIES) return;
+      const key = `${ecosystem}\u0000${item.name}`;
+      if (this.dependencyKeys.has(key)) continue;
+      this.dependencyKeys.add(key);
+      this.dependencies.push({ ecosystem, name: item.name, version: item.version });
+    }
   }
 
   /** 装配结果。 */
@@ -246,10 +313,21 @@ class MetadataScanner {
       readmeExcerpt: this.readme === null ? null : excerptOf(this.readme),
       fileTree: this.tree,
       languages: this.languageDistribution(),
-      dependencies: [],
+      dependencies: this.dependencyList(),
       completeness: 0,
       fileTreeTruncated: this.treeTruncated,
     };
+  }
+
+  /**
+   * 依赖列表：按 `(ecosystem, name)` 升序——**与清单的出现顺序无关**，因此同一份归档
+   * 解析两次逐字节一致（去重是「先到先得」，排序只发生在最后）。
+   */
+  private dependencyList(): { ecosystem: string; name: string; version: string }[] {
+    return [...this.dependencies].sort((left, right) => {
+      if (left.ecosystem !== right.ecosystem) return compareNames(left.ecosystem, right.ecosystem);
+      return compareNames(left.name, right.name);
+    });
   }
 
   /**
@@ -304,6 +382,111 @@ function excerptOf(content: Buffer): string {
   return content.toString('utf8').slice(0, README_EXCERPT_CHARS);
 }
 
+// ── 依赖清单的**纯文本**解析（C2：只做字符串/JSON 解析，绝不执行）────────────────
+//
+// 三个解析器都是纯函数（字符串进、数组出），因此它们可以脱离归档单独读懂、单独测。
+// 「绝不执行」在这里是**结构性**的：输入是 `Buffer` 解出来的字符串，没有任何
+// require / eval / import / 动态执行的位置。
+
+/** 一个清单解析出来的东西。`null` = **解析不了**（今天只有「package.json 不是 JSON」一种）。 */
+interface ManifestFacts {
+  readonly dependencies: readonly { name: string; version: string }[];
+}
+
+/** 按 ecosystem 分发到对应的纯文本解析器。 */
+function parseManifest(ecosystem: string, content: Buffer): ManifestFacts | null {
+  const text = content.toString('utf8');
+  if (ecosystem === 'npm') return parsePackageJson(text);
+  if (ecosystem === 'pypi') return { dependencies: parseRequirements(text) };
+  return { dependencies: parseGoMod(text) };
+}
+
+/**
+ * `package.json`：只取四类依赖字段，版本**原样**保留（`^5.0.0` / `>=19` 都是原文）。
+ *
+ * 解析用 `JSON.parse`——**这是数据解析，不是执行**（没有 `require`、没有 `eval`）。
+ * 非法 JSON（或顶层不是对象）⇒ 返回 `null`，调用方据此不产出依赖：
+ * 一份坏掉的清单不该变成 0 条依赖（那与「清单里确实没有依赖」不是同一件事）。
+ */
+function parsePackageJson(text: string): ManifestFacts | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+
+  const record = parsed as Record<string, unknown>;
+  const dependencies: { name: string; version: string }[] = [];
+  // 顺序有意如此：`dependencies` 排在前面 ⇒ 同名依赖去重时它赢（见 `addDependencies`）。
+  for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+    const group = record[field];
+    if (typeof group !== 'object' || group === null || Array.isArray(group)) continue;
+    for (const [name, version] of Object.entries(group as Record<string, unknown>)) {
+      if (typeof version === 'string') dependencies.push({ name, version });
+    }
+  }
+  return { dependencies };
+}
+
+/**
+ * `requirements.txt`：逐行文本解析（PEP 508 的**常用子集**）。
+ *
+ * 处理：`#` 注释、空行、以 `-` 开头的选项行（`-r` / `-e` / `--index-url`）、
+ * `name[extras]` 的 extras、环境标记（`;` 之后的部分丢弃）、版本符原样保留。
+ * **不处理**：行继续符（末尾 `\`）、`--hash`、`-e <vcs url>` 里的包名——
+ * 这几类在产物里都落到「跳过」或「版本为空」，不会让解析失败（据实记载）。
+ */
+function parseRequirements(text: string): { name: string; version: string }[] {
+  const dependencies: { name: string; version: string }[] = [];
+  for (const rawLine of text.split('\n')) {
+    const line = (rawLine.split('#')[0] ?? '').trim();
+    if (line.length === 0 || line.startsWith('-')) continue;
+    const match = /^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*(.*)$/.exec(line);
+    if (match === null) continue;
+    const name = match[1];
+    if (name === undefined || name.length === 0) continue;
+    const specifier = (match[3] ?? '').split(';')[0] ?? '';
+    dependencies.push({ name, version: specifier.trim() });
+  }
+  return dependencies;
+}
+
+/**
+ * `go.mod`：只认 `require`（块形式与单行形式）。
+ *
+ * `// indirect` 的条目**跳过**：它们是间接依赖，在 `go.mod` 里由这一行注释自己标出来；
+ * 预览资料要的是「这个项目用了什么」，把传递闭包铺进去只会淹掉它（据实记载的一条取舍）。
+ * `module` / `go` / `toolchain` / `replace` 等行一概不算依赖。
+ */
+function parseGoMod(text: string): { name: string; version: string }[] {
+  const dependencies: { name: string; version: string }[] = [];
+  let inRequireBlock = false;
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.trim();
+    if (line.length === 0 || line.startsWith('//')) continue;
+    if (line === 'require (') {
+      inRequireBlock = true;
+      continue;
+    }
+    if (inRequireBlock && line === ')') {
+      inRequireBlock = false;
+      continue;
+    }
+    const body = inRequireBlock
+      ? line
+      : line.startsWith('require ')
+        ? line.slice('require '.length).trim()
+        : null;
+    if (body === null || body.includes('// indirect')) continue;
+    const [name, version] = body.split(/\s+/);
+    if (name === undefined || name.length === 0) continue;
+    dependencies.push({ name, version: version ?? '' });
+  }
+  return dependencies;
+}
+
 /** zip：只读中央目录 + 按需解压**限长**的条目内容。 */
 function scanZip(reader: RandomAccessReader, totalSize: number, scanner: MetadataScanner): Promise<void> {
   return new Promise<void>((resolve, reject) => {
@@ -330,7 +513,7 @@ function scanZip(reader: RandomAccessReader, totalSize: number, scanner: Metadat
           return;
         }
         scanner.addFile(entry.fileName, entry.uncompressedSize);
-        const request = scanner.need(entry.fileName);
+        const request = scanner.need(entry.fileName, entry.uncompressedSize);
         if (request === null) {
           advance(opened);
           return;
@@ -416,7 +599,7 @@ function scanTarGz(reader: RandomAccessReader, archiveBytes: number, scanner: Me
       }
       const bytes = entry.size ?? 0;
       scanner.addFile(entry.path, bytes);
-      const request = scanner.need(entry.path);
+      const request = scanner.need(entry.path, bytes);
       if (request === null) {
         entry.resume();
         return;
