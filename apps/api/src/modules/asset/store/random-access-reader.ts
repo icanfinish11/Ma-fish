@@ -313,6 +313,10 @@ export class EncryptedArtifactReader extends EventEmitter implements RandomAcces
    *
    * **存储读取与解密在同一侧**：命中时两者都不发生。分开写（先无条件 `getRange` 再看
    * memo）会把「每半条记录读一整块」的成本留下——那正是 Ruling 1 要消掉的东西。
+   *
+   * 一处据实记载（memo 的边界）：**并发的**同块读会各自解密一次（两个调用都先看到未命中）。
+   * 这不是缺陷，因为本类的消费方都是顺序的——yauzl 等每次回调返回后才发下一次读、
+   * gunzip 顺序拉取；只是别把「命中」当成并发语义上的保证。
    */
   private async plaintextOf(position: number, block: BlockSpan): Promise<Buffer> {
     const cached = this.recent;
