@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Readable } from 'node:stream';
 import { createGunzip } from 'node:zlib';
 import { fileTypeFromBuffer } from 'file-type';
@@ -15,6 +15,7 @@ import {
   checkZipLink,
 } from '@vca/api/modules/asset/archive/limits.js';
 import { SNIFF_BYTES, sniffArchive } from '@vca/api/modules/asset/archive/sniff.js';
+import { inspectZip } from '@vca/api/modules/asset/archive/zip-inspector.js';
 import { EncryptedArtifactReader } from '@vca/api/modules/asset/store/random-access-reader.js';
 // 制品（密文外壳）的构造与观察住在 Task 3 的共享夹具里：Task 4 的输入是
 // `EncryptedArtifactReader`，因此这里的「样本」是**先加密成制品、再打开读取器**。
@@ -307,5 +308,138 @@ describe('D6 路径与链接：绝对路径 / .. 段 / 反斜杠穿越 / symlink
     expect(checkEntry({ name: 'a.txt', typeflag: '2' })).not.toBeNull();
     expect(checkEntry({ name: 'a.txt', externalFileAttributes: (0o120777 << 16) >>> 0 })).not.toBeNull();
     expect(checkEntry({ name: 'a.txt', externalFileAttributes: (0o100644 << 16) >>> 0 })).toBeNull();
+  });
+});
+
+/** 用例里的拒绝理由（`ok: true` 时为空串）——不这么收窄就得每个断言里写一遍 as。 */
+function reasonOf(result: { ok: true } | { ok: false; reason: string }): string {
+  return result.ok ? '' : result.reason;
+}
+
+describe('zip：只读中央目录 + 解析器抛错计为拒绝（D6 的两条实现约束、C19）', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * 直接调 inspector（不做嗅探）：这些用例问的是「zip 这一条 inspector 的判别力」。
+   * 块大小取 64 KiB——100 MiB 的炸弹只有 1600 块，索引不会喧宾夺主。
+   */
+  async function inspectZipOf(
+    plaintext: Buffer,
+    limits = ARCHIVE_LIMITS,
+  ): Promise<{ result: { ok: true } | { ok: false; reason: string }; store: MemoryStore }> {
+    const { store, reader } = await openPlaintext(plaintext, { chunkSize: 64 * 1024 });
+    return { result: await inspectZip(reader, reader.plaintextLength, limits), store };
+  }
+
+  it('合法 zip 放行（反向用例）', async () => {
+    const { result } = await inspectZipOf(sampleBytes('ok.zip'));
+    expect(result).toEqual({ ok: true });
+  });
+
+  it('zip-slip：yauzl 在中央目录阶段抛错 ⇒ **返回拒绝**，不是异常、不是崩溃', async () => {
+    const { result } = await inspectZipOf(sampleBytes('zip-slip.zip'));
+    expect(result.ok).toBe(false);
+    expect(reasonOf(result)).toContain('invalid relative path');
+  });
+
+  it('symlink：由**我们自己的**外部属性检查拒掉（yauzl 自带的 zip-slip 防护不覆盖它）', async () => {
+    const { result } = await inspectZipOf(sampleBytes('symlink.zip'));
+    expect(result.ok).toBe(false);
+    expect(reasonOf(result)).toContain('符号链接');
+    expect(reasonOf(result)).toContain('120777');
+  });
+
+  it('炸弹：仅凭中央目录就拒（压缩比），且**一个条目数据字节都没解压**', async () => {
+    const openReadStream = vi.spyOn(yauzl.ZipFile.prototype, 'openReadStream');
+    const { result } = await inspectZipOf(sampleBytes('bomb.zip'));
+    expect(result.ok).toBe(false);
+    expect(reasonOf(result)).toContain('压缩比');
+    expect(openReadStream).not.toHaveBeenCalled();
+  });
+
+  it('flood：第 20,001 条触发条目数上限（并且不会把调用栈打爆）', async () => {
+    const { result } = await inspectZipOf(sampleBytes('flood.zip'));
+    expect(result.ok).toBe(false);
+    expect(reasonOf(result)).toContain('条目数');
+    expect(reasonOf(result)).toContain('20001');
+  });
+
+  it('C19 验收：所有**真的 zip** 样本走完，`openReadStream` **一次都没被调用**', async () => {
+    const openReadStream = vi.spyOn(yauzl.ZipFile.prototype, 'openReadStream');
+    // `fake-mime.zip` 的内容是 PNG（名字里带 .zip 而已），它根本走不到 zip 解析器，
+    // 因此在「zip 解析器不解压数据」这条断言里不属于样本集。
+    const zipSamples = ARCHIVE_SAMPLES.filter(
+      (sample) => sample.name.endsWith('.zip') && sample.name !== 'fake-mime.zip',
+    );
+    expect(zipSamples).toHaveLength(5);
+    for (const sample of zipSamples) {
+      await inspectZipOf(sample.bytes());
+    }
+    expect(openReadStream).not.toHaveBeenCalled();
+  });
+
+  it('累计未压缩大小：中心目录自称 1.1 GiB ⇒ 用**真实阈值**拒绝（而压缩比那条并不超限）', async () => {
+    const zip = buildZip([
+      {
+        name: 'huge.bin',
+        data: Buffer.from('tiny'),
+        method: 8,
+        declaredUncompressedSize: 1_100_000_000,
+        declaredCompressedSize: 12_000_000,
+      },
+    ]);
+    const { result } = await inspectZipOf(zip);
+    expect(result.ok).toBe(false);
+    expect(reasonOf(result)).toContain('累计未压缩大小');
+    // 判别力必须落在大小的那一条上：这条样本的压缩比是 91.7:1，远低于 100:1 的上限
+    expect(1_100_000_000 / 12_000_000).toBeLessThan(ARCHIVE_LIMITS.maxCompressionRatio);
+  });
+
+  it('条目数边界（注入小上限）：恰好上限放行，多一条拒绝', async () => {
+    const three = buildZip([{ name: 'a' }, { name: 'b' }, { name: 'c' }]);
+    expect((await inspectZipOf(three, { ...ARCHIVE_LIMITS, maxEntries: 3 })).result).toEqual({ ok: true });
+    expect((await inspectZipOf(three, { ...ARCHIVE_LIMITS, maxEntries: 2 })).result.ok).toBe(false);
+  });
+
+  it('累计大小边界（注入小上限）：恰好上限放行，多 1 字节拒绝', async () => {
+    const zip = buildZip([{ name: 'a', data: Buffer.alloc(100) }]);
+    expect((await inspectZipOf(zip, { ...ARCHIVE_LIMITS, maxTotalUncompressedBytes: 100 })).result).toEqual({
+      ok: true,
+    });
+    expect((await inspectZipOf(zip, { ...ARCHIVE_LIMITS, maxTotalUncompressedBytes: 99 })).result.ok).toBe(false);
+  });
+
+  it('压缩比边界（真实阈值）：恰好 100:1 放行，多 1 字节拒绝', async () => {
+    const atLimit = buildZip([
+      { name: 'a', method: 8, declaredUncompressedSize: 1000, declaredCompressedSize: 10 },
+    ]);
+    const overLimit = buildZip([
+      { name: 'a', method: 8, declaredUncompressedSize: 1001, declaredCompressedSize: 10 },
+    ]);
+    expect((await inspectZipOf(atLimit)).result).toEqual({ ok: true });
+    const over = (await inspectZipOf(overLimit)).result;
+    expect(over.ok).toBe(false);
+    expect(reasonOf(over)).toContain('压缩比');
+  });
+
+  it('反斜杠条目名：解析器**拒绝**而不是悄悄规范化（默认 strictFileNames 会改成 `a/b`）', async () => {
+    const zip = buildZip([{ name: 'dir\\file.txt', data: Buffer.from('x') }]);
+    const { result } = await inspectZipOf(zip);
+    expect(result.ok).toBe(false);
+    expect(reasonOf(result)).toContain('invalid characters');
+  });
+
+  it('解析器吐回的条目名会被转义：拒绝理由里不出现裸控制字符', async () => {
+    // 反斜杠会让 yauzl 抛 `invalid characters in fileName: <名字>`。
+    // 名字里塞换行需要一个前提：必须置「文件名是 UTF-8」标志位，否则 yauzl 按 CP437
+    // 解码，字节 0x0A 会变成 `◙` 而不是换行（探针实测）——那样这条用例就测了个寂寞。
+    const zip = buildZip([{ name: 'a\nb\\c.txt', utf8: true, data: Buffer.from('x') }]);
+    const { result } = await inspectZipOf(zip);
+    expect(result.ok).toBe(false);
+    expect(reasonOf(result)).toContain('invalid characters');
+    expect(reasonOf(result)).toContain('\\x0a');
+    expect(reasonOf(result)).not.toContain('\n');
   });
 });

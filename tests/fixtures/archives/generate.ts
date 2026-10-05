@@ -65,6 +65,14 @@ export interface ZipEntrySpec {
   declaredUncompressedSize?: number;
   /** 头部与中央目录**声明**的压缩后大小（默认 = 实际载荷长度）。 */
   declaredCompressedSize?: number;
+  /**
+   * 置上「文件名是 UTF-8」的标志位（通用位 11）。
+   *
+   * 需要它，是因为 yauzl 在标志位未置时会按 **CP437** 解码名字：字节 `0x0A` 会变成
+   * `◙`（U+25D9）而不是换行。想构造「条目名里带真控制字符、且该字符会进入解析器错误信息」
+   * 的样本，就必须置这一位（探针实测，见 evidence/t4-probe-yauzl-names.txt）。
+   */
+  utf8?: boolean;
 }
 
 /**
@@ -87,11 +95,13 @@ export function buildZip(entries: readonly ZipEntrySpec[]): Buffer {
     const uncompressedSize = entry.declaredUncompressedSize ?? data.length;
     const checksum = crc32(data);
     const externalAttributes = ((entry.unixMode ?? 0o100644) << 16) >>> 0;
+    /** 通用位 11 = 文件名是 UTF-8（否则读取方按 CP437 解码，控制字符会变成图形字符）。 */
+    const flags = entry.utf8 === true ? 0x0800 : 0;
 
     const local = Buffer.alloc(30 + name.length);
     local.writeUInt32LE(0x04034b50, 0); // 本地文件头签名
     local.writeUInt16LE(20, 4); // version needed
-    local.writeUInt16LE(0, 6); // flags
+    local.writeUInt16LE(flags, 6); // flags
     local.writeUInt16LE(method, 8);
     local.writeUInt32LE(0, 10); // dos time
     local.writeUInt32LE(checksum, 14);
@@ -106,7 +116,7 @@ export function buildZip(entries: readonly ZipEntrySpec[]): Buffer {
     central.writeUInt32LE(0x02014b50, 0); // 中央目录签名
     central.writeUInt16LE(0x031e, 4); // version made by：Unix + 3.0
     central.writeUInt16LE(20, 6);
-    central.writeUInt16LE(0, 8);
+    central.writeUInt16LE(flags, 8);
     central.writeUInt16LE(method, 10);
     central.writeUInt32LE(0, 12);
     central.writeUInt32LE(checksum, 16);

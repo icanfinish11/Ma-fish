@@ -111,6 +111,22 @@ export function checkEntry(facts: ArchiveEntryFacts): string | null {
   );
 }
 
+/**
+ * 把一段**来自解析器**的错误信息里的控制字符转义掉。
+ *
+ * 为什么要这一步：yauzl / tar 抛出的消息里会带上**条目名**（例如
+ * `invalid characters in fileName: <名字>`），而条目名是攻击者可控字节。
+ * 一个含换行的名字能把一行日志拆成两行（日志伪造），含 ESC 的名字能在终端里改显示。
+ * 本模块的判据自己拼名字时用 `JSON.stringify`，但解析器的消息只能在这里收口——
+ * 两个 inspector 的「解析失败」分支共用它，规则因此只有一处。
+ */
+export function sanitizeReason(text: string): string {
+  return text.replaceAll(/[\u0000-\u001f\u007f]/g, (character) => {
+    const code = character.codePointAt(0) ?? 0;
+    return `\\x${code.toString(16).padStart(2, '0')}`;
+  });
+}
+
 /** 条目数上限（恰好 `maxEntries` 放行）。 */
 export function checkEntryCount(count: number, limits: ArchiveLimits = ARCHIVE_LIMITS): string | null {
   if (count <= limits.maxEntries) return null;
