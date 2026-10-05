@@ -65,10 +65,10 @@ const frozenRef = (userId: string): AccountRef =>
  *
  * | 结论 | 落点 | 谁看着它 |
  * |---|---|---|
- * | C25/D8 余额扣减的并发权威是**条件更新的受影响行数** | `applyBalances` | 「两笔并发各冻结 6000」+ 那条确定性用例（`stage === 'conditional-update'`） |
- * | C26/D9 幂等键是数据库**唯一约束**，三态：重放 / 409 / 新键 | `post` 的 findUnique 比腿 + `isIdempotencyConflict` | 幂等①②③ |
+ * | C25/D8 余额扣减的并发权威是**条件更新的受影响行数** | `applyBalances` | 「两笔并发各冻结 6000」+ 那条确定性用例（`stage === 'conditional-update'`）+ 「解冻」那条（`USER_FROZEN` 那一侧只有它看着） |
+ * | C26/D9 幂等键是数据库**唯一约束**，三态：重放 / 409 / 新键 | `postLegs` 的 findUnique 比腿 + `isIdempotencyConflict` | 幂等①②③ |
  * | C28 「应用侧显式平衡断言」是唯一稳定的错误通道 | **`postLegs` 头部**那次 `assertBalanced` | 「直接腿入口」三条用例（探针 p7'：删掉它 ⇒ ② 变红） |
- * | D10 一笔过账一行审计，**写在同一个事务里** | `post` 末尾的 `audit.record(…, tx)` | 「账本回滚 ⇒ 审计行 0 行」（独立断言） |
+ * | D10 一笔过账一行审计，**写在同一个事务里** | `postLegs` 末尾的 `audit.record(…, tx)` | 「账本回滚 ⇒ 审计行 0 行」（独立断言） |
  *
  * **不要**把延迟约束触发器当主错误通道：实测经 Prisma 7.10.0 时它退化成
  * `DriverAdapterError` 且 `code === undefined`（只有 `cause.code === '23514'`）。
