@@ -20,6 +20,9 @@ import {
 } from './crypto/artifact-format.js';
 import { ChunkEncryptor } from './crypto/chunk-cipher.js';
 import { KEY_RING, type KeyRing } from './crypto/key-ring.js';
+// 待落库记录的**形状**住在它自己的文件里（Task 9）：它与 `AssetVersionService` 共享，
+// 而两边直接互相 import 会构成一个环（`no-circular` 实测抓到过）。理由在那个文件的头部。
+import type { IngestedVersion } from './ingested-version.js';
 import { parseMetadata, type ParsedMetadata } from './metadata/parse-metadata.js';
 import { ARTIFACT_STORE, ArtifactTooLargeError, type ArtifactStore } from './store/artifact-store.port.js';
 import { EncryptedArtifactReader } from './store/random-access-reader.js';
@@ -472,24 +475,6 @@ export interface StoredArtifact {
   readonly key: string;
   readonly bytes: number;
   readonly receipt: ArtifactWriteReceipt;
-}
-
-/**
- * 待落库的版本记录（`finalize` 的返回值；Task 7 的 `persistIngested` 是它唯一的落点）。
- *
- * 字段刻意用「行」的粒度：Task 7 把它铺成 `Asset` / `AssetVersion` / `AssetMetadata` 时
- * 不需要再回到这里补任何东西——特别是 `plaintextBytes`，它是**唯一**那条带外长度的载体。
- * Task 9 起它的生产落点是 {@link AssetService.ingest} 的第三步（此前只有用例调用它）。
- */
-export interface IngestedVersion {
-  /** 制品库对象键（下载路径靠它取对象；**不**出现在 HTTP 响应里）。 */
-  readonly storageKey: string;
-  readonly sha256: string;
-  readonly plaintextBytes: number;
-  readonly keyId: string;
-  readonly fileId: string;
-  readonly kind: ArchiveKind;
-  readonly uploadedById: string | null;
 }
 
 /**

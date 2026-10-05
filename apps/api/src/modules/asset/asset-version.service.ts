@@ -1,7 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../db/prisma.service.js';
+// 待落库记录的**形状**住在它自己的文件里（Task 9）：它与 `AssetService` 共享，而两边直接
+// 互相 import 会构成一个环（`no-circular` 在 `pnpm test` 的 architecture project 里实测抓到过）。
+// 理由与依赖图写在 `ingested-version.ts` 的头部。
+import type { IngestedVersion } from './ingested-version.js';
 import { AssetNotFoundError } from './ownership.service.js';
-import type { IngestedVersion } from './asset.service.js';
 import type { ParsedMetadata } from './metadata/parse-metadata.js';
 
 /**
