@@ -56,10 +56,10 @@ export interface ArchiveEntryFacts {
   typeflag?: string;
 }
 
-/** `S_IFMT`：Unix mode 里「文件类型」那几位。 */
-export const S_IFMT = 0o170000;
+/** `S_IFMT`：Unix mode 里「文件类型」那几位。**不导出**——只有链接判据用它。 */
+const S_IFMT = 0o170000;
 /** `S_IFLNK`：符号链接。 */
-export const S_IFLNK = 0o120000;
+const S_IFLNK = 0o120000;
 
 /**
  * 条目名的一票否决：绝对路径、`..` 段、反斜杠分隔符穿越、空字节。
@@ -83,8 +83,10 @@ export function checkEntryPath(name: string): string | null {
  *
  * **位移只在这里做一次**。探针实测过它的失效形态：生成器忘了移位时，symlink 样本读出来的
  * mode 是 `0`——样本压根没带 `0o120777`，而「必须拒绝」的用例照样绿。
+ * 不导出（C16）：它只有 `checkZipLink` 一个使用者，而那条判据自己的用例
+ * （以及变异探针 M17）已经把这次位移钉住了。
  */
-export function unixModeOf(externalFileAttributes: number): number {
+function unixModeOf(externalFileAttributes: number): number {
   return (externalFileAttributes >>> 16) & 0xffff;
 }
 
