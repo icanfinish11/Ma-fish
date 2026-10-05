@@ -328,6 +328,15 @@ export function validateArchive(reader: RandomAccessReader): Promise<ArchiveVerd
 | `ok.zip` / `ok.tar.gz` | **接受** | **必须有用例**，否则「全部拒绝」的实现也能通过 |
 
 **Steps:**
+- [ ] **Step 0（依赖登记 + 复验）:** 把 `file-type@22.1.1` 与 `tar@7.5.22` **精确版本**登记进 `apps/api`（是 `tar`，**不是** `tar-stream`）。登记后跑 `pnpm install`，再用 **`require.resolve`（从 `apps/api/src` 出发）** 确认两者真的可解析——**不要**以 `node_modules/` 下存在同名目录为准（Task 3 发现：控制器预检探针的残留 `.pnpm` 目录会让「已安装」看起来为真，见预检 §8）。
+- [ ] **Step 0b（末块认证 —— Task 3 复审新增的**强制**要求）:** 归档校验**必须先认证末块**，再下任何结论。五条要点，逐条都要有对应用例：
+  1. **机制**：Task 3 **没有**导出「认证末块」的专用 API（C16 不允许为了一条断言加抽象）。可用形式是**读一段覆盖 `plaintextLength - 1` 的区间**——`ChunkDecipher.decryptAt` 是**急切认证**的，**1 个字节就足够**触发末块的 `isLast` 校验。
+  2. **用例必须是 Task 4 边界上的端到端**：一个**自洽的截断制品**必须被拒**且不返回任何元数据**——而不是只断言「读取会抛」。
+  3. **口径（provenance）比数值更重要**：`totalSize` **必须**取自读取器的 `plaintextLength`，**绝不能**从对象的字节长度或上传元数据重新推导。因为被物理截断的对象**自身是自洽的**，它的长度什么都说明不了。
+  4. **定义 `plaintextLength === 0`**：几何上允许 0 块制品，此时「认证末块」无定义——必须有明确行为与用例。
+  5. **若上传时记录了带外长度**（非制品自称），用它交叉核对——那是**唯一**非自称的长度载体。
+
+  > **为什么这是强制的**：格式里**没有任何字段认证「制品有多长」**（总量字段在尾部，且不在任何 AAD 里）。整块截断只能靠末块的 `isLast` 标记发现，而它**只在末块被真正读取时才生效**。Task 3 已用两条变异探针证明**读取器这一层**无法构造「走到自称末尾却没认证末块」的路径 ⇒ **剩余风险全部转移到 Task 4 如何使用 `plaintextLength`**。
 - [ ] **Step 1:** `limits.ts` + `sniff.ts`。嗅探判定条件必须是 `ext === 'tar.gz' || mime === 'application/gzip'`。
   - **必有用例（预检实测的缺陷）**：断言**合法 tar.gz 被识别为 tar.gz**。写成 `=== 'gz'` 会把 100% 的合法 tar.gz 误拒——这是「测试全绿、生产全炸」型错误，且会让整条 tar.gz 路径不被执行。
 - [ ] **Step 2:** `zip-inspector.ts`：`lazyEntries` 只读中央目录，收集 `fileName` / `uncompressedSize` / `compressedSize` / `externalFileAttributes`。**Open/parse 抛错 ⇒ 返回拒绝**（不是崩）。
