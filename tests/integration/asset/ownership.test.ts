@@ -344,6 +344,55 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
     await expect(prisma.assetVersion.count({ where: { assetId } })).resolves.toBe(1);
     await expect(prisma.assetMetadata.count({ where: { assetVersionId: retry.assetVersionId } })).resolves.toBe(1);
   });
+
+  /**
+   * **未知作品必须给出领域错误**（修复轮 1 / Important 2）。
+   *
+   * 落库路径的外键（`asset_versions.asset_id → asset.assets.id`）会在库里失败，于是
+   * 接口上**碰巧**也是「有错误抛出」——但那是一条 `PrismaClientKnownRequestError`（`P2003`），
+   * 调用方拿到的是一句「外键约束失败」，说不出**责任方**是谁。`transferOwnership` 在同样的
+   * 情况下给的是 {@link AssetNotFoundError}（`ownership.service.ts`），两条路径因此不一致。
+   *
+   * 为什么现在就必须统一：**Task 8 会把这两个方法直接接在 HTTP 边界下面**。翻译要么做一次、
+   * 要么做两次——做两次的话同一种「调用方指错了作品」在两条路由上会得到不同的状态码，
+   * 而那正是本仓库一直在避免的形态（状态码要说清责任方）。
+   *
+   * 判据有两半：错误**类型**是领域的（不是 Prisma 的），以及**没有留下任何行**。
+   * 反面对照在同一个用例里：一个真的存在的作品照旧落库成功——否则上面那句在「怎么都抛」
+   * 的实现上也绿。
+   *
+   * 「没有留下任何行」用的是**前后差值**（`count()` 无 `where` 是库级计数，本文件前面的用例
+   * 已经写过版本行，直接断言库级计数只能是自我同义反复）：拒绝前后的行数必须**一个不差**。
+   */
+  it('未知作品 ⇒ persistIngested 抛 AssetNotFoundError（不是 Prisma 的 P2003），且不留任何行', async () => {
+    const { ingested, metadata } = await ingestVersion(prisma, assets, store);
+    const ghost = randomUUID();
+    const rowsBefore = await prisma.assetVersion.count();
+
+    let thrown: unknown;
+    try {
+      await versions.persistIngested({ assetId: ghost, ingested, metadata });
+    } catch (err: unknown) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(AssetNotFoundError);
+    expect((thrown as AssetNotFoundError).assetId).toBe(ghost);
+    // 领域错误说出的是「作品不存在」；P2003 会带着一句外键约束失败（把责任推给数据库）。
+    expect((thrown as Error).message).toContain('作品不存在');
+
+    // 负后果：**没有任何行**被写下。半份状态（版本行在、元数据行不在）与「多写一行」都在
+    // 这两句里：前者让 `assetId` 那句红，后者让差值那句红。
+    await expect(prisma.assetVersion.count({ where: { assetId: ghost } })).resolves.toBe(0);
+    await expect(prisma.assetVersion.count()).resolves.toBe(rowsBefore);
+
+    // 反面对照：真的存在的作品照旧落库（否则上面几句在「怎么都抛」的实现上也绿）。
+    const real = await prisma.asset.create({ data: { ownerId: randomUUID() } });
+    const persisted = await versions.persistIngested({ assetId: real.id, ingested, metadata });
+    await expect(prisma.assetVersion.count({ where: { assetId: real.id } })).resolves.toBe(1);
+    await expect(prisma.assetMetadata.count({ where: { assetVersionId: persisted.assetVersionId } })).resolves.toBe(1);
+    await expect(prisma.assetVersion.count()).resolves.toBe(rowsBefore + 1);
+  });
 });
 
 /**

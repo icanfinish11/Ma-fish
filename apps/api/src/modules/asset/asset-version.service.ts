@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../db/prisma.service.js';
+import { AssetNotFoundError } from './ownership.service.js';
 import type { IngestedVersion } from './asset.service.js';
 import type { ParsedMetadata } from './metadata/parse-metadata.js';
 
@@ -54,6 +55,9 @@ export class AssetVersionService {
    *
    * @param input.assetId 归属的作品。**由调用方给出**：`Asset` 的创建有自己的入口
    *   （作品可以在上传之前就存在，一个作品也有多个版本），本服务不替它决定。
+   * @throws {AssetNotFoundError} 作品不存在（**不**落任何行）。错误类型与
+   *   `OwnershipService.transferOwnership` 用的是**同一个类**：Task 8 的 HTTP 边界
+   *   因此只需要一处翻译（否则同一种「指错了作品」会在两条路由上得到不同状态码）。
    * @returns 落库之后**确实写进去**的几个字段（版本 id、制品键、明文长度）。刻意只回这三个：
    *   调用方（接入路径）需要它们继续往下走，而多回一份完整行只会多一份会过期的副本。
    */
@@ -61,6 +65,15 @@ export class AssetVersionService {
     const { assetId, ingested, metadata } = input;
 
     return this.prisma.$transaction(async (tx) => {
+      // ⓪ 作品的**归属**先被确认。不确认的话这里的失败来自外键（`P2003`），调用方拿到的
+      //    是一句「约束失败」——说不出责任方，而且与 `transferOwnership` 在同样情形下给出的
+      //    `AssetNotFoundError` 不一致（Task 8 把两个方法接在**同一个** HTTP 边界下，那种
+      //    不对称会让翻译被决定两次、且两次不同）。
+      //    错误类型与措辞都复用**同一个** `AssetNotFoundError`（它住在 `ownership.service.ts`，
+      //    不是复制一份）：两个类同名同言，边界上的翻译就只有一处。
+      const asset = await tx.asset.findUnique({ where: { id: assetId }, select: { id: true } });
+      if (asset === null) throw new AssetNotFoundError(assetId);
+
       const version = await tx.assetVersion.create({
         data: {
           assetId,
