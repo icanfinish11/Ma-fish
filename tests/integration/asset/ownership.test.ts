@@ -26,7 +26,7 @@ import { EncryptedArtifactReader } from '@vca/api/modules/asset/store/random-acc
 /**
  * 作品 / 版本 / 元数据 / 所有权历史（P1 / Task 7；设计决定 D11 + D12）。
  *
- * ## 这个文件问的三件事（分三节，各自独立）
+ * ## 这个文件问的四件事（分四节，各自独立）
  *
  * 1. **`asset` schema 的迁移真的落地了吗**——逐列断言形状（C5 的 schema 归属、C6 的
  *    `timestamptz(3)`、C4 的 UUIDv7 主键）。这一节**不**碰任何业务方法，它只问
@@ -36,12 +36,18 @@ import { EncryptedArtifactReader } from '@vca/api/modules/asset/store/random-acc
  *    判据不是「列存在」，而是「**真实接入流程**产出的那个数出现在那一行里」。
  * 3. **所有权转让**——`Asset.ownerId` 变更 + 一行 `OwnershipHistory`，**同一事务**；
  *    制品**字节与键完全未变**（§5.2 第 2 条：制品只存一份，转让不解密、不复制）。
+ *    另外两条**拒绝**分支也在这里：「转给自己」在源头被拒（控制器裁定），以及作品不存在时
+ *    落库给出的是领域错误而不是外键失败。
+ * 4. **约束真的在拦东西吗**——`plaintext_bytes` 的 `NOT NULL` 有一条**行为**见证：
+ *    一条缺了明文长度的版本行必须被 PostgreSQL 拒绝（修复轮 1 / Important 3）。
+ *    第 1 节的形状断言编码的是「迁移写了什么」，这一条问的是「库里拦得住什么」。
  *
  * ## 为什么必须真库
  *
- * 三节的判据全是 PostgreSQL 自身的语义：列类型与时区精度、Prisma 客户端的 UUIDv7 生成、
- * 交互式事务的提交/回滚、行锁的排队语义、以及（`tests/integration/db/append-only.test.ts`
- * 那一半）角色 ACL。替身能证明的只有「我的假对象说了算」。
+ * 四节的判据全是 PostgreSQL 自身的语义：列类型与时区精度、Prisma 客户端的 UUIDv7 生成、
+ * 交互式事务的提交/回滚、行锁的排队语义、约束的拒绝，以及
+ * （`tests/integration/db/append-only.test.ts` 那一半）角色 ACL。替身能证明的只有
+ * 「我的假对象说了算」。
  */
 
 /** `ok.zip` 的字节（八样本表里那个「合法」样本，见 fixtures/archives/generate.ts）。 */
@@ -112,24 +118,9 @@ async function ingestVersion(
 }
 
 /**
- * 作品 / 版本 / 元数据 / 所有权历史（P1 / Task 7；设计决定 D11 + D12）。
+ * 第 1 节：迁移落地的形状。
  *
- * ## 这个文件问的三件事（分三节，各自独立）
- *
- * 1. **`asset` schema 的迁移真的落地了吗**——逐列断言形状（C5 的 schema 归属、C6 的
- *    `timestamptz(3)`、C4 的 UUIDv7 主键）。这一节**不**碰任何业务方法，它只问
- *    「迁移在真库上造成了什么」，因为那是本任务唯一一件「跑一次就永久生效」的事。
- * 2. **Task 5 的接入记录真的能落库吗**——`storageKey` 与 `plaintextBytes` 必须由
- *    `IngestedVersion` 逐字段写进 `asset_versions`（brief 的 Step 1b，Task 5 §12 的移交义务）。
- *    判据不是「列存在」，而是「**真实接入流程**产出的那个数出现在那一行里」。
- * 3. **所有权转让**——`Asset.ownerId` 变更 + 一行 `OwnershipHistory`，**同一事务**；
- *    制品**字节与键完全未变**（§5.2 第 2 条：制品只存一份，转让不解密、不复制）。
- *
- * ## 为什么必须真库
- *
- * 三节的判据全是 PostgreSQL 自身的语义：列类型与时区精度、Prisma 客户端的 UUIDv7 生成、
- * 交互式事务的提交/回滚、以及（`tests/integration/db/append-only.test.ts` 那一半）
- * 角色 ACL。替身能证明的只有「我的假对象说了算」。
+ * 文件级的导航（四节各自在问什么、为什么必须真库）写在**文件头**，这里不再重复一份。
  */
 describe('asset schema：迁移落地的形状（C4 / C5 / C6）', () => {
   let pg: TestPg;
@@ -294,9 +285,13 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
     expect(persisted.storageKey).toBe(ingested.storageKey);
     expect(persisted.plaintextBytes).toBe(ingested.plaintextBytes);
 
-    // 恰好一行版本、一行元数据：落库不是「顺手多写几条」。
+    // 恰好一行版本、一行元数据：落库不是「顺手多写几条」。两条都**按这一次的版本**计数
+    // （修复轮 1 / Minor）：`count()` 不带 `where` 是**库级**计数，与它上面那句版本计数
+    // 口径不同——库级计数在本文件里还会被后面的用例改，读起来像在断言「全库只有一行」。
     await expect(prisma.assetVersion.count({ where: { assetId } })).resolves.toBe(1);
-    await expect(prisma.assetMetadata.count()).resolves.toBe(1);
+    await expect(
+      prisma.assetMetadata.count({ where: { assetVersionId: persisted.assetVersionId } }),
+    ).resolves.toBe(1);
   });
 
   it('Task 6 的六个元数据字段逐字段落库（JSONB 存的是整份结构）', async () => {
@@ -343,6 +338,82 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
     const retry = await versions.persistIngested({ assetId, ingested, metadata });
     await expect(prisma.assetVersion.count({ where: { assetId } })).resolves.toBe(1);
     await expect(prisma.assetMetadata.count({ where: { assetVersionId: retry.assetVersionId } })).resolves.toBe(1);
+  });
+
+  /**
+   * **`plaintext_bytes` 的 `NOT NULL` 是承重的，不是一句注释**（修复轮 1 / Important 3）。
+   *
+   * ## 这条用例在问什么（以及形状断言问不到的那部分）
+   *
+   * `四张表的列、类型、可空性…`（第 1 节）把 `plaintext_bytes:integer`（**没有** `?`）
+   * 写进了期望值里——那是「迁移写的是什么」的**编码**，不是「约束拦得住什么」的**见证**。
+   * 一个被写下来的期望值不会因为约束被撤掉而变红的原因很简单：**它断言的就是那句话本身**。
+   *
+   * 这里问的是另一个问题：**「一份不知道明文长度」的版本行能不能被写进去？** 判据落在
+   * 数据库的**行为**上——一条缺了长度的 `INSERT` 必须被拒（PostgreSQL `23502`
+   * `not_null_violation`，且点的是 `plaintext_bytes` 那一列）。把迁移里那个 `NOT NULL`
+   * 拿掉，这条用例立刻红（探针 **m10** 实测：插入**成功**、返回 1 行 ⇒ 断言红；
+   * 同一探针下第 1 节的形状断言也一起红，两条判据互相独立）。
+   *
+   * ## 为什么用 raw SQL 而不是 Prisma 客户端
+   *
+   * 这一列在 Prisma 模型里是**必填**（`Int`，不是 `Int?`），因此客户端在类型与运行期都
+   * 不会把 `null` 发出去——用它测这一条，测的是**生成代码**，不是**数据库**。约束活在库里
+   * （`migration.sql` 的 `"plaintext_bytes" INTEGER NOT NULL`），因此见证也必须落在库里：
+   * 这条语句绕过模型，直接问 PostgreSQL 答不答应。
+   *
+   * ## 为什么插入在事务里、且断言行数没变
+   *
+   * 判据必须包含「什么都没留下」：**若**在某次改动里这条 `INSERT` 真的成功了（= 约束没了），
+   * 事务结束时回滚，库里不会多出一行没有长度的版本；而计数断言会在那一刻把这件事说清楚
+   * （否则探针红了、库里却留下一行脏数据，下一个用例的失败原因会被带偏）。
+   */
+  it('未知明文长度的版本行写不进去：plaintext_bytes 的 NOT NULL 由数据库拒绝（23502）', async () => {
+    const ownerId = randomUUID();
+    const asset = await prisma.asset.create({ data: { ownerId } });
+    const versionId = randomUUID();
+    const before = await prisma.assetVersion.count();
+
+    let thrown: unknown;
+    let insertedRows: number | undefined;
+    try {
+      insertedRows = await prisma.$transaction(async (tx) =>
+        tx.$executeRaw`
+          INSERT INTO asset.asset_versions
+            (id, asset_id, sha256, storage_key, plaintext_bytes, key_id, file_id, uploaded_by_id)
+          VALUES (${versionId}::uuid, ${asset.id}::uuid, 'probe-sha256', 'probe-storage-key',
+                  NULL, 'v2', 'probe-file-id', NULL)
+        `,
+      );
+    } catch (err: unknown) {
+      thrown = err;
+    }
+
+    // 「插进去了」与「被拒了」是互斥的两半，这里把两半都说清：成功的那一半带上返回值，
+    // 于是失败信息里能看见「返回了 N 行」而不是只有一句 TypeError。
+    expect(thrown, `缺长度的版本行被写进去了（返回 ${String(insertedRows)} 行）`).toBeInstanceOf(Error);
+
+    /**
+     * 错误的**形状**（实测定下来的，不是照文档猜的）：Prisma 7 把 raw 失败包成 `P2010`，
+     * 而 PostgreSQL 的 SQLSTATE 在 `meta.driverAdapterError.cause` 里（有驱动适配器时），
+     * 同时被序列化进 message（`Code: \`23502\``）。
+     *
+     * 因此判据取**两处**：① message 逐字带上 SQLSTATE 与列名——这是驱动适配器路径之外的
+     * 表面（没有适配器时 PostgreSQL 自己的 `DatabaseError.code` 就是 `23502`，走的正是这一处）；
+     * ② 有 `cause` 时它的 `originalCode` 也必须是 `23502`（这条路今天不走，但它在库里就是
+     * 这个形状——少了它，一个有适配器的实现把 SQLSTATE 弄丢了也照样绿）。
+     */
+    const raw = thrown as { message?: string; meta?: { driverAdapterError?: { cause?: { originalCode?: string } } } };
+    expect(raw.message, 'raw 失败的消息里没有 PostgreSQL 的 SQLSTATE').toContain('23502');
+    // 点名的必须是**那一列**：否则这条用例在「任意别的约束坏了」时也会绿。
+    expect(raw.message).toContain('plaintext_bytes');
+    expect(raw.message).toContain('not-null');
+    const sqlState = raw.meta?.driverAdapterError?.cause?.originalCode;
+    if (sqlState !== undefined) expect(sqlState).toBe('23502');
+
+    // 负后果：一行都没有留下（成功的分支已在事务里回滚）。
+    await expect(prisma.assetVersion.count()).resolves.toBe(before);
+    await expect(prisma.assetVersion.count({ where: { assetId: asset.id } })).resolves.toBe(0);
   });
 
   /**
@@ -426,6 +497,13 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
     // 不用本用例私有的临时目录：这样「转让有没有碰制品」的判据落在**应用真正会用的那个卷**上，
     // 而变异探针（注入一段真的去读写制品的代码）也只有在这里才找得到那份制品。
     storeDir = process.env.ARTIFACT_STORE_DIR as string;
+    // 清空这个卷（修复轮 1 / Minor）。**它为什么安全**：`setupFiles` 把 `ARTIFACT_STORE_DIR`
+    // 按 **worker** 切成独立目录（`tests/setup/artifact-store.ts`、`tests/helpers/env.ts`），
+    // 而 vitest 在**同一个 worker 内顺序跑文件** —— 因此这个 `rm -rf` 只会清掉
+    // **本文件之前**在这个 worker 里跑过的制品套件留下的对象（每一套件在引导期都这么做，
+    // 残留目录也会被顺带收掉）。它不是「因为碰巧没人在用」才安全的：目录所有权是按 worker
+    // 隔离出来的，若哪天 vitest 改成同 worker 内并发跑文件，这里会**响亮地**坏掉
+    // （另一个文件正在用的对象被删），而不是静默跑错。
     await rm(storeDir, { recursive: true, force: true });
     store = new LocalArtifactStore(storeDir);
     assets = new AssetService(
@@ -441,6 +519,9 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
     await prisma?.$disconnect();
     await owner?.end();
     await pg?.stop();
+    // 收尾同样只作用于**本 worker** 的目录（理由见 `beforeAll` 里那段）。留下也不会影响别的
+    // 文件，但不下一个人来清：套件自己用完自己收，是 `tests/helpers/env.ts` 那句
+    // 「目录的清理归各套件自己（谁用谁清）」的落点。
     await rm(storeDir, { recursive: true, force: true });
   });
 
