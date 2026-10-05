@@ -7,6 +7,7 @@ import { AuditModule } from '../audit/index.js';
 import { AssetController } from './asset.controller.js';
 import { AssetService } from './asset.service.js';
 import { AssetVersionService } from './asset-version.service.js';
+import { OwnershipService } from './ownership.service.js';
 import { ARTIFACT_STORE, type ArtifactStore } from './store/artifact-store.port.js';
 import { LocalArtifactStore } from './store/local-artifact.store.js';
 
@@ -55,8 +56,10 @@ import { LocalArtifactStore } from './store/local-artifact.store.js';
     // 这一半把它写进 `asset` schema。两者都在本模块里提供，注入方（Task 8 的接入路径）
     // 因此拿到的必然是同一对实例。
     AssetVersionService,
+    // 所有权转让（Task 7）：指针 + 一行 append-only 历史，同一事务，**不碰制品**。
+    OwnershipService,
   ],
-  exports: [ARTIFACT_STORE, AssetService, AssetVersionService],
+  exports: [ARTIFACT_STORE, AssetService, AssetVersionService, OwnershipService],
 })
 export class AssetStoreModule {}
 

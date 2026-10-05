@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -13,11 +13,84 @@ import { PrismaService } from '@vca/api/db/prisma.service.js';
 import { AuditService } from '@vca/api/modules/audit/index.js';
 import { AssetService } from '@vca/api/modules/asset/asset.service.js';
 import { AssetVersionService } from '@vca/api/modules/asset/asset-version.service.js';
+import { AssetNotFoundError, OwnershipService } from '@vca/api/modules/asset/ownership.service.js';
 import type { Env } from '@vca/api/config/env.schema.js';
 import { createKeyRing, type KeyRing } from '@vca/api/modules/asset/crypto/key-ring.js';
 import { parseMetadata } from '@vca/api/modules/asset/metadata/parse-metadata.js';
 import { LocalArtifactStore } from '@vca/api/modules/asset/store/local-artifact.store.js';
 import { EncryptedArtifactReader } from '@vca/api/modules/asset/store/random-access-reader.js';
+
+/**
+ * 文件清单里出现的辅助函数（`ingestVersion` / `objectPath` / `listObjects` / `sha256`）
+ * 都定义在本文件上半部分，三节共用。
+ */
+
+/** `ok.zip` 的字节（八样本表里那个「合法」样本，见 fixtures/archives/generate.ts）。 */
+function zipBytes(): Buffer {
+  const sample = ARCHIVE_SAMPLES.find((item) => item.name === 'ok.zip');
+  if (sample === undefined) throw new Error('样本表里没有 ok.zip');
+  return sample.bytes();
+}
+
+/** 环境夹具里的密钥环（与 `AssetService` 构造期用的是同一份输入）。 */
+function ringFromEnv(): KeyRing {
+  return createKeyRing({ ARTIFACT_KEYS: testEnv.ARTIFACT_KEYS, ARTIFACT_ACTIVE_KEY_ID: testEnv.ARTIFACT_ACTIVE_KEY_ID });
+}
+
+const MAX_UPLOAD_BYTES = Number(testEnv.ARTIFACT_MAX_UPLOAD_BYTES);
+
+/**
+ * `LocalArtifactStore` 的分片布局：`<root>/<前2位>/<次2位>/<键>`（见 `local-artifact.store.ts`）。
+ *
+ * 用例里直接读盘上那份字节，是因为「转让没有碰过制品」这句话的判据只能是**字节**：
+ * 存储端口刻意没有覆写 API，而「制品在静止状态被改写」正是要排除的形态。
+ */
+function objectPath(storeDir: string, key: string): string {
+  return join(storeDir, key.slice(0, 2), key.slice(2, 4), key);
+}
+
+/** 递归列出制品库里的全部文件（相对路径，排好序）——复制制品会在这里多出一行。 */
+async function listObjects(root: string): Promise<string[]> {
+  const out: string[] = [];
+  const pending: string[] = [root];
+  while (pending.length > 0) {
+    const dir = pending.pop() as string;
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) pending.push(full);
+      else out.push(full.slice(root.length + 1));
+    }
+  }
+  return out.sort();
+}
+
+function sha256(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+/** 真实接入（Task 5）→ 真实解析（Task 6）；返回**待落库**的那条记录（本函数刻意不落库——
+ *  落库是每个用例自己要断言的那一步，提前做掉会让「一行版本」这类计数判据失去意义）。 */
+async function ingestVersion(
+  prisma: PrismaService,
+  assets: AssetService,
+  store: LocalArtifactStore,
+  ownerId: string = randomUUID(),
+): Promise<{
+  assetId: string;
+  ownerId: string;
+  ingested: Awaited<ReturnType<AssetService['finalize']>>;
+  metadata: Awaited<ReturnType<typeof parseMetadata>>;
+  plaintext: Buffer;
+}> {
+  const plaintext = zipBytes();
+  const asset = await prisma.asset.create({ data: { ownerId } });
+  const write = await assets.putStream(Readable.from([plaintext]), { maxBytes: MAX_UPLOAD_BYTES });
+  const ingested = await assets.finalize(write, { uploadedById: randomUUID() });
+  // 元数据这一半来自 Task 6：读取器按头里的 keyId 选键重新打开制品（与下载路径同一条路）。
+  const reader = await EncryptedArtifactReader.open(store, ingested.storageKey, ringFromEnv());
+  const metadata = await parseMetadata(reader, 'zip');
+  return { assetId: asset.id, ownerId: asset.ownerId, ingested, metadata, plaintext };
+}
 
 /**
  * 作品 / 版本 / 元数据 / 所有权历史（P1 / Task 7；设计决定 D11 + D12）。
@@ -152,15 +225,6 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
   let store: LocalArtifactStore;
   let storeDir: string;
 
-  const MAX_UPLOAD_BYTES = Number(testEnv.ARTIFACT_MAX_UPLOAD_BYTES);
-  const zipBytes = (): Buffer => {
-    const sample = ARCHIVE_SAMPLES.find((item) => item.name === 'ok.zip');
-    if (sample === undefined) throw new Error('样本表里没有 ok.zip');
-    return sample.bytes();
-  };
-  const ringFromEnv = (): KeyRing =>
-    createKeyRing({ ARTIFACT_KEYS: testEnv.ARTIFACT_KEYS, ARTIFACT_ACTIVE_KEY_ID: testEnv.ARTIFACT_ACTIVE_KEY_ID });
-
   beforeAll(async () => {
     pg = await startPostgres();
     owner = new Client({ connectionString: pg.ownerUri });
@@ -194,14 +258,14 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
     metadata: Awaited<ReturnType<typeof parseMetadata>>;
     plaintext: Buffer;
   }> {
-    const plaintext = zipBytes();
-    const asset = await prisma.asset.create({ data: { ownerId: randomUUID() } });
-    const write = await assets.putStream(Readable.from([plaintext]), { maxBytes: MAX_UPLOAD_BYTES });
-    const ingested = await assets.finalize(write, { uploadedById: randomUUID() });
-    // 元数据这一半来自 Task 6：读取器按头里的 keyId 选键重新打开制品（与下载路径同一条路）。
-    const reader = await EncryptedArtifactReader.open(store, ingested.storageKey, ringFromEnv());
-    const metadata = await parseMetadata(reader, 'zip');
-    return { assetId: asset.id, ownerId: asset.ownerId, ingested, metadata, plaintext };
+    const seeded = await ingestVersion(prisma, assets, store);
+    return {
+      assetId: seeded.assetId,
+      ownerId: seeded.ownerId,
+      ingested: seeded.ingested,
+      metadata: seeded.metadata,
+      plaintext: seeded.plaintext,
+    };
   }
 
   it('storageKey 与 plaintextBytes 逐字段落库，且明文长度是**写入侧量出来**的那个数', async () => {
@@ -278,5 +342,216 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
     const retry = await versions.persistIngested({ assetId, ingested, metadata });
     await expect(prisma.assetVersion.count({ where: { assetId } })).resolves.toBe(1);
     await expect(prisma.assetMetadata.count({ where: { assetVersionId: retry.assetVersionId } })).resolves.toBe(1);
+  });
+});
+
+/**
+ * 所有权转让（D11 / 设计 §5.2 第 2 条）。
+ *
+ * 判据有两半，**缺一不可**：
+ *
+ * 1. **变了什么**：`Asset.ownerId` 指向新所有人，并且 `OwnershipHistory` **追加**一行
+ *    （不是改写既有行）。两件事必须在**同一个事务**里——一半成功等于历史说谎。
+ * 2. **没变什么**：制品一个字节都没动。「制品只存一份」正是「原子式所有权互换是一个
+ *    本地数据库事务」的全部前提；如果转让要解密/复制制品，它就不再是本地事务了。
+ *    这一半的判据只能落在**字节**上（`sha256` 与对象键），不能落在「没抛错」上。
+ */
+describe('所有权转让：指针 + 一行历史（同一事务），制品一个字节都不动', () => {
+  let pg: TestPg;
+  let owner: Client;
+  let prisma: PrismaService;
+  let assets: AssetService;
+  let versions: AssetVersionService;
+  let ownership: OwnershipService;
+  let store: LocalArtifactStore;
+  let storeDir: string;
+
+  beforeAll(async () => {
+    pg = await startPostgres();
+    owner = new Client({ connectionString: pg.ownerUri });
+    await owner.connect();
+    prisma = new PrismaService(pg.appUri);
+    await prisma.$connect();
+    // 制品卷用**环境里那个**（`tests/setup/artifact-store.ts` 按 worker 定的目录），
+    // 不用本用例私有的临时目录：这样「转让有没有碰制品」的判据落在**应用真正会用的那个卷**上，
+    // 而变异探针（注入一段真的去读写制品的代码）也只有在这里才找得到那份制品。
+    storeDir = process.env.ARTIFACT_STORE_DIR as string;
+    await rm(storeDir, { recursive: true, force: true });
+    store = new LocalArtifactStore(storeDir);
+    assets = new AssetService(
+      store,
+      new ConfigService(testEnv) as unknown as ConfigService<Env, true>,
+      new AuditService(prisma),
+    );
+    versions = new AssetVersionService(prisma);
+    ownership = new OwnershipService(prisma);
+  }, 240_000);
+
+  afterAll(async () => {
+    await prisma?.$disconnect();
+    await owner?.end();
+    await pg?.stop();
+    await rm(storeDir, { recursive: true, force: true });
+  });
+
+  it('转让 = ownerId 变更 + **追加**一行历史；连续两次转让链条一致', async () => {
+    const alice = randomUUID();
+    const bob = randomUUID();
+    const carol = randomUUID();
+    const asset = await prisma.asset.create({ data: { ownerId: alice } });
+
+    const first = await ownership.transferOwnership({ assetId: asset.id, toUserId: bob, reason: '拍卖成交' });
+    expect(first.assetId).toBe(asset.id);
+    expect(first.fromUserId).toBe(alice);
+    expect(first.toUserId).toBe(bob);
+    expect(first.transferredAt).toBeInstanceOf(Date);
+    await expect(prisma.asset.findUniqueOrThrow({ where: { id: asset.id } })).resolves.toMatchObject({
+      ownerId: bob,
+    });
+
+    const second = await ownership.transferOwnership({ assetId: asset.id, toUserId: carol, reason: '交换成交' });
+    // 第二笔的**前手是当前所有人**（bob），不是「上一次转让之前那个人」——这正是行锁要保证的。
+    expect(second.fromUserId).toBe(bob);
+    expect(second.toUserId).toBe(carol);
+    await expect(prisma.asset.findUniqueOrThrow({ where: { id: asset.id } })).resolves.toMatchObject({
+      ownerId: carol,
+    });
+
+    const history = await prisma.ownershipHistory.findMany({ where: { assetId: asset.id } });
+    // 顺序无关的判据（`createdAt` 只到毫秒，两行可能同毫秒——按时间排序不稳定）。
+    const pairs = history.map((row) => `${row.fromUserId}->${row.toUserId}`);
+    expect(pairs).toHaveLength(2);
+    expect(pairs).toEqual(expect.arrayContaining([`${alice}->${bob}`, `${bob}->${carol}`]));
+    expect(pairs, '第二行写下了过期的前手（alice→carol）').not.toContain(`${alice}->${carol}`);
+    expect(new Set(history.map((row) => row.id))).toEqual(
+      new Set([first.ownershipHistoryId, second.ownershipHistoryId]),
+    );
+    // 事由逐字落库；时间是 Date（C6 的 timestamptz(3) 回读）
+    expect(history.map((row) => row.reason).sort()).toEqual(['交换成交', '拍卖成交']);
+    for (const row of history) expect(row.createdAt).toBeInstanceOf(Date);
+  });
+
+  it('转让不触碰制品：字节、对象键与版本行都**逐字段未变**（§5.2 第 2 条）', async () => {
+    const seeded = await ingestVersion(prisma, assets, store);
+    const persisted = await versions.persistIngested({
+      assetId: seeded.assetId,
+      ingested: seeded.ingested,
+      metadata: seeded.metadata,
+    });
+    const path = objectPath(storeDir, seeded.ingested.storageKey);
+    const beforeBytes = await readFile(path);
+    const beforeObjects = await listObjects(storeDir);
+    const beforeRow = await prisma.assetVersion.findUniqueOrThrow({ where: { id: persisted.assetVersionId } });
+
+    const to = randomUUID();
+    await ownership.transferOwnership({ assetId: seeded.assetId, toUserId: to, reason: '转让' });
+
+    // ① 盘上那份制品：字节逐字节相同（大小、内容、摘要都不变）。
+    const afterBytes = await readFile(path);
+    expect(afterBytes.equals(beforeBytes), '转让改写了制品的字节').toBe(true);
+    expect(sha256(afterBytes)).toBe(sha256(beforeBytes));
+    // ② 制品库里**没有**多出对象（复制制品会在这里多一行）。
+    await expect(listObjects(storeDir)).resolves.toEqual(beforeObjects);
+    // ③ 版本行逐字段未变：`storageKey`（下载路径取对象的线索）、`plaintextBytes`（带外长度）、
+    //    `sha256`、`keyId`、`fileId`、`uploadedById`、`createdAt` 全部照旧。
+    const afterRow = await prisma.assetVersion.findUniqueOrThrow({ where: { id: persisted.assetVersionId } });
+    expect(afterRow).toEqual(beforeRow);
+    await expect(prisma.assetVersion.count({ where: { assetId: seeded.assetId } })).resolves.toBe(1);
+
+    // 反面对照：指针**确实**变了，否则上面几条在一个「什么都没做」的实现上也绿。
+    await expect(prisma.asset.findUniqueOrThrow({ where: { id: seeded.assetId } })).resolves.toMatchObject({
+      ownerId: to,
+    });
+    await expect(prisma.ownershipHistory.count({ where: { assetId: seeded.assetId } })).resolves.toBe(1);
+  });
+
+  it('未知作品 ⇒ AssetNotFoundError，且不留下任何历史行', async () => {
+    const ghost = randomUUID();
+    let thrown: unknown;
+    try {
+      await ownership.transferOwnership({ assetId: ghost, toUserId: randomUUID(), reason: '不存在的作品' });
+    } catch (err: unknown) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(AssetNotFoundError);
+    expect((thrown as AssetNotFoundError).assetId).toBe(ghost);
+    await expect(prisma.ownershipHistory.count({ where: { assetId: ghost } })).resolves.toBe(0);
+  });
+
+  it('同一事务：历史写不进去时指针**也没有变**（不是半个转让）', async () => {
+    const alice = randomUUID();
+    const bob = randomUUID();
+    const asset = await prisma.asset.create({ data: { ownerId: alice } });
+
+    // 注入一个真实的失败：运行时角色的 INSERT 被收掉（属主身份操作，随后恢复）。
+    await owner.query(`REVOKE INSERT ON asset.ownership_history FROM app_user`);
+    let thrown: unknown;
+    try {
+      await ownership.transferOwnership({ assetId: asset.id, toUserId: bob, reason: '这笔必须整体失败' });
+    } catch (err: unknown) {
+      thrown = err;
+    } finally {
+      await owner.query(`GRANT INSERT ON asset.ownership_history TO app_user`);
+    }
+
+    expect(thrown, '历史写不进去时没有抛错').toBeInstanceOf(Error);
+    // 回滚的证据：指针仍是 alice（若两条语句各写各的事务，这里会变成 bob 而没有历史行）。
+    await expect(prisma.asset.findUniqueOrThrow({ where: { id: asset.id } })).resolves.toMatchObject({
+      ownerId: alice,
+    });
+    await expect(prisma.ownershipHistory.count({ where: { assetId: asset.id } })).resolves.toBe(0);
+
+    // 反面对照：权限恢复之后同一笔转让可以成功（否则上面那句断言在「怎么都抛」的实现上也绿）。
+    const retry = await ownership.transferOwnership({ assetId: asset.id, toUserId: bob, reason: '重试' });
+    expect(retry.fromUserId).toBe(alice);
+    await expect(prisma.asset.findUniqueOrThrow({ where: { id: asset.id } })).resolves.toMatchObject({
+      ownerId: bob,
+    });
+    await expect(prisma.ownershipHistory.count({ where: { assetId: asset.id } })).resolves.toBe(1);
+  });
+
+  /**
+   * **行锁**：前手必须取「拿到锁那一刻」的所有人。
+   *
+   * ## 这条用例在问什么
+   *
+   * 转让要读一次当前所有人（`fromUserId`），再改指针。若那一次读**不持锁**，两笔并发转让
+   * 会各自读到同一个前手，于是第二行记下一个**过期的** `fromUserId`——一份自相矛盾的
+   * 所有权史（P1 的存在意义之一就是它能在争议里当证据）。
+   *
+   * ## 为什么这样构造是**确定性**的
+   *
+   * 用例自己（属主连接）先 `BEGIN; SELECT ... FOR UPDATE` 扣住那一行，再发起转让：
+   *   * 持锁读的实现会在**读**那一步阻塞，直到用例把所有人改成 dave 并提交，于是它读到
+   *     `dave` ⇒ 历史行是 `dave→carol`；
+   *   * 不持锁的实现在读那一步就拿到了 `alice`（MVCC 读不会被行锁挡住），随后 `UPDATE`
+   *     才阻塞，解锁后照着新版本写 `carol` ⇒ 历史行是 `alice→carol`，断言红。
+   *
+   * 时序前提写在明处：中间那 500ms 是「让转让走到它那条读语句」的余量，本地容器上一次
+   * 往返是亚毫秒级。若机器把它拖慢到 500ms 以上，这条用例会**漏判**（绿），不会误判（红）。
+   */
+  it('行锁：前手取的是拿到锁那一刻的所有人，不是读之前那个（并发转让不会记下过期前手）', async () => {
+    const alice = randomUUID();
+    const dave = randomUUID();
+    const carol = randomUUID();
+    const asset = await prisma.asset.create({ data: { ownerId: alice } });
+
+    await owner.query('BEGIN');
+    await owner.query('SELECT owner_id FROM asset.assets WHERE id = $1 FOR UPDATE', [asset.id]);
+
+    const pending = ownership.transferOwnership({ assetId: asset.id, toUserId: carol, reason: '并发场景' });
+    // 让转让走到它的读语句（持锁实现会**停在那里**）
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    // 锁的持有者在这一行上做一次真实的变更（模拟另一笔事务先提交）
+    await owner.query('UPDATE asset.assets SET owner_id = $1 WHERE id = $2', [dave, asset.id]);
+    await owner.query('COMMIT');
+
+    const result = await pending;
+    expect(result.fromUserId, '前手是读锁之前那个值 —— 记下了一行过期的所有权史').toBe(dave);
+    const history = await prisma.ownershipHistory.findMany({ where: { assetId: asset.id } });
+    expect(history).toHaveLength(1);
+    expect(history[0]?.fromUserId).toBe(dave);
+    expect(history[0]?.toUserId).toBe(carol);
   });
 });
