@@ -185,6 +185,19 @@ describe('越权矩阵：asset 模块的每个端点 × 每个角色（判据 11
     return req.set('Cookie', cookies.get(role) as string).set(CSRF_HEADER, csrf);
   }
 
+  /**
+   * 失败消息里的「响应里到底说了什么」——**刻意不回显正文**。
+   *
+   * 签发**成功**时的正文里就是那串签名 URL（票据本身），而 C11 不允许把凭证写进
+   * 日志/CI 输出：一次变异探针（p7）实测过这个形态——断言消息把一整条可用的签名 URL
+   * 打进了失败输出。这里只取两个**非凭证**字段（`code` 与 `message`），
+   * 排障需要的信息一个不少，凭证一个都不出现。
+   */
+  function failureDetail(res: request.Response): string {
+    const body = res.body as { code?: unknown; message?: unknown } | null;
+    return `status=${res.status} code=${JSON.stringify(body?.code ?? null)} message=${JSON.stringify(body?.message ?? null)}`;
+  }
+
   const MATRIX: MatrixRow[] = [
     {
       handler: 'upload',
@@ -248,7 +261,7 @@ describe('越权矩阵：asset 模块的每个端点 × 每个角色（判据 11
         const res = await row.call(role);
         const body = res.body as { code?: string; message?: string; assetVersionId?: string };
 
-        expect(res.status, `响应体=${res.text}`).toBe(expected.status);
+        expect(res.status, failureDetail(res)).toBe(expected.status);
 
         if (expected.kind === 'login') {
           // 守卫的「需要登录」：身份缺失，判定还没开始

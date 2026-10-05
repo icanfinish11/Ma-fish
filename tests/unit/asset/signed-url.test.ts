@@ -244,6 +244,11 @@ describe('签名比较必须是常量时间原语（结构判据）', () => {
   });
 
   it('源码里没有对签名的 `===` / `==` 比较（那正是它要替代的写法）', () => {
-    expect(code).not.toMatch(/(?:signature|computed|expected)\s*[!=]==?\s*(?:t\.signature|signature|computed|expected)/);
+    // 方括号里的名字覆盖了**这份实现的两种写法**：`t.signature`（类型里的字段名）与
+    // `ticket.signature`（本文件里的局部变量名）。判别力是实测的：把调用点换成
+    // `if (computed !== ticket.signature) …`，本用例与上一条一起变红（探针 p3）。
+    expect(code).not.toMatch(
+      /(?:signature|computed|expected)\s*[!=]==?\s*(?:t\.signature|ticket\.signature|signature|computed|expected)/,
+    );
   });
 });

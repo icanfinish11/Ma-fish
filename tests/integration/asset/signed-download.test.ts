@@ -23,6 +23,7 @@ import {
   createNonce,
   signTicket,
 } from '@vca/api/modules/asset/download/signed-url.js';
+import { NONCE_KEY_PREFIX, consumeNonce } from '@vca/api/modules/asset/download/nonce-store.js';
 import { createTestApp } from '../../helpers/app.js';
 import { fetchCsrfToken } from '../../helpers/csrf.js';
 import { startPostgres, type TestPg } from '../../helpers/db.js';
@@ -410,6 +411,43 @@ describe('签名下载（D10）：授权、单次使用、超时、篡改、审�
     expect((JSON.parse((loser.body as Buffer).toString('utf8')) as { code?: string }).code).toBe(
       'ASSET_DOWNLOAD_TICKET_REPLAYED',
     );
+  });
+
+  /**
+   * **nonce 台账的原子性**——这条判据只能在这一层做（据实记载）。
+   *
+   * 上面那条 HTTP 层的并发用例**没有**判别力：变异探针 p2 把 `SET NX` 换成
+   * 「先 GET 再 SET」（经典的竞态写法）之后，它**仍然全绿**——两次 supertest 请求的
+   * 连接建立把两个请求错开了，而那个竞态窗口只有微秒级（实测：`18 passed`，
+   * 见 `evidence/t8-mutation-p2-nonce-get-then-set.txt`）。一条没有判别力的用例
+   * 留着只会让人误以为「并发已经被覆盖」。
+   *
+   * 真正能踩到那个窗口的形态是：**同一个 tick 里发出两条命令**（两个 `consumeNonce`
+   * 同时在飞）。此时「先 GET 再 SET」的两个 `EXISTS` 都会在任何一个 `SET` 之前返回 0
+   * ⇒ 两个都拿到 `true`（本用例变红），而 `SET ... NX` 只有一个拿到 `OK`。
+   */
+  it('nonce 台账：同一 tick 里发出的两条 consumeNonce 恰好一条为真（`SET NX` 的原子性）', async () => {
+    const client = redis.newClient();
+    try {
+      const nonce = createNonce();
+      const results = await Promise.all([
+        consumeNonce(client, nonce, 60),
+        consumeNonce(client, nonce, 60),
+      ]);
+
+      expect(results.filter(Boolean), `两条并发命令的结果：${JSON.stringify(results)}`).toHaveLength(1);
+      // 键留在库里（第三个人也拿不到）
+      expect(await consumeNonce(client, nonce, 60)).toBe(false);
+      // 且**有**过期时间：台账不会无限增长（TTL 是这条控制的另一半）
+      const ttl = await client.ttl(`${NONCE_KEY_PREFIX}${nonce}`);
+      expect(ttl).toBeGreaterThan(0);
+      expect(ttl).toBeLessThanOrEqual(60);
+      // 形状不对的 nonce 不建任何键（它是 Redis 键的一部分，必须有界）
+      expect(await consumeNonce(client, nonce, 60), '同一个 nonce 被消费了两次').toBe(false);
+      expect(await consumeNonce(client, 'short', 60)).toBe(false);
+    } finally {
+      client.disconnect();
+    }
   });
 
   it('超时：手工签一张已过期的票 ⇒ 403（EXPIRED）+ 审计行（当事人来自票据，因此可信）', async () => {
@@ -802,7 +840,6 @@ describe('资产模块的新路由归属 P0 的限流层（打到上限即 429�
     const reader = await EncryptedArtifactReader.open(app.get<ArtifactStore>(ARTIFACT_STORE), ingested.storageKey, ringFromEnv());
     const metadata = await parseMetadata(reader, ingested.kind);
     const persisted = await versions.persistIngested({ assetId: asset.id, ingested, metadata });
-    await sessions.create(owner, { ip: '127.0.0.1', userAgent: 'vitest' });
 
     const call = (): request.Test =>
       request(app.getHttpServer())
