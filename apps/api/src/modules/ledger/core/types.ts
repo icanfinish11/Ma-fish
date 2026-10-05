@@ -63,6 +63,22 @@ export interface PostingRequest {
   readonly actorId?: string | null;
 }
 
+/**
+ * **直接腿入口**的输入形状（`LedgerService.postLegs`）。
+ *
+ * 与 `PostingRequest` 的唯一差别：腿是调用方**手工构造**的（`accountId` 已经是库里的 id），
+ * 因此这条路上没有「引用 → 账户」的解析——也就没有惰性创建、没有 kind/owner 绑定、
+ * 没有自转检查（那些是 `post` 那扇门的活）。它存在的理由是 C28：显式平衡断言必须有一条
+ * **可达**的路径（`movesToLegs` 产出的腿集按构造总是平衡的，见 `postLegs` 的注释）。
+ */
+export interface PostingLegsRequest {
+  readonly kind: TransactionKind;
+  readonly idempotencyKey: string;
+  readonly legs: readonly PostingLeg[];
+  /** 发起人；写进审计的 `actorId`。 */
+  readonly actorId?: string | null;
+}
+
 export interface PostingResult {
   readonly transactionId: string;
   readonly created: boolean;

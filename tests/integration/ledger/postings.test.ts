@@ -6,7 +6,7 @@ import { PrismaService } from '@vca/api/db/prisma.service.js';
 import { LedgerService } from '@vca/api/modules/ledger/ledger.service.js';
 import { TRANSACTION_KINDS } from '@vca/api/modules/ledger/core/types.js';
 import { ACCOUNT_KINDS, USER_ACCOUNT_KINDS } from '@vca/api/modules/ledger/core/account-kind.js';
-import { InsufficientFundsError, IdempotencyKeyReusedError, SystemAccountMissingError, UnknownAccountKindError } from '@vca/api/modules/ledger/core/errors.js';
+import { InsufficientFundsError, IdempotencyKeyReusedError, SystemAccountMissingError, UnbalancedPostingError, UnknownAccountKindError } from '@vca/api/modules/ledger/core/errors.js';
 import { startPostgres, type TestPg } from '../../helpers/db.js';
 
 /**
@@ -74,6 +74,33 @@ async function materializeAccounts(userId: string): Promise<void> {
       moves: [{ from: frozen(userId), to: available(userId), amount: 1n }],
     }),
   );
+}
+
+/**
+ * 给某个用户发 `amount` 分，并返回**手工构造腿**所需要的两个账户 `id`。
+ *
+ * 为什么直接腿的用例需要它：`post` 收的是**引用**（`AccountRef`），引用→`id` 的解析
+ * （含惰性创建、kind/owner 绑定、系统账户只查不建）是 `post` 那扇门的活。
+ * `postLegs` 那扇门拿到的已经是 `id`——这正是一条「腿集不来自 `movesToLegs`」的路径。
+ */
+async function fundAvailable(userId: string, amount: bigint) {
+  await prisma.$transaction((tx) =>
+    ledger.post(tx, {
+      kind: TRANSACTION_KINDS.TOPUP,
+      idempotencyKey: `legs-seed:${userId}`,
+      moves: [{ from: topup, to: available(userId), amount }],
+    }),
+  );
+  const rows = await prisma.ledgerAccount.findMany({
+    where: { OR: [{ ownerUserId: userId }, { kind: ACCOUNT_KINDS.EXTERNAL_TOPUP, ownerUserId: null }] },
+    select: { id: true, kind: true },
+  });
+  const idOf = (kind: string): string => {
+    const row = rows.find((r) => r.kind === kind);
+    if (!row) throw new Error(`构造失败：账户 ${kind} 不存在（这一步的时序前提不成立）`);
+    return row.id;
+  };
+  return { available: idOf(ACCOUNT_KINDS.USER_AVAILABLE), topup: idOf(ACCOUNT_KINDS.EXTERNAL_TOPUP) };
 }
 
 /**
@@ -558,5 +585,97 @@ describe('过账：LedgerService.post（C25 / C26 / C28 / D9 / D10）', () => {
       }),
     );
     expect(await ledger.readBalances(prisma, userId.toUpperCase())).toEqual({ available: 10_000n, frozen: 0n });
+  });
+
+  /**
+   * ★ **直接腿入口**（`postLegs`）—— C28 那条显式平衡断言真正的门。
+   *
+   * 为什么需要这扇门：`post` 的腿永远来自 `movesToLegs`，而它**按构造**总是平衡的
+   * （每一条转移同时产生 −a 与 +a，和恒为 0）。探针 **p7** 实测：把 `post` 里那次
+   * `assertBalanced` 删掉，**一条用例都不红**——在那条路上它是装饰。
+   * 于是控制器裁定：保留它，把理由改成「它是为**腿集不来自 `movesToLegs`** 的路径准备的」，
+   * 并给它一条真见证（`progress.md` 的 p7 裁定）。下面三条就是那条见证。
+   */
+  it('直接腿入口①：手工构造的**不平衡**腿 ⇒ UnbalancedPostingError，且库里一行都不留', async () => {
+    const userId = uuidv7();
+    const ids = await fundAvailable(userId, 100n);
+    const key = `legs-unbalanced:${userId}`;
+    const error = await prisma
+      .$transaction((tx) =>
+        ledger.postLegs(tx, {
+          kind: TRANSACTION_KINDS.TOPUP,
+          idempotencyKey: key,
+          legs: [{ accountId: ids.available, amount: -100n }], // 和 = −100 ≠ 0：手工构造出来的不平衡腿集
+        }),
+      )
+      .then(() => null, (e: unknown) => e);
+
+    expect(error).toBeInstanceOf(UnbalancedPostingError);
+    expect((error as UnbalancedPostingError).sum).toBe(-100n);
+    // 拒绝方向的三条独立判据；它们的**接受对侧**在下一条（同一查询形状必须返回 1 / 2 / 1）。
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: key } })).toBe(0);
+    expect(await auditRowsFor(key)).toBe(0);
+    expect(await ledger.readBalances(prisma, userId)).toEqual({ available: 100n, frozen: 0n });
+  });
+
+  it('★ 直接腿入口②：不平衡的腿**先于幂等判定**被拒（这一条是那次 `assertBalanced` 的**判别性**见证）', async () => {
+    // 为什么需要这一条：下一条（接受方向）与上一条都是「删掉那次 assertBalanced 也照样绿」的
+    // ——`applyPosting` 的第一句也是 `assertBalanced`，任何不平衡的腿集它都会抛同一个错。
+    // 唯一能把这**两处**分开的观测量是**顺序**：`post` 里那次断言在 `findUnique` **之前**，
+    // 而 `applyPosting` 那次在它**之后**。因此这里让幂等键**真的存在**：
+    //   有那次 assertBalanced ⇒ UnbalancedPostingError（结构错误先报）；
+    //   删掉它（探针 p7'）    ⇒ 一路走到 findUnique、比腿不同 ⇒ IdempotencyKeyReusedError。
+    // 这句顺序不是任意的：一笔**结构上就是错的**请求不该被当成「一次幂等重放/冲突」来回答。
+    const userId = uuidv7();
+    const ids = await fundAvailable(userId, 100n);
+    const key = `legs-precedence:${userId}`;
+    const first = await prisma.$transaction((tx) =>
+      ledger.post(tx, {
+        kind: TRANSACTION_KINDS.TOPUP,
+        idempotencyKey: key,
+        moves: [{ from: topup, to: available(userId), amount: 7n }],
+      }),
+    );
+
+    const error = await prisma
+      .$transaction((tx) =>
+        ledger.postLegs(tx, {
+          kind: TRANSACTION_KINDS.TOPUP,
+          idempotencyKey: key, // ← 同一个键，且腿集与已存在的那笔**不同**
+          legs: [{ accountId: ids.available, amount: -3n }],
+        }),
+      )
+      .then(() => null, (e: unknown) => e);
+
+    expect(error).toBeInstanceOf(UnbalancedPostingError);
+    expect(error).not.toBeInstanceOf(IdempotencyKeyReusedError);
+    // 已存在的那笔**一字未动**（不是「报错但写坏了」）：
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: key } })).toBe(1);
+    expect(await prisma.ledgerEntry.count({ where: { transactionId: first.transactionId } })).toBe(2);
+    expect(await ledger.readBalances(prisma, userId)).toEqual({ available: 107n, frozen: 0n });
+  });
+
+  it('★ 直接腿入口③（**接受方向**）：手工构造的**平衡**腿被接受 —— 交易 / 分录 / 审计 = 1 / 2 / 1', async () => {
+    const userId = uuidv7();
+    const ids = await fundAvailable(userId, 100n);
+    const key = `legs-balanced:${userId}`;
+    const result = await prisma.$transaction((tx) =>
+      ledger.postLegs(tx, {
+        kind: TRANSACTION_KINDS.TOPUP,
+        idempotencyKey: key,
+        actorId: userId,
+        legs: [
+          { accountId: ids.topup, amount: -50n }, // 借：系统账户（天然为负）
+          { accountId: ids.available, amount: 50n }, // 贷：用户可用
+        ],
+      }),
+    );
+
+    expect(result.created).toBe(true);
+    // 三条判据与入口①逐条同形（否则入口①那三个 0 只能证明「查询写错了」）：
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: key } })).toBe(1);
+    expect(await prisma.ledgerEntry.count({ where: { transactionId: result.transactionId } })).toBe(2);
+    expect(await auditRowsFor(key)).toBe(1);
+    expect(await ledger.readBalances(prisma, userId)).toEqual({ available: 150n, frozen: 0n });
   });
 });

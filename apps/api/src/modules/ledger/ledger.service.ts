@@ -12,7 +12,7 @@ import {
 } from './core/errors.js';
 import { applyPosting, assertBalanced, movesToLegs, sameLegs } from './core/posting.js';
 import type {
-  AccountRef, AccountSnapshot, MoneyMove, PostingLeg, PostingRequest, PostingResult,
+  AccountRef, AccountSnapshot, MoneyMove, PostingLeg, PostingLegsRequest, PostingRequest, PostingResult,
 } from './core/types.js';
 import type { Prisma } from '../../generated/prisma/client.js';
 
@@ -25,7 +25,7 @@ import type { Prisma } from '../../generated/prisma/client.js';
  * |---|---|---|
  * | C25/D8 余额扣减的并发权威是**条件更新的受影响行数** | `applyBalances` | 「两笔并发各冻结 6000」+ 那条确定性用例（`stage === 'conditional-update'`） |
  * | C26/D9 幂等键是数据库**唯一约束**，三态：重放 / 409 / 新键 | `post` 的 findUnique 比腿 + `isIdempotencyConflict` | 幂等①②③ |
- * | C28 「应用侧显式平衡断言」是唯一稳定的错误通道 | `post` 里那次 `assertBalanced` | 纯核心的 `UnbalancedPostingError` 用例（Task 5） |
+ * | C28 「应用侧显式平衡断言」是唯一稳定的错误通道 | **`postLegs` 头部**那次 `assertBalanced` | 「直接腿入口」三条用例（探针 p7'：删掉它 ⇒ ② 变红） |
  * | D10 一笔过账一行审计，**写在同一个事务里** | `post` 末尾的 `audit.record(…, tx)` | 「账本回滚 ⇒ 审计行 0 行」（独立断言） |
  *
  * **不要**把延迟约束触发器当主错误通道：实测经 Prisma 7.10.0 时它退化成
@@ -46,36 +46,69 @@ export class LedgerService {
   ) {}
 
   /**
-   * **唯一的过账入口**。与业务写入共用**调用方**的事务（与 `OutboxService.publish(tx, msg)`
-   * 同一纪律：「必须走到 $transaction 里」这件事在调用点就是看得见的）。
+   * **唯一的过账入口**（引用 → 腿：解析账户、展开成复式腿，然后交给 `postLegs`）。
+   * 与业务写入共用**调用方**的事务（与 `OutboxService.publish(tx, msg)` 同一纪律：
+   * 「必须走到 $transaction 里」这件事在调用点就是看得见的）。
    *
    * ## 为什么签名收 `tx` 而不是自己开事务
    * P3 的「原子释放」要求「所有权转移 + 资金释放」在**同一个**事务里（设计 §8.5 原文：
    * 「`RELEASED` 与 `SETTLEMENT` 各自在单一事务内完成」）。账本自己开事务会从结构上
    * 排除这件事——而那时候的修法是「把账本拆成两半」，代价远大于一开始就收 `tx`。
    *
-   * ## 六步，顺序即语义
-   * ① 解析/惰性创建账户（用户账户 `ON CONFLICT DO NOTHING`；系统账户只查不建）
-   * ② 展开成复式腿 + **应用侧显式平衡断言**（C28）
-   * ③ 幂等：同键已存在 ⇒ 比腿（同 ⇒ 重放；异 ⇒ 409）
-   * ④ 读快照 → 纯核心算新余额（不变式 #3，产生稳定领域错误）
-   * ⑤ 落库：交易 + 分录；余额用**条件更新**（C25），只有用户账户带守卫
-   * ⑥ 审计：一行/一笔过账，**写在同一个 tx 里**（D10 / Task 2）
+   * ## 两扇门，一条落库路径
+   * 本方法只做「引用 → 腿」这一半（① 解析/惰性创建账户、② 展开成复式腿）；
+   * ③–⑥（幂等 / 快照与预判 / 落库 / 审计）在 `postLegs` 里，**两条路共用同一份实现**。
+   * 分开的理由不是分层美学，而是 C28 那条平衡断言需要一条**可达**的路径——见 `postLegs`。
    *
-   * 顺序里有一处是**承重**的：③ 在 ⑤ 之前。幂等键的唯一约束在 `ledger.transactions`
-   * 上，而 `ledgerTransaction.create` 是 ⑤ 的第一步——因此「同键」在**没有并发**时
-   * 由 ③ 判出来（重放或 409）；并发时第二个请求会卡在唯一索引上、等第一个提交后拿到
-   * `P2002`，由 `runWithIdempotentRetry` 重试一次、在 ③ 上走重放路径。
+   * 顺序里有一处是**承重**的：幂等判定在落库之前。幂等键的唯一约束在 `ledger.transactions`
+   * 上，而 `ledgerTransaction.create` 是落库的第一步——因此「同键」在**没有并发**时
+   * 由判定判出来（重放或 409）；并发时第二个请求会卡在唯一索引上、等第一个提交后拿到
+   * `P2002`，由 `runWithIdempotentRetry` 重试一次、走重放路径。
    */
   async post(tx: Prisma.TransactionClient, request: PostingRequest): Promise<PostingResult> {
     const moves = request.moves.map((m) => ({ ...m, from: normalizeRef(m.from), to: normalizeRef(m.to) }));
     const resolved = await this.resolveAccounts(tx, moves);
     const legs = movesToLegs(moves, resolved);
-    // ↓ 这一句看起来与 `movesToLegs` 内部的那次断言重复，**刻意保留**：C28 要求
-    //   「过账函数在自己算完之后、提交之前做一次显式平衡断言」，因为触发器经 Prisma
-    //   退化成 `DriverAdapterError`（code === undefined），领域错误只能从这里产生。
-    //   把这句话删掉、只靠 `movesToLegs` 内部那次，等于把这条要求藏进一个「展开腿」的
-    //   辅助函数里——下一个改动腿的生成方式的人不会知道自己在动一条不变式的执行点。
+    return this.postLegs(tx, {
+      kind: request.kind,
+      idempotencyKey: request.idempotencyKey,
+      legs,
+      actorId: request.actorId ?? null,
+    });
+  }
+
+  /**
+   * **直接腿入口**：腿由调用方手工构造（`accountId` 已是解析后的 id）。
+   *
+   * ## 它为什么存在 —— C28 那条显式平衡断言需要一条**可达**的路径
+   * `post` 的腿永远来自 `movesToLegs`，而它**按构造**总是平衡的（每一条转移同时产生
+   * `−a` 与 `+a`，和恒为 0）。探针 **p7**（Task 6）实测：把 `post` 里那次
+   * `assertBalanced` 删掉，**一条用例都不红**——在那条路上它是装饰。
+   * 控制器据此裁定（`progress.md` 的 p7 条）：保留这条断言，但把**理由**改成
+   * 「它是为**腿集不来自 `movesToLegs`** 的路径准备的」，并给它一条真的见证。
+   * 本方法就是那条路径：断言在它的第一行，`tests/integration/ledger/postings.test.ts`
+   * 的「直接腿入口」三条用例从这扇门进来（其中 ② 是**判别性**见证，见下）。
+   *
+   * ## 为什么判别性见证靠的是**顺序**而不是「会不会抛」
+   * 任何不平衡的腿集 `applyPosting` 也会抛同一个 `UnbalancedPostingError`（它的第一句
+   * 也是 `assertBalanced`），所以「抛没抛」分不开这两处。能分开的只有顺序：
+   * 本方法这一次在幂等判定**之前**（因此一笔结构上就是错的请求不会被当成
+   * 「一次幂等重放/冲突」来回答），而 `applyPosting` 那次在它**之后**。
+   * 探针 **p7'**（删掉本方法里的 `assertBalanced`）实测：入口 ② 以
+   * `IdempotencyKeyReusedError` 变红，其余用例全绿。**据实记载**：在同一条路径上，
+   * 这次的「拒绝」判据与纯核心那次是**冗余**的；它真正独有的责任是那个**顺序**。
+   *
+   * ## 这扇门验证得**更少**（据实记载，不是疏漏）
+   * 它不解析引用，因此没有：kind/owner 绑定检查、§8.1 之外的 kind 拒绝、
+   * 惰性创建账户、自转检查、同账户净额合并。`accountId` 由调用方负责，
+   * 从库里读回的快照仍会做 `assertAccountKind`，`applyPosting` 仍会判不变式 #3，
+   * 数据库那道延迟约束触发器仍会在 COMMIT 兜底。**P2 里唯一的调用方是本类自己**
+   * （`post`）与用例；将来若有第二条腿路，它必须先回答「谁保证那些 id 是被授权的」。
+   */
+  async postLegs(tx: Prisma.TransactionClient, request: PostingLegsRequest): Promise<PostingResult> {
+    const legs = request.legs.map((leg) => ({ ...leg }));
+    // ↓ C28 的执行点（本文件里**唯一**一次）：腿集不来自 `movesToLegs` 的那条路上，
+    //   这是「借贷必须平衡」的第一道、也是唯一一道应用侧守卫。
     assertBalanced(legs);
 
     const existing = await tx.ledgerTransaction.findUnique({
@@ -89,7 +122,7 @@ export class LedgerService {
       throw new IdempotencyKeyReusedError(request.idempotencyKey);
     }
 
-    const snapshots = await this.loadSnapshots(tx, resolved);
+    const snapshots = await this.loadSnapshots(tx, [...new Set(legs.map((leg) => leg.accountId))]);
     applyPosting(snapshots, legs); // ← 只取它的异常；并发权威在下面的受影响行数
 
     const transaction = await tx.ledgerTransaction.create({
@@ -218,13 +251,16 @@ export class LedgerService {
    * ④ 读快照（**同一事务内**）。没有它，纯核心的预判就只能靠猜余额。
    * 读出来的 `balance` 是 Prisma 的 `BigInt` → JS `bigint`，预检 A.2 实测**完全无损**
    * （含 `9007199254740993n` 与负数，`$queryRaw` 路径同样成立）。
+   *
+   * 参数是 **id 列表**（不是解析结果）：两扇门走到这里时都已经有 id 了——`post` 由
+   * `resolveAccounts` 解析出来，`postLegs` 由调用方直接给出。
    */
   private async loadSnapshots(
     tx: Prisma.TransactionClient,
-    resolved: readonly (AccountRef & { id: string })[],
+    accountIds: readonly string[],
   ): Promise<AccountSnapshot[]> {
     const rows = await tx.ledgerAccount.findMany({
-      where: { id: { in: resolved.map((r) => r.id) } },
+      where: { id: { in: [...accountIds] } },
       select: { id: true, kind: true, ownerUserId: true, balance: true },
     });
     return rows.map((row) => {
