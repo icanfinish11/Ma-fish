@@ -65,7 +65,6 @@ export interface ParsedMetadata {
    * 分母包含空文件，而照那个口径实现会让一份只有空文件的归档算出 `0/0`。口径的唯一
    * 来源在 `MetadataScanner.addFile` 的 `bytes > 0` 那个条件上。
    */
-
   languages: { name: string; bytes: number; ratio: number }[];
   /** 依赖清单（纯文本解析）：`package.json` / `requirements.txt` / `go.mod`。
    * vendored 目录里的清单**不算**——否则依赖的清单会占掉那 8 个名额。 */
