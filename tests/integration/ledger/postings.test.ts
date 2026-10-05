@@ -6,7 +6,7 @@ import { PrismaService } from '@vca/api/db/prisma.service.js';
 import { LedgerService } from '@vca/api/modules/ledger/ledger.service.js';
 import { TRANSACTION_KINDS } from '@vca/api/modules/ledger/core/types.js';
 import { ACCOUNT_KINDS, USER_ACCOUNT_KINDS } from '@vca/api/modules/ledger/core/account-kind.js';
-import { InsufficientFundsError, IdempotencyKeyReusedError } from '@vca/api/modules/ledger/core/errors.js';
+import { InsufficientFundsError, IdempotencyKeyReusedError, SystemAccountMissingError, UnknownAccountKindError } from '@vca/api/modules/ledger/core/errors.js';
 import { startPostgres, type TestPg } from '../../helpers/db.js';
 
 /**
@@ -352,9 +352,113 @@ describe('过账：LedgerService.post（C25 / C26 / C28 / D9 / D10）', () => {
     expect(await auditRowsFor(witnessKey)).toBe(1);
   });
 
-  it('readBalances：没有账户行 = 余额 0（D2）', async () => {
+  it('余额不足（顺序）⇒ **预判**先拦下（stage = predicted），且库里一行都不留', async () => {
+    // 这条用例是「`post` 真的调用了纯核心的 `applyPosting`」的**唯一**见证。
+    // 删掉 `post` 里那句 `applyPosting(snapshots, legs)` 之后，这条会以
+    // `stage === 'conditional-update'` 变红——顺序场景下条件更新**也**拦得住，
+    // 所以「两笔并发各冻结 6000」那条（它只断言 stage 落在两元素集合里）**指不出**
+    // 预判这条路有没有被走到。与 errors.ts 里 `stage` 那段注释是同一条理由。
+    const userId = uuidv7();
+    await prisma.$transaction((tx) =>
+      ledger.post(tx, {
+        kind: TRANSACTION_KINDS.TOPUP,
+        idempotencyKey: `seed:${userId}`,
+        moves: [{ from: topup, to: available(userId), amount: 1_000n }],
+      }),
+    );
+    const key = `insufficient:${userId}`;
+    const error = await prisma
+      .$transaction((tx) =>
+        ledger.post(tx, {
+          kind: TRANSACTION_KINDS.FREEZE,
+          idempotencyKey: key,
+          moves: [{ from: available(userId), to: frozen(userId), amount: 1_001n }],
+        }),
+      )
+      .then(() => null, (e: unknown) => e);
+    expect(error).toBeInstanceOf(InsufficientFundsError);
+    expect((error as InsufficientFundsError).stage).toBe('predicted');
+    // 被拒的那笔在库里不留任何痕迹（同一个事务，全部回滚）。
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: key } })).toBe(0);
+    expect(await ledger.readBalances(prisma, userId)).toEqual({ available: 1_000n, frozen: 0n });
+  });
+
+  it('kind 与 owner 的绑定写反 ⇒ UnknownAccountKindError（两个方向，库里不得出现第二行系统账户）', async () => {
+    // `resolveAccounts` 里那句 `isSystem !== (ref.ownerUserId === null)` 的见证。
+    // 写歪的后果**只有对账看得见**：`(owner_user_id, kind)` 的唯一索引把 NULL 视为互不相同，
+    // 因此「给系统 kind 安一个 owner」会静默建出第二个 PLATFORM_ESCROW 账户（预检 §B.2 实测过）。
+    const id = uuidv7();
+    await expect(
+      prisma.$transaction((tx) =>
+        ledger.post(tx, {
+          kind: TRANSACTION_KINDS.TOPUP,
+          idempotencyKey: `badref-user-null:${id}`,
+          moves: [{ from: topup, to: { kind: ACCOUNT_KINDS.USER_AVAILABLE, ownerUserId: null }, amount: 1n }],
+        }),
+      ),
+    ).rejects.toThrow(UnknownAccountKindError);
+    await expect(
+      prisma.$transaction((tx) =>
+        ledger.post(tx, {
+          kind: TRANSACTION_KINDS.ESCROW_LOCK,
+          idempotencyKey: `badref-system-owned:${id}`,
+          moves: [{ from: { kind: ACCOUNT_KINDS.PLATFORM_ESCROW, ownerUserId: uuidv7() }, to: available(id), amount: 1n }],
+        }),
+      ),
+    ).rejects.toThrow(UnknownAccountKindError);
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: { contains: `badref-` } } })).toBe(0);
+  });
+
+  it('系统账户缺失 ⇒ SystemAccountMissingError —— **不得**惰性创建（D2 的另一半）', async () => {
+    // `if (!row) throw new SystemAccountMissingError(...)` 的见证，同时是 D2
+    // 「系统账户只由迁移种子化」的**机器判据**：若把系统 kind 也放进惰性创建，
+    // 这个用例会变成「过账成功」——因为 `(NULL, kind)` 上没有唯一性，库里会出现第二行。
+    // 只有属主能删账户行（运行期角色被 REVOKE DELETE，Task 5 的 Item 0）。
+    const owner = new Client({ connectionString: pg.ownerUri });
+    await owner.connect();
+    try {
+      const removed = await owner.query(
+        `DELETE FROM "ledger"."accounts" WHERE "kind" = $1 AND "owner_user_id" IS NULL`,
+        [ACCOUNT_KINDS.PLATFORM_ESCROW],
+      );
+      expect(removed.rowCount, '构造失败：PLATFORM_ESCROW 那一行没被删掉（它是不是被分录引用了？）').toBe(1);
+
+      await expect(
+        prisma.$transaction((tx) =>
+          ledger.post(tx, {
+            kind: TRANSACTION_KINDS.ESCROW_LOCK,
+            idempotencyKey: `no-escrow:${uuidv7()}`,
+            moves: [{ from: available(uuidv7()), to: escrow, amount: 1n }],
+          }),
+        ),
+      ).rejects.toThrow(SystemAccountMissingError);
+    } finally {
+      // 复原（新 id、余额 0；此刻它还没有任何分录，所以删/建都是无损的）。
+      await owner.query(
+        `INSERT INTO "ledger"."accounts" ("id", "kind", "owner_user_id", "balance") VALUES ($1::uuid, $2, NULL, 0)`,
+        [uuidv7(), ACCOUNT_KINDS.PLATFORM_ESCROW],
+      );
+      await owner.end();
+    }
+    expect(await prisma.ledgerAccount.count({ where: { kind: ACCOUNT_KINDS.PLATFORM_ESCROW, ownerUserId: null } })).toBe(1);
+  });
+
+  it('readBalances：没有账户行 = 余额 0（D2），且 UUID 的大小写不敏感', async () => {
     expect(await ledger.readBalances(prisma, uuidv7())).toEqual({ available: 0n, frozen: 0n });
     expect(USER_ACCOUNT_KINDS).toEqual(['USER_AVAILABLE', 'USER_FROZEN']);
     expect(escrow.kind).toBe(ACCOUNT_KINDS.PLATFORM_ESCROW);
+
+    // ★ 大小写这条是 `readBalances` 里 `.toLowerCase()` 的**唯一**见证：
+    //   库里存的是小写，而大写拼写与那一行**不相等**（P1 的 `ownership.service` 在这里踩过），
+    //   于是「余额 10000」会静默变成「余额 0」——一个不会报错、只会算错的缺陷。
+    const userId = uuidv7();
+    await prisma.$transaction((tx) =>
+      ledger.post(tx, {
+        kind: TRANSACTION_KINDS.TOPUP,
+        idempotencyKey: `case:${userId}`,
+        moves: [{ from: topup, to: available(userId), amount: 10_000n }],
+      }),
+    );
+    expect(await ledger.readBalances(prisma, userId.toUpperCase())).toEqual({ available: 10_000n, frozen: 0n });
   });
 });
