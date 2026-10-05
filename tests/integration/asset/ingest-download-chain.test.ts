@@ -441,11 +441,18 @@ describe('上传 → 落库 → 签发 → 下载：一条真的能走通的链�
    * 另一份更短、完全自洽的制品（另一份合法归档加密出来的产物：末块标记正确、
    * 三条完整性校验全过、`open()` 成功）。只有**库里那个明文长度**能挡住它。
    *
+   * **I1 之后必须先对齐「身份」两列**（据实记载）：下载路径现在会先比对制品的**身份**
+   * （`reader.fileId !== version.fileId` ⇒ 500 `ASSET_ARTIFACT_UNREADABLE`），
+   * 而它排在内容校验之前——一份被换过的对象根本不该再被当成内容去解读。
+   * 于是要**单独**观测长度那一列，就必须先把 `file_id` / `key_id` 改成与盘上对象一致；
+   * 本用例的判据因此收窄为一句更准确的话：**身份一致时，长度是剩下的那道界**。
+   * 「一份别的制品被换进来」这个形态由 `signed-download.test.ts` 的**等长**用例覆盖。
+   *
    * 正面对照在同一个用例里：把那一列也改成替换制品的长度之后，下载必须成功并**原样**
    * 发出那份更短的制品。少了这半句，前面那句可能只是「任何被换过的制品都会被拒」，
    * 而不是「这条核对真的在承重」。
    */
-  it('制品在静止状态被换成更短的：带外长度核对拒绝它（422 + 零字节）；把长度改对则 200', async () => {
+  it('制品在静止状态被换成更短的（身份已对齐）：带外长度核对拒绝它（422 + 零字节）；把长度改对则 200', async () => {
     const uploader = await createUser();
     const cookie = await login(uploader);
     const plaintext = sampleBytes('ok.zip');
@@ -460,6 +467,11 @@ describe('上传 → 落库 → 签发 → 下载：一条真的能走通的链�
     // 把盘上那份换成**更短、完全自洽**的制品（用环境里的密钥环真实加密出来的字节）
     const seeded = await seedArtifact(new MemoryStore(), replacementPlaintext, { ring: ringFromEnv() });
     store.substitute = { key: version.storageKey, bytes: seeded.artifact };
+    // 身份两列对齐到这份替换制品（I1 之后它们是承重的，见上面的用例注释）
+    await prisma.assetVersion.update({
+      where: { id: versionId },
+      data: { fileId: seeded.header.fileId.toString('hex'), keyId: seeded.header.keyId },
+    });
 
     const issued = await issue(versionId, cookie);
     expect(issued.status, `响应体=${issued.text}`).toBe(200);
@@ -476,6 +488,7 @@ describe('上传 → 落库 → 签发 → 下载：一条真的能走通的链�
     await expect(store.stat(version.storageKey)).resolves.toMatchObject({ bytes: seeded.artifact.length });
 
     // 正面对照：把那一列改成替换制品的明文长度 ⇒ 同一次替换必须**成功**发出那份更短的制品
+    // （身份两列在上面已经对齐，因此这里改的**只有**长度那一列。）
     await prisma.assetVersion.update({
       where: { id: versionId },
       data: { plaintextBytes: replacementPlaintext.length },

@@ -180,6 +180,33 @@ export class DownloadService {
     try {
       // **本请求局部**的读取器（见类注释：不池化、不缓存、不留字段）。
       reader = await EncryptedArtifactReader.open(this.store, version.storageKey, this.ring);
+      /**
+       * **承重的一行（I1）**：盘上那份制品必须是**这条版本记录指向的那一份**。
+       *
+       * 删掉它 ⇒ 任何能往制品卷里写一个文件的人（正是本地加密卷设计所针对的那个不可信角色）
+       * 可以把对象换成**另一份明文长度完全相同的、合法加密的制品**（zip 让「等长」很容易：
+       * 条目名与内容同长即可），而它会通过嗅探、归档校验、末块认证与下面的带外长度核对，
+       * 最后**以那位创作者的作品之名被发出去**。长度**不是身份**。
+       *
+       * 身份的事实来源是 `fileId`：它出现在**每一个块的 AAD** 里（`artifact-format.ts`
+       * 的 `buildAad`），因此读取器报出来的这个值只能等于这份制品真实的身份——头虽然不在
+       * AAD 里，但改头里的 `fileId` 会让所有块认证失败。
+       *
+       * 拒绝走 `ArtifactUnreadableError`（500 + 审计 `unreadable`）而不是 422：盘上那份
+       * 不是这条记录指向的那一份，**责任方在服务端/存储侧**，不是调用方的制品内容不可接受。
+       */
+      if (reader.fileId !== version.fileId) {
+        throw new Error(
+          `制品的身份与版本记录不符：对象头里的 fileId=${reader.fileId}，而 asset_versions.file_id=${version.fileId}`,
+        );
+      }
+      // `keyId` 不在 AAD 里，因此它不是新的安全边界（改了就选错密钥、解密直接失败）；
+      // 它挡的是「记录与对象对不上」这一类运维错误，成本是一行。
+      if (reader.keyId !== version.keyId) {
+        throw new Error(
+          `制品的密钥 id 与版本记录不符：对象头里的 keyId=${reader.keyId}，而 asset_versions.key_id=${version.keyId}`,
+        );
+      }
     } catch (error) {
       await this.recordFailure(ticket, 'unreadable');
       // 与接入路径**同一个**错误类型 ⇒ HTTP 边界上**同一处**翻译（500）。

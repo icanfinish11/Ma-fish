@@ -53,17 +53,30 @@ export class AssetAccessService {
   }
 
   /**
-   * 下载路径要的那几列（版本存在性 + 制品定位 + **带外明文长度**）。
+   * 下载路径要的那几列（版本存在性 + 制品定位 + **带外明文长度** + **制品身份**）。
    *
    * 为什么把 `plaintextBytes` 一起取出来（而不是让调用方再去查一次）：它是下载路径上
    * **承重**的那个数——必须作为 `expectedPlaintextLength` 传给归档校验（见
    * `download.service.ts` 的强制义务那一段）。同一次查询里取出它，就没有「忘了带上」
    * 这条路径。
+   *
+   * 为什么 `fileId` / `keyId` 也在这里（I1）：它们同样是**承重**的核对值，而且只能是
+   * 同一次查询里的同几列——「下载路径必须把制品的身份与这条记录比对」这条义务要么
+   * 在这个 `select` 里成立，要么在调用方多一次查询里成立，后者迟早会漏。
+   * 与 `plaintextBytes` 一样，它们**只**用于服务端的比对，不进任何响应体
+   * （`readMetadata` 的 `select` 里没有它们，见那边的注释）。
    */
   async findDownloadableVersion(assetVersionId: string): Promise<DownloadableVersion | null> {
     const row = await this.prisma.assetVersion.findUnique({
       where: { id: assetVersionId },
-      select: { id: true, assetId: true, storageKey: true, plaintextBytes: true },
+      select: {
+        id: true,
+        assetId: true,
+        storageKey: true,
+        plaintextBytes: true,
+        fileId: true,
+        keyId: true,
+      },
     });
     if (row === null) return null;
     return {
@@ -71,6 +84,8 @@ export class AssetAccessService {
       assetId: row.assetId,
       storageKey: row.storageKey,
       plaintextBytes: row.plaintextBytes,
+      fileId: row.fileId,
+      keyId: row.keyId,
     };
   }
 
@@ -130,6 +145,16 @@ export interface DownloadableVersion {
    * `expectedPlaintextLength` 传回校验器——格式里没有任何字段认证制品总长。
    */
   readonly plaintextBytes: number;
+  /**
+   * 「这份制品」的身份：制品头里的 `fileId`（hex，AAD 绑定的那个值）。
+   *
+   * 下载路径**必须**把它与读取器解出来的 `fileId` 比对（I1）：只核长度挡不住
+   * 「另一份明文等长的合法制品」被换进制品卷——那正是这份设计所针对的不可信角色
+   * 能做、且只靠长度看不出来的事。
+   */
+  readonly fileId: string;
+  /** 写入时用的制品密钥 id（= 制品头里的那个）。同一次比对里顺带核对（见 `reader.keyId`）。 */
+  readonly keyId: string;
 }
 
 /** 元数据响应的形状：`ParsedMetadata` 逐字段 + 版本 id（**只有它，没有别的**）。 */

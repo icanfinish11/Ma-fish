@@ -109,6 +109,35 @@ export class EncryptedArtifactReader extends EventEmitter implements RandomAcces
   /** 明文总字节数（尾部自称、且已与实际块长度之和核对过）。调用方拿它作 zip 的 `totalSize`。 */
   readonly plaintextLength: number;
 
+  /**
+   * 制品头里的 `fileId`（**十六进制**，与 `asset_versions.file_id` 同一表示）。
+   *
+   * ## 为什么它必须被暴露出来（I1：最终全分支审查的 Important 项）
+   *
+   * `fileId` 出现在**每一个块的 AAD** 里（见 `artifact-format.ts` 的 `buildAad`），
+   * 因此它就是「这份制品」的**身份**：换一份别的制品，AAD 就对不上、认证必然失败。
+   * 但这条绑定只在**加密层**成立——**盘上那份制品究竟是不是这条版本记录指向的那一份**，
+   * 此前没有任何一层比对过：下载路径只核对了带外明文长度，而长度**不是身份**
+   * （另一份明文长度相同的合法制品完全可以通过全部检查）。
+   *
+   * 因此读取器把已经解出来的这个值**交出去**（`open()` 里本来就解了它，只是没有出口），
+   * 由下载路径与版本行里的 `file_id` 比对——那个比对在 `DownloadService.readVerified`。
+   *
+   * **一处据实记载**：头本身**不在任何 AAD 里**，所以这里的值也来自不可信输入；
+   * 但它要能骗过认证，就必须与所有块 AAD 里用的那个 `fileId` 一致——也就是说，
+   * 它只能等于**这份制品真实的身份**。比对因此是有效的（不是「信头里那个自称值」）。
+   */
+  readonly fileId: string;
+
+  /**
+   * 制品头里的 `keyId`（选密钥用的那个）。
+   *
+   * 暴露它是为了同一处的一致性核对：`keyId` **不在** AAD 里，因此改它不会带来
+   * 「换一份制品而不被发现」的能力（改了就选错密钥 ⇒ 解密直接失败），
+   * 它挡的是**记录与对象对不上**这一类运维错误（例如对象被换成了用另一把键加密的那一份）。
+   */
+  readonly keyId: string;
+
   private readonly store: ArtifactStore;
   private readonly key: string;
   private readonly decipher: ChunkDecipher;
@@ -151,6 +180,7 @@ export class EncryptedArtifactReader extends EventEmitter implements RandomAcces
     decipher: ChunkDecipher,
     blocks: readonly BlockSpan[],
     plaintextLength: number,
+    header: ArtifactHeader,
   ) {
     super();
     this.store = store;
@@ -158,6 +188,9 @@ export class EncryptedArtifactReader extends EventEmitter implements RandomAcces
     this.decipher = decipher;
     this.blocks = blocks;
     this.plaintextLength = plaintextLength;
+    // 头已经由 `decodeHeader` 校验过（magic / 版本 / 长度），这里只做表示转换。
+    this.fileId = header.fileId.toString('hex');
+    this.keyId = header.keyId;
   }
 
   /**
@@ -209,7 +242,7 @@ export class EncryptedArtifactReader extends EventEmitter implements RandomAcces
       blocks.push({ plaintextStart, length: entry.ciphertextLength, artifactStart: Number(entry.offset) });
       plaintextStart += entry.ciphertextLength;
     }
-    return new EncryptedArtifactReader(store, key, decipher, blocks, Number(footer.plaintextLength));
+    return new EncryptedArtifactReader(store, key, decipher, blocks, Number(footer.plaintextLength), header);
   }
 
   /**

@@ -12,7 +12,7 @@ import { AssetService } from '@vca/api/modules/asset/asset.service.js';
 import { AssetVersionService } from '@vca/api/modules/asset/asset-version.service.js';
 import { OwnershipService } from '@vca/api/modules/asset/ownership.service.js';
 import { createKeyRing, type KeyRing } from '@vca/api/modules/asset/crypto/key-ring.js';
-import { FOOTER_BYTES, decodeFooter } from '@vca/api/modules/asset/crypto/artifact-format.js';
+import { FOOTER_BYTES, decodeFooter, decodeHeader } from '@vca/api/modules/asset/crypto/artifact-format.js';
 import { parseMetadata } from '@vca/api/modules/asset/metadata/parse-metadata.js';
 import { ARTIFACT_STORE, type ArtifactStore } from '@vca/api/modules/asset/store/artifact-store.port.js';
 import { LocalArtifactStore } from '@vca/api/modules/asset/store/local-artifact.store.js';
@@ -29,8 +29,8 @@ import { fetchCsrfToken } from '../../helpers/csrf.js';
 import { startPostgres, type TestPg } from '../../helpers/db.js';
 import { testEnv } from '../../helpers/env.js';
 import { startTestRedis, type TestRedis } from '../../helpers/redis.js';
-import { ARCHIVE_SAMPLES } from '../../fixtures/archives/generate.js';
-import { MemoryStore, seedArtifact } from '../../helpers/craft-encrypted-artifact.js';
+import { ARCHIVE_SAMPLES, buildZip } from '../../fixtures/archives/generate.js';
+import { MemoryStore, pattern, seedArtifact } from '../../helpers/craft-encrypted-artifact.js';
 
 /**
  * 签名下载（P1 / Task 8；规格 D10 + D11，验收判据 8 / 9）。
@@ -634,6 +634,18 @@ describe('签名下载（D10）：授权、单次使用、超时、篡改、审�
  *
  * 变异探针（见报告 p1）：删掉 `expectedPlaintextLength` 那个入参，第 1 条立刻变成
  * 200 并把**错的字节**发出去。
+ *
+ * ## I1 之后这些用例为什么要显式对齐「身份」两列（据实记载）
+ *
+ * I1 给下载路径加上了**制品身份**核对（`reader.fileId !== version.fileId` ⇒ 500），
+ * 而它排在内容校验**之前**（一份被换过的对象根本不该再被当成内容去解读）。
+ * 于是「把别的制品换进制品卷」现在**先**在那一关被拒——本节原先靠替换对象来观测的
+ * **长度核对**因此不再可达。要**单独**观测长度那一列，就必须先把身份两列对齐
+ * （`alignIdentityColumns`）：「长度不符」这条判据的完整含义因此是
+ * **「身份一致时，长度是剩下的那道界」**。
+ *
+ * 「一份别的制品被换进来」这个形态本身由**同文件的「等长」用例**覆盖（它不碰库、只换对象，
+ * 判据是 500 + 零字节）——两条用例合起来，两个控制各自都有会变红的见证。
  */
 describe('签名下载：制品被换成更短的自洽制品时，带外长度核对必须拒掉它（零字节）', () => {
   let app: INestApplication;
@@ -673,7 +685,7 @@ describe('签名下载：制品被换成更短的自洽制品时，带外长度�
   });
 
   /** 与上一节同款的最短路径：真实接入 → 真实落库 → 签发 → 兑换。 */
-  async function setupVersion(): Promise<{
+  async function setupVersion(plaintext: Buffer = sampleBytes('ok.zip')): Promise<{
     owner: string;
     cookie: string;
     assetId: string;
@@ -682,7 +694,7 @@ describe('签名下载：制品被换成更短的自洽制品时，带外长度�
     original: Buffer;
   }> {
     const owner = (await prisma.user.create({ data: {} })).id;
-    const original = sampleBytes('ok.zip');
+    const original = plaintext;
     const asset = await prisma.asset.create({ data: { ownerId: owner } });
     const write = await assets.putStream(Readable.from([original]), { maxBytes: MAX_UPLOAD_BYTES });
     const ingested = await assets.finalize(write, { uploadedById: owner });
@@ -736,7 +748,23 @@ describe('签名下载：制品被换成更短的自洽制品时，带外长度�
     }
   }
 
-  it('被换成更短的制品（长度仍记为原值）⇒ 422 + **零字节**：核对发生在写出第一个字节之前', async () => {
+  /**
+   * 把版本行里的**身份两列**改成与盘上那个对象一致（`file_id` / `key_id`）。
+   *
+   * I1 之后这两列是承重的：任何「把别的制品换进制品卷」的形态都会先被身份核对拒掉
+   * （500），因此要单独观测**长度**那一列的判据必须先对齐它们——见本节注释末段。
+   * 改得动库的人当然能改任何东西，这一点本节的用例从来没有否认过：
+   * 它们证明的是「哪一列在承重」，而不是「改库也能骗过」。
+   */
+  async function alignIdentityColumns(versionId: string, artifact: Buffer): Promise<void> {
+    const { header } = decodeHeader(artifact);
+    await prisma.assetVersion.update({
+      where: { id: versionId },
+      data: { fileId: header.fileId.toString('hex'), keyId: header.keyId },
+    });
+  }
+
+  it('被换成更短的制品（**身份已对齐**、长度仍记为原值）⇒ 422 + **零字节**：核对发生在写出第一个字节之前', async () => {
     const { versionId, storageKey, original, cookie } = await setupVersion();
     const replacementPlaintext = sampleBytes('ok.tar.gz');
     // 「攻击者形态」的那份字节：**另一份合法归档**重新加密（完全自洽、末块标记正确）
@@ -744,6 +772,8 @@ describe('签名下载：制品被换成更短的自洽制品时，带外长度�
     expect(replacementPlaintext.length).toBeLessThan(original.length);
 
     store.substitute = { key: storageKey, bytes: replacement };
+    // 身份两列对齐到这份替换制品 ⇒ 唯一还不符的就是**长度**那一列（见本节注释末段）。
+    await alignIdentityColumns(versionId, replacement);
     try {
       const res = await download(await issue(versionId, cookie));
 
@@ -779,6 +809,9 @@ describe('签名下载：制品被换成更短的自洽制品时，带外长度�
       // 这一行就是「攻击者还得同时改库」的那一步：改得动库的人已经能改任何东西，
       // 因此本用例证明的**不是**「改库也能骗过」，而是**上面那条 422 是长度值造成的**——
       // 同一份字节、同一个请求，只把那个数改对，结论就从 422 变成 200。
+      // `alignIdentityColumns` 是 I1 之后必须先做的一步（身份两列也是承重的，见本节注释末段）：
+      // 对齐之后两份请求之间**唯一**的差别仍然只有长度那一列。
+      await alignIdentityColumns(versionId, replacement);
       await prisma.assetVersion.update({ where: { id: versionId }, data: { plaintextBytes: replacementPlaintext.length } });
 
       const res = await download(await issue(versionId, cookie));
@@ -792,6 +825,81 @@ describe('签名下载：制品被换成更短的自洽制品时，带外长度�
     } finally {
       store.substitute = null;
     }
+  });
+
+  /**
+   * **I1：制品的身份必须与版本行比对**（最终全分支审查的 Important 项）。
+   *
+   * ## 这一条补的是哪个洞（攻击者形态）
+   *
+   * 上面两条用例钉的是**长度**：更短的制品被 422 拦下、把长度也改对就 200。
+   * 但长度**不是身份**。任何能往制品卷里写一个文件的人（**正是**本地加密卷设计所针对的
+   * 那个不可信角色）可以把对象 K 换成**另一份明文长度完全相同的、合法加密的制品**：
+   * zip 让「等长」变得很容易（条目名同长、内容同长、stored 条目 ⇒ 整份 zip 同长）。
+   * 它会通过 `sniff`、`inspectZip`、末块认证与那条长度核对，然后**以那位创作者的作品之名
+   * 被发出去**。
+   *
+   * 而版本行里早就有能抓住它的东西：`file_id` 出现在**每一个块的 AAD** 里——它就是这份
+   * 制品的身份——只是从来没有执行者去比对它（「声明了但未强制」那一类）。这条用例就是
+   * 那个执行者：长度相同、结构自洽、末块正确，**身份不同就一律拒**。
+   *
+   * 判据同时钉住责任方：拒绝落在**存储侧**（`ASSET_ARTIFACT_UNREADABLE` / 500 / 审计
+   * `unreadable`），不是「调用方的制品不可接受」（那是 422）——盘上那份不是这条记录指向的
+   * 那一份，这是服务端/存储侧的问题。
+   */
+  it('被换成**等长**的另一份合法制品 ⇒ 拒绝且零字节：长度相同不算同一份制品（I1）', async () => {
+    // 两份 zip 的总长度逐字节相等：条目名同长（a.txt / b.txt）、内容同长、都是 stored 条目。
+    const original = buildZip([{ name: 'a.txt', data: pattern(64 * 1024, 1) }]);
+    const replacementPlaintext = buildZip([{ name: 'b.txt', data: pattern(64 * 1024, 2) }]);
+    expect(replacementPlaintext.length, '本用例的前提是两份明文等长').toBe(original.length);
+    expect(replacementPlaintext.equals(original), '本用例的前提是两份明文不同').toBe(false);
+
+    const { versionId, storageKey, cookie } = await setupVersion(original);
+    // 「攻击者形态」的那份字节：另一次加密（**另一把 fileId**）、同一把活动密钥、
+    // 同样的明文长度 ⇒ 长度核对、末块认证、归档校验全部会通过。
+    const replacement = (await seedArtifact(new MemoryStore(), replacementPlaintext, { ring: ringFromEnv() })).artifact;
+    expect(replacement.length).not.toBe(0);
+
+    store.substitute = { key: storageKey, bytes: replacement };
+    try {
+      const res = await download(await issue(versionId, cookie));
+
+      expect(res.status, `响应体=${res.text}`).toBe(500);
+      const body = errorBody(res);
+      expect(body.code).toBe('ASSET_ARTIFACT_UNREADABLE');
+      // 内容级别：替换制品的**一个字节**都不许出去，原制品同样不许
+      expectNoArtifactBytes(res, replacementPlaintext);
+      expectNoArtifactBytes(res, original);
+      // 失败理由落在存储侧，而不是「内容不可接受」那条出口
+      const rows = await prisma.auditLog.findMany({
+        where: { resourceId: versionId },
+        orderBy: { createdAt: 'asc' },
+        select: { action: true, metadata: true },
+      });
+      expect(rows.map((row) => row.action)).toEqual(['asset.download_url_issued', 'asset.download_failed']);
+      expect(rows[1]?.metadata).toMatchObject({ reason: 'unreadable' });
+    } finally {
+      store.substitute = null;
+    }
+  });
+
+  /**
+   * `key_id` 那半行也有见证（**它不是安全边界，但它是承重的契约**）。
+   *
+   * 造法：对象**一个字节都不换**，只把版本行的 `key_id` 改成一个别的合法取值。
+   * 身份（`fileId`）仍然一致 ⇒ I1 的第一道比对通过；而读取器报出来的 `keyId` 与记录不符 ⇒
+   * 拒绝。删掉那一行的话这次下载会**照常成功**（读取器按**头里**的 keyId 选键，对象是真的）
+   * ——也就是说，没有这一行，「记录说用 v1、对象其实是 v2」这件事在服务端**没有任何痕迹**。
+   * 它不是安全边界：改头里的 keyId 会选错密钥、解密直接失败（见 `reader.keyId` 的注释）。
+   */
+  it('版本行的 key_id 与对象头里的不符 ⇒ 同样拒绝（契约核对，不是安全边界）', async () => {
+    const { versionId, cookie } = await setupVersion();
+    await prisma.assetVersion.update({ where: { id: versionId }, data: { keyId: 'v9-retired' } });
+
+    const res = await download(await issue(versionId, cookie));
+
+    expect(res.status, `响应体=${res.text}`).toBe(500);
+    expect(errorBody(res).code).toBe('ASSET_ARTIFACT_UNREADABLE');
   });
 
   it('尾块被改一位（长度自洽）⇒ 422 + 零字节：末块认证在任何结论之前', async () => {
@@ -818,7 +926,7 @@ describe('签名下载：制品被换成更短的自洽制品时，带外长度�
     }
   });
 
-  it('每个请求一个新读取器：换掉对象（长度也改对）之后，第二次下载给出的是**新的**字节', async () => {
+  it('每个请求一个新读取器：换掉对象（身份与长度都改对）之后，第二次下载给出的是**新的**字节', async () => {
     const { versionId, storageKey, original, cookie } = await setupVersion();
 
     const first = await download(await issue(versionId, cookie));
@@ -828,6 +936,7 @@ describe('签名下载：制品被换成更短的自洽制品时，带外长度�
     const replacementPlaintext = sampleBytes('ok.tar.gz');
     const replacement = (await seedArtifact(new MemoryStore(), replacementPlaintext, { ring: ringFromEnv() })).artifact;
     store.substitute = { key: storageKey, bytes: replacement };
+    await alignIdentityColumns(versionId, replacement);
     await prisma.assetVersion.update({ where: { id: versionId }, data: { plaintextBytes: replacementPlaintext.length } });
     try {
       const second = await download(await issue(versionId, cookie));
