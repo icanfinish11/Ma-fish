@@ -71,6 +71,26 @@ describe('parseEnv', () => {
       parseEnv({ ...VALID, ARTIFACT_KEYS: ring({ v1: base64Key('cb') + 'AAAA' }) } as NodeJS.ProcessEnv),
     ).toThrowError(/ARTIFACT_KEYS/);
   });
+
+  it('上传上限有上界（1 GiB）：再往上会让一次成功上传在 INSERT 撞 int4 溢出（M2）', () => {
+    /**
+     * 失效形态（这是本用例存在的理由）：`plaintext_bytes` 是 `Int`（int4，上限 2,147,483,647）。
+     * 上限设到 2 GiB 以上时，整份包**传完、写完**之后才在 `INSERT` 上撞 Postgres `22003`
+     * ⇒ 500，而且制品对象已经落盘。**传输的代价已经付掉了**，错却报在最晚的一刻。
+     *
+     * 边界两侧都钉：1 GiB（D6 的值）放行，比它大一个字节就拒。
+     */
+    expect(
+      () => parseEnv({ ...VALID, ARTIFACT_MAX_UPLOAD_BYTES: String(1024 ** 3) } as NodeJS.ProcessEnv),
+      '1 GiB 是 D6 的值，必须放行',
+    ).not.toThrow();
+    for (const tooBig of [1024 ** 3 + 1, 2 ** 31, 2 ** 32]) {
+      expect(
+        () => parseEnv({ ...VALID, ARTIFACT_MAX_UPLOAD_BYTES: String(tooBig) } as NodeJS.ProcessEnv),
+        `${String(tooBig)} 字节应当被拒（它会让 plaintext_bytes 在 INSERT 溢出 int4）`,
+      ).toThrowError(/ARTIFACT_MAX_UPLOAD_BYTES/);
+    }
+  });
 });
 
 /**
