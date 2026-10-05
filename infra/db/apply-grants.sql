@@ -29,7 +29,10 @@
 -- ════════════════════════════════════════════════════════════════════════════
 
 -- 用 schema 的前提是有 USAGE；没有它，后续表级 GRANT 全部无意义。
-GRANT USAGE ON SCHEMA auth, audit, notify, asset TO app_user;
+-- P2 / Task 4：`ledger` 加进这一行——它是**前提**，不是可选的美化：没有 USAGE 时
+-- 下面那条 `GRANT … ON ALL TABLES IN SCHEMA ledger` 语法就通不过（schema 必须存在），
+-- 而即便它存在，运行期角色对 ledger 下的任何对象也会在解析阶段被挡。
+GRANT USAGE ON SCHEMA auth, audit, notify, asset, ledger TO app_user;
 
 -- ── auth：通用业务表，可读写（改密、注销需要 UPDATE/DELETE）──────
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA auth TO app_user;
@@ -82,6 +85,39 @@ REVOKE UPDATE, DELETE ON asset.ownership_history FROM app_user;
 GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA audit TO app_user;
 REVOKE UPDATE, DELETE ON ALL TABLES IN SCHEMA audit FROM app_user;
 
+-- ── ledger：账本（P2 / Task 4，设计 §8.3 不变式 #5）──────────────────────
+-- `accounts` 是**要可写**的（余额是物化值，过账就是改它），因此先发 schema 级广播；
+-- `entries` 与 `transactions` 是 **append-only**，紧随其后逐表撤权。
+--
+-- ⚠️ 这一对语句**不能省**：实测新建 schema 上只写 schema 级 `GRANT … ON ALL TABLES` 时
+-- `has_table_privilege(app_user, …, 'UPDATE') = 'true'`，而且 app_user **真的**把一条分录
+-- 从 100 改成了 999（append-only 不成立）。补上逐表 REVOKE 之后才拒绝、
+-- relacl 回到 `app_user=ar/vca_owner`。
+--
+-- 见证（两层，缺一不可）：CI 的「运行期角色的权限事实」那一步查
+-- `has_table_privilege` 的 14 项；`tests/integration/db/ledger-enforcement.test.ts` 另查
+-- `aclexplode(relacl)` 的**逐表能力集合**，并**真的**以 app_user 发一次 UPDATE/DELETE
+-- 看它被拒、且那两行数据没被动过（「拒绝」本身不是判据）。
+--
+-- ⚠️ `GRANT … ON ALL TABLES` **不覆盖 SEQUENCE**：本 schema 里**没有**任何 SEQUENCE
+-- （三张表全是 UUIDv7 主键，C4），因此这里**刻意不写** `GRANT USAGE ON SEQUENCES`。
+-- 那句话不是推测，而是被一条用例行使过的实测：
+-- `tests/integration/db/ledger-enforcement.test.ts` 里「序列那条坑的两个方向」会临时建一张
+-- bigserial 表，断言 app_user 的 INSERT 先以 `permission denied for sequence` 被拒、
+-- 补上序列授权后被接受，然后把它删掉。将来谁在这里加自增主键，那条用例会指出必须补授权
+-- （而不是等到生产上第一次写入）。
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ledger TO app_user;
+
+-- ledger.entries：**append-only**（不变式 #5）——分录是账本的事实，写进去就不能改、
+-- 不能删。一行改过的分录会让「这笔钱去哪了」这个问题永久失去答案。
+GRANT SELECT, INSERT ON ledger.entries TO app_user;
+REVOKE UPDATE, DELETE ON ledger.entries FROM app_user;
+
+-- ledger.transactions：同样是 **append-only**。幂等键的唯一约束是「不许重复过账」的执行点，
+-- 而允许改写/删除交易行会把那条约束变成一句可撤销的话（改掉 idempotency_key 即可重放）。
+GRANT SELECT, INSERT ON ledger.transactions TO app_user;
+REVOKE UPDATE, DELETE ON ledger.transactions FROM app_user;
+
 -- ── 未来新建的表沿用同样默认权限 ──────────────────────────────────
 -- 放在本文件而非 roles.sql：`ALTER DEFAULT PRIVILEGES ... IN SCHEMA <名>` 要求该 schema
 -- 此刻已存在（只有属主或超级用户能执行，且 schema 必须存在），而这些 schema 由 Prisma
@@ -96,4 +132,9 @@ ALTER DEFAULT PRIVILEGES FOR ROLE vca_owner IN SCHEMA audit
 -- asset 的默认权限是**可读写**（作品/版本/元数据会持续演进），append-only 的表靠
 -- 逐表撤权（默认权限是按 schema 发的，做不到「只给这张表少一档」）。
 ALTER DEFAULT PRIVILEGES FOR ROLE vca_owner IN SCHEMA asset
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_user;
+-- ledger 同 asset 的形状：`accounts` 要可写（物化余额），`entries` / `transactions`
+-- 靠上面那两对逐表 GRANT/REVOKE 例外出来。**默认权限只影响此后新建的表**，而每次
+-- `migrate deploy` 之后本文件都会重跑，因此「新表拿到什么权限」只有这一份定义。
+ALTER DEFAULT PRIVILEGES FOR ROLE vca_owner IN SCHEMA ledger
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_user;

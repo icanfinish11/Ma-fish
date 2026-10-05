@@ -19,9 +19,14 @@ generator client {
   output   = "../src/generated/prisma"
 }
 
+// `schemas` 是 `prisma migrate diff --from-config-datasource` 的**可见性边界**：
+// 不在这里列出的 schema 对它**结构性失明**（整个 schema 连表带触发器一起不存在，
+// 它照样报 `No difference detected.`——P2 / Task 1 的决定性实测，
+// 见 docs/superpowers/notes/2026-10-06-p2-migration-drift.md §2）。
+// 因此**新增一个模块 schema 时，把名字加进这一行与声明它的 model 必须在同一个提交里**。
 datasource db {
   provider = "postgresql"
-  schemas  = ["auth", "audit", "notify", "asset"]
+  schemas  = ["auth", "audit", "notify", "asset", "ledger"]
 }
 
 // ── auth ──────────────────────────────────────────────────────────
@@ -253,4 +258,105 @@ model OwnershipHistory {
   @@index([assetId, createdAt])
   @@schema("asset")
   @@map("ownership_history")
+}
+
+// ── ledger ── 复式记账（P2 / Task 4；设计 §8）─────────────────────────
+//
+// 三张表就是账本的全部：账户（物化余额）、交易（幂等键的载体）、分录（append-only 的事实）。
+// **刻意没有** `currency` 列（D1：C16 + MVP 单币种）、**刻意没有** `EscrowRecord`
+// （D3：冻结分录本身就是托管记录，`EscrowRecord` 属 P3 的 Order）。
+//
+// ## 这个 schema 里的强制点分成两半，**两半的见证方式不同**
+//
+//   * **Prisma 建得出来的那半**（表 / 列 / 索引 / 外键 / 唯一约束）由 `migrate diff`
+//     的零漂移门见证——它比的是库与模型。
+//   * **Prisma 表达不了的那半**（延迟约束触发器、条件化 CHECK、非零 CHECK、系统账户种子）
+//     **只有真库能见证**。实测：库里挂着手写 plpgsql 函数 + `DEFERRABLE INITIALLY DEFERRED`
+//     约束触发器 + `CHECK` 时，`migrate diff` 照样报 `No difference detected.`
+//     （`docs/superpowers/notes/2026-10-06-p2-migration-drift.md` §3）。
+//     因此**不要**把零漂移门读成「手写 DDL 还在」；那半的证据在
+//     `tests/integration/db/ledger-enforcement.test.ts`
+//     （`pg_proc` / `pg_trigger` / `pg_get_constraintdef` 目录断言 + 行为用例）。
+//
+// ## 为什么账户没有跨 schema 外键指向 auth.users
+// 与 P1 的 asset schema 同一条理由（C5）：归属由调用方给出的 UUID 表达，
+// 跨模块的约束留在接口层。
+
+/// 一个账户 = (kind, owner)。**用户账户惰性创建**；**系统账户由迁移种子化恰好一次**（D2）。
+model LedgerAccount {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  /// `USER_AVAILABLE` / `USER_FROZEN` / `PLATFORM_ESCROW` / `PLATFORM_REVENUE` / `EXTERNAL_TOPUP`
+  /// ——**只有这五个**（§8.1）。§8.2 里的 `SELLER_AVAILABLE` 之流是「另一个用户的
+  /// `USER_AVAILABLE`」，**不是**新的 kind（C30）。取值集合的定义处是
+  /// `core/account-kind.ts`（Task 5）。
+  kind String
+
+  /// 用户账户的当事人；系统账户为 NULL。**不变式 #3 只约束有 owner 的那两种 kind**
+  /// （条件化 CHECK，见迁移），因为系统账户天然为负——实测：无条件 CHECK 会钉死充值路径。
+  ownerUserId String? @map("owner_user_id") @db.Uuid
+
+  /// 物化余额（**分**，bigint）。只由过账函数在事务内改动，且与分录同一事务（C27）。
+  balance BigInt @default(0)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  entries LedgerEntry[]
+
+  /// 用户账户的 (owner, kind) 唯一 ⇒ 惰性创建的 `ON CONFLICT DO NOTHING` 有约束可依
+  /// （实测三次并发 → 1/0/0）。
+  ///
+  /// **注意它对系统账户不成立**：PostgreSQL 的唯一索引把 NULL 视为互不相同，
+  /// 因此 (NULL, 'PLATFORM_ESCROW') 可以出现多行。这正是系统账户**不用**惰性创建、
+  /// 而由迁移种子化恰好一次的原因（D2）；「恰好三个系统账户」由
+  /// `tests/integration/db/ledger-enforcement.test.ts` 的一条计数断言守住。
+  @@unique([ownerUserId, kind])
+  @@schema("ledger")
+  @@map("accounts")
+}
+
+/// 一笔过账（复式记账的「交易」）。幂等键的唯一约束在这里（C26 / §8.5）。
+model LedgerTransaction {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  /// 业务类型：`TOPUP` / `FREEZE` / `UNFREEZE` / `ESCROW_LOCK` / `ESCROW_RELEASE`
+  /// （§8.2 的行；取值集合见 `core/types.ts`，Task 5）。
+  kind String
+
+  /// **幂等键**（§8.5「每个 Worker 任务有幂等键」）。唯一约束是它的执行点：
+  /// 重复得到可判别的 P2002，而**不是**被 upsert 静默去重（P0 的 `OutboxService`
+  /// 已经立了同款规矩：重复发布是调用方需要知道的事实）。
+  idempotencyKey String @unique @map("idempotency_key")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  entries LedgerEntry[]
+
+  @@schema("ledger")
+  @@map("transactions")
+}
+
+/// 分录（**append-only**，C7 / 不变式 #5）。
+///
+/// `amount` 的符号约定（全账本唯一一处定义）：**正 = 贷（该账户余额增加），负 = 借（减少）**。
+/// 因此 §8.2 的 `DR X CR Y` 记作 `X: -a`、`Y: +a`，而「每笔交易 Σ = 0」就是不变式 #1。
+model LedgerEntry {
+  id            String @id @default(uuid(7)) @db.Uuid
+  transactionId String @map("transaction_id") @db.Uuid
+  accountId     String @map("account_id") @db.Uuid
+
+  /// 有符号的「分」。`<> 0` 由迁移里的行级 CHECK 强制（一笔交易在某个账户上的净额不得为 0）。
+  amount BigInt
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  transaction LedgerTransaction @relation(fields: [transactionId], references: [id])
+  account     LedgerAccount     @relation(fields: [accountId], references: [id])
+
+  /// 这条索引是**被一个真实查询逼出来的**：延迟约束触发器在 COMMIT 时按 `transaction_id`
+  /// 聚合（`AFTER ROW` 逐行触发 ⇒ 20 条腿 20 次聚合）。预检 §C.18 的实测开销
+  /// （10 腿 11.4 ms / 200 腿 35.5 ms）就是在这条索引下量的。
+  @@index([transactionId])
+  @@schema("ledger")
+  @@map("entries")
 }
