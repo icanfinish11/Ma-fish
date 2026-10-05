@@ -50,6 +50,33 @@ async function auditRowsFor(key: string): Promise<number> {
 }
 
 /**
+ * 把 `(userId, USER_AVAILABLE)` 与 `(userId, USER_FROZEN)` 两行**先建出来**（一个来回，余额复原）。
+ *
+ * 为什么必须：账户行是惰性创建的，而创建那条 `INSERT … ON CONFLICT DO NOTHING` 在一行
+ * 正被另一个事务占用时会**等那个事务结束**（实测见「条件更新是并发权威」用例里的逐字证据）。
+ * 不先把两行建出来的话，并发用例里后来的那个请求会在 **INSERT** 上排队，等第一个提交之后
+ * 才读快照——于是「唯一索引」那条路与「条件更新」那条路**都走不到**。
+ * 这不是推测：探针 **p15a**（把幂等判别器改成恒 `false`，即 P2002 不再被重试）跑出来
+ * 幂等③ 照样绿，说明它当时一次都没撞到唯一索引。
+ */
+async function materializeAccounts(userId: string): Promise<void> {
+  await prisma.$transaction((tx) =>
+    ledger.post(tx, {
+      kind: TRANSACTION_KINDS.FREEZE,
+      idempotencyKey: `materialize-out:${userId}`,
+      moves: [{ from: available(userId), to: frozen(userId), amount: 1n }],
+    }),
+  );
+  await prisma.$transaction((tx) =>
+    ledger.post(tx, {
+      kind: TRANSACTION_KINDS.UNFREEZE,
+      idempotencyKey: `materialize-back:${userId}`,
+      moves: [{ from: frozen(userId), to: available(userId), amount: 1n }],
+    }),
+  );
+}
+
+/**
  * 等到有 n 个后端卡在锁上（`wait_event_type = 'Lock'`），并**返回它们正在执行的语句**。
  *
  * 它只被「条件更新是并发权威」那条用例用到。返回语句这件事不是装饰，而是那条用例的
@@ -163,9 +190,13 @@ describe('过账：LedgerService.post（C25 / C26 / C28 / D9 / D10）', () => {
   });
 
   it('幂等③：3 个并发同键请求 ⇒ 恰好 1 个 created=true、其余 created=false、库里恰好 1 笔交易', async () => {
-    // 这一条行使的是 `runWithIdempotentRetry` 的 P2002 路径（预检 C.5 实测的真实并发形态：
-    // 3 并发 → 1 成功 / 2 × P2002，最终 1 行）。不加那一层重试时，另外两个请求会以
-    // P2002 冒到 HTTP 层变成 500 —— 幂等路由在并发下退化成「一个 200 + 两个 500」。
+    // **这一条断言的是结果，不是路径。** 计划原本写着它「行使的是 runWithIdempotentRetry 的
+    // P2002 路径（预检 C.5：3 并发 → 1 成功 / 2 × P2002）」——**实测不是**：这里用的是全新的
+    // 当事人，账户行还不存在，于是三笔都先去做那次 `INSERT … ON CONFLICT DO NOTHING`，
+    // 后两笔在第一笔的账户行上等到它提交，等完再读快照就已经能看见那一行了 ⇒ 它们走的是
+    // `findUnique` 的**重放**路径，唯一索引一次都没被撞到。证据是探针 **p15a**：把判别器改成
+    // 恒 `false`（P2002 不再重试）之后，这一条**照样绿**。
+    // 那条路因此由下面那条**确定性**用例单独负责；这里保留的是并发下的**结果**判据。
     const userId = uuidv7();
     const request = {
       kind: TRANSACTION_KINDS.TOPUP,
@@ -180,6 +211,67 @@ describe('过账：LedgerService.post（C25 / C26 / C28 / D9 / D10）', () => {
     expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: request.idempotencyKey } })).toBe(1);
     expect(await ledger.readBalances(prisma, userId)).toEqual({ available: 300n, frozen: 0n });
   });
+
+  it('★ 并发同键**真的**会撞 P2002，且重试一次后走重放（确定性构造：后来的那个卡在幂等键的唯一索引上）', async () => {
+    // 上一条证明的是结果；这一条证明的是**路径**——`isIdempotencyConflict` 认出真库上那条
+    // 约束、`runWithIdempotentRetry` 真的重试了、重试后真的走了重放。构造是确定性的：
+    //   W：一笔过账，`ledger.transactions` 那一行已插入、事务挂住不提交；
+    //   A：同一幂等键的另一笔 ⇒ 它的 `findUnique` **看不见** W 那行（未提交）⇒ 一路走到
+    //      `ledgerTransaction.create` ⇒ 卡在唯一索引上（等 W 的 xid）；
+    //   放行 W ⇒ A 拿到 23505 / P2002 ⇒ 重试一次 ⇒ 重放（created:false）。
+    // 判别力（两条探针实测）：p15a（判别器恒 false）与 p9（不重试）都会让这条变红。
+    const userId = uuidv7();
+    await prisma.$transaction((tx) =>
+      ledger.post(tx, {
+        kind: TRANSACTION_KINDS.TOPUP,
+        idempotencyKey: `seed:${userId}`,
+        moves: [{ from: topup, to: available(userId), amount: 500n }],
+      }),
+    );
+    await materializeAccounts(userId);
+
+    const request = {
+      kind: TRANSACTION_KINDS.FREEZE,
+      idempotencyKey: `p2002:${userId}`,
+      moves: [{ from: available(userId), to: frozen(userId), amount: 100n }],
+    } as const;
+
+    let winnerWroteTheRow!: () => void;
+    const winnerInserted = new Promise<void>((resolve) => { winnerWroteTheRow = resolve; });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const winner = prisma.$transaction(
+      async (tx) => {
+        const result = await ledger.post(tx, request);
+        winnerWroteTheRow(); // transactions 那一行已插入、未提交 ⇒ 唯一索引会挡住后来的同键插入
+        await gate;
+        return result;
+      },
+      { timeout: 20_000 },
+    );
+    await winnerInserted;
+
+    const loser = ledger.runWithIdempotentRetry((tx) => ledger.post(tx, request));
+
+    const observer = new Client({ connectionString: pg.appUri });
+    await observer.connect();
+    let blockedStatements: string[];
+    try {
+      blockedStatements = await waitForLockWaiters(observer, 1);
+    } finally {
+      await observer.end();
+    }
+    expect(
+      blockedStatements.filter((sql) => /INSERT INTO "ledger"\."transactions"/.test(sql)),
+      `等锁的语句必须是那条幂等键的 INSERT（否则撞的不是唯一索引，这条用例证明的不是它想证明的事）。实测：${JSON.stringify(blockedStatements)}`,
+    ).toHaveLength(1);
+
+    release();
+    const winnerResult = await winner;
+    await expect(loser).resolves.toEqual({ transactionId: winnerResult.transactionId, created: false });
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: request.idempotencyKey } })).toBe(1);
+    expect(await ledger.readBalances(prisma, userId)).toEqual({ available: 400n, frozen: 100n });
+  }, 120_000);
 
   it('并发扣款：初始 10000 分、两笔并发各冻结 6000 ⇒ 恰好一笔成功、余额 4000', async () => {
     // ★ 这条用例是 C25 的判据。预检实测的两种失败形态：读-判断-写 ⇒ 两笔都成功、
@@ -231,29 +323,12 @@ describe('过账：LedgerService.post（C25 / C26 / C28 / D9 / D10）', () => {
         moves: [{ from: topup, to: available(userId), amount: 10_000n }],
       }),
     );
-    // ★ 把 `USER_FROZEN` 这一行**先建出来**（一个来回，余额回到 10000/0）。
-    //   为什么必须：账户行是**惰性创建**的，而「创建」这条路径本身会等锁——实测
-    //   （`pg_stat_activity` 的 `query` 逐字，见报告 §「构造的见证」）：
-    //   `INSERT … ON CONFLICT DO NOTHING` 撞上一行正被另一个事务插入/更新时，
-    //   唯一索引的冲突检测会按该行的 `xmin` **等那个事务结束**（`wait_event = 'transactionid'`）。
-    //   不先建出来的话，W 就是 `USER_FROZEN` 的创建者，而 A 会在**那条 INSERT** 上等
-    //   W——于是 A 等到 W 提交之后才读快照，由纯核心的预判拦下（`predicted`），
-    //   `conditional-update` 那条路**一次都走不到**。这条构造要的是「A 的第一个锁点是
-    //   借方守卫」，因此两行都必须先存在。
-    await prisma.$transaction((tx) =>
-      ledger.post(tx, {
-        kind: TRANSACTION_KINDS.FREEZE,
-        idempotencyKey: `materialize-out:${userId}`,
-        moves: [{ from: available(userId), to: frozen(userId), amount: 1n }],
-      }),
-    );
-    await prisma.$transaction((tx) =>
-      ledger.post(tx, {
-        kind: TRANSACTION_KINDS.UNFREEZE,
-        idempotencyKey: `materialize-back:${userId}`,
-        moves: [{ from: frozen(userId), to: available(userId), amount: 1n }],
-      }),
-    );
+    // ★ 把 `USER_FROZEN` 这一行**先建出来**（`materializeAccounts`，一个来回、余额不变）。
+    //   理由逐字见那个 helper 的注释：不先建出来，W 就是 `USER_FROZEN` 的创建者，而 A 会在
+    //   **那条 INSERT** 上等 W——于是 A 等到 W 提交之后才读快照，由纯核心的预判拦下
+    //   （`predicted`），`conditional-update` 那条路**一次都走不到**。这条构造要的是
+    //   「A 的第一个锁点是借方守卫」，因此两行都必须先存在。
+    await materializeAccounts(userId);
 
     let writerHoldsTheRow!: () => void;
     const writerLocked = new Promise<void>((resolve) => { writerHoldsTheRow = resolve; });
