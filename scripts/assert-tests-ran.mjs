@@ -84,7 +84,18 @@ const GATES = {
   // 8 = 五条 100k-runs 金额属性 + 一条预算下限断言 + 一条 2^53 用例
   //     + 一条 `@fast-check/vitest` 接线用例（预检 §G.5）。
   //     实测值来自 `node scripts/assert-tests-ran.mjs property` 的输出，不是预测。
-  property: 8,
+  //
+  // P2 / Task 5：**8 → 11**（+3）。新增 `tests/property/ledger-fee-split.test.ts` 三条：
+  //   ① 控制器裁定 4 / C23 / 预检 §F.3 明写的那条属性——任意 `(gross, bps)` 下
+  //      `fee + net === gross`（bps 上界取到 100_000 ⇒ 顺带行使上限钳制分支）；
+  //   ② 向上取整的**全域**命题（`fee = ceil(gross·bps/10⁴)` 的最小性）——守恒那条钉不住
+  //      取整方向（向下取整 + 净额减出来照样守恒），这一条才钉得住；
+  //   ③ 反 vacuity 的生成器覆盖率（非零 fee / 「向上取整真的起作用」/ 钳制分支都被走到）。
+  //   三条的预算都是 `PROPERTY_NUM_RUNS = 100_000`（与设计 §8.3 的下限同源）。
+  //   ⚠️ 计划 Task 8 的算术表把「裁定 4 的费率属性」算作它自己的 +4 之一；那一条**已经在这里
+  //   交付**，因此 Task 8 落地 `ledger-invariants.test.ts` 时应当**重新读实测条数**再对齐
+  //   （本文件的既定规矩：数字与当前实际执行条数对齐，任何删除都会红一次）。
+  property: 11,
 };
 
 /** vitest 自己的 JS 入口（读它 `package.json` 里声明的 `bin.vitest`，不猜路径）。 */
