@@ -427,14 +427,25 @@ describe('过账：LedgerService.post（C25 / C26 / C28 / D9 / D10）', () => {
     //   只有让**同一形状**的查询在一次已提交的过账上返回 1，才能把 (b) 排掉。
     const witness = uuidv7();
     const witnessKey = `rollback-witness:${witness}`;
-    await prisma.$transaction((tx) =>
+    const committed = await prisma.$transaction((tx) =>
       ledger.post(tx, {
         kind: TRANSACTION_KINDS.TOPUP,
         idempotencyKey: witnessKey,
+        actorId: witness,
         moves: [{ from: topup, to: available(witness), amount: 1n }],
       }),
     );
     expect(await auditRowsFor(witnessKey)).toBe(1);
+
+    // 审计行的三个字段必须与这次业务写入对得上——§13.2 要求「审计日志可完整重建任一次
+    // 资金变动的链路」，而这条链路的三个扣件就是 (actorId, resource, resourceId)。
+    // 这一句是 `actorId: request.actorId ?? null` 的**唯一**见证（把它改成恒 null，
+    // 别的用例一条都不会红）。
+    const row = await prisma.auditLog.findFirst({
+      where: { metadata: { path: ['idempotencyKey'], equals: witnessKey } },
+      select: { actorId: true, resource: true, resourceId: true },
+    });
+    expect(row).toEqual({ actorId: witness, resource: 'LedgerTransaction', resourceId: committed.transactionId });
   });
 
   it('余额不足（顺序）⇒ **预判**先拦下（stage = predicted），且库里一行都不留', async () => {
