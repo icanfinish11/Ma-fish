@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { Env } from '../../config/env.schema.js';
+import { AuditService } from '../audit/index.js';
 import type { ArchiveKind } from './archive/sniff.js';
 import { validateArchive } from './archive/validate-archive.js';
 import {
@@ -69,6 +70,7 @@ import { EncryptedArtifactReader } from './store/random-access-reader.js';
 export class AssetService {
   private readonly store: ArtifactStore;
   private readonly ring: KeyRing;
+  private readonly audit: AuditService;
 
   /**
    * 密钥环在**构造期**建立（而不是每次上传现取）：
@@ -84,8 +86,10 @@ export class AssetService {
   constructor(
     @Inject(ARTIFACT_STORE) store: ArtifactStore,
     config: ConfigService<Env, true>,
+    audit: AuditService,
   ) {
     this.store = store;
+    this.audit = audit;
     this.ring = createKeyRing({
       ARTIFACT_KEYS: config.get('ARTIFACT_KEYS', { infer: true }),
       ARTIFACT_ACTIVE_KEY_ID: config.get('ARTIFACT_ACTIVE_KEY_ID', { infer: true }),
@@ -213,10 +217,78 @@ export class AssetService {
    * 与拒绝路径的清理出口——**只有一条**删除路径，否则「删干净了没有」要按最弱的那条判断。
    *
    * 幂等：对象不存在时静默返回（`ArtifactStore.delete` 的契约）。
+   *
+   * ## 删除失败时的处置（规格 §5 第 3 条：**必须明确选一个**，这就是选定的那个）
+   *
+   * **同步重试 {@link CLEANUP_ATTEMPTS} 次 → 写一行审计 → 抛 {@link ArtifactCleanupError}（控制器回 500）。**
+   *
+   * 三个候选里「同步重试 + 审计」与「留待清理标记 + worker 兜底」在本仓库里**是同一件事**：
+   * 新建一张清理表是 **Task 7** 的 schema 所有权（本任务明令不得自造 schema），
+   * 而 `audit_logs` 是现成的、**append-only**（写进去就删不掉）、可查询的持久落点——
+   * 于是那一行 `asset.artifact.cleanup_failed` **同时就是待清理标记**：
+   * `resource_id` = 被留下的对象键，将来任何 worker/运维都能按 `action` 扫出来清掉。
+   * 这就是两个候选的结合，且没有自造任何表。
+   *
+   * 为什么最后还要**抛错**：清理失败意味着制品库里多了一个没有版本记录的孤儿密文。
+   * 这时回 4xx（「你的归档不行」）会把服务端的清理故障说成调用方的问题，而**静默吞掉**
+   * 更糟——孤儿会无声地累积，没有任何东西会注意到。500 + 审计行让它在当下（请求）
+   * 与事后（append-only 行）**两个地方**都看得见。
    */
   async delete(key: string): Promise<void> {
-    await this.store.delete(key);
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= CLEANUP_ATTEMPTS; attempt++) {
+      try {
+        await this.store.delete(key);
+        return;
+      } catch (error) {
+        lastError = error;
+        // 退避一点点再试：瞬时失败（卷忙 / 杀软短暂占用 / fd 还没释放）是这一层的
+        // 主要失败形态。总代价有界：最多 (1+2) × 25ms，不会把一次请求拖成秒级。
+        if (attempt < CLEANUP_ATTEMPTS) await delay(CLEANUP_RETRY_DELAY_MS * attempt);
+      }
+    }
+
+    const failure = lastError instanceof Error ? lastError : new Error(String(lastError));
+    // 审计里只放**结构化、可检索**的三样：尝试次数、错误名、错误码。
+    // **不**放原始消息：它可能带着制品卷的文件系统路径，而审计行是 append-only 的
+    // （写进去就删不掉），路径不该因此永久留档（C11 的精神：只记非机密、必要的量）。
+    let auditFailure: string | null = null;
+    try {
+      await this.audit.record({
+        action: ARTIFACT_CLEANUP_FAILED_ACTION,
+        resource: 'AssetArtifact',
+        resourceId: key,
+        metadata: {
+          attempts: CLEANUP_ATTEMPTS,
+          errorName: failure.name,
+          errorCode: (failure as { code?: unknown }).code ?? null,
+        },
+      });
+    } catch (error) {
+      // 审计也写不进去：仍要抛（绝不静默），并把这件事写进错误消息里——这是唯一还能
+      // 留下痕迹的地方（两个持久化落点同时不可用，已经不是本层能兜住的故障）。
+      auditFailure = error instanceof Error ? error.message : String(error);
+    }
+    throw new ArtifactCleanupError(key, CLEANUP_ATTEMPTS, failure.message, auditFailure);
   }
+}
+
+/**
+ * 「密文对象没删掉」的审计动作名（append-only 表里的可检索键，**同时也是待清理标记**）。
+ *
+ * 稳定字符串：运维的告警规则与将来的清理 worker 都按它匹配（同 `audit.service.ts` 里
+ * `<域>.<动作>` 的命名约定）。
+ */
+export const ARTIFACT_CLEANUP_FAILED_ACTION = 'asset.artifact.cleanup_failed';
+
+/** 删除的同步尝试次数（含第一次）。 */
+const CLEANUP_ATTEMPTS = 3;
+
+/** 每次重试之间的基准退避（毫秒），按尝试序号线性放大。 */
+const CLEANUP_RETRY_DELAY_MS = 25;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
@@ -295,6 +367,29 @@ export class ArtifactUnreadableError extends Error {
   ) {
     super(`制品无法读取（键 ${key}）：${detail}`);
     this.name = 'ArtifactUnreadableError';
+  }
+}
+
+/**
+ * 密文对象删不掉（{@link AssetService.delete} 重试之后仍失败）。
+ *
+ * 与 {@link ArtifactUnreadableError} 一样属于**服务端**故障，因此走 500：调用方的归档
+ * 是不是合法与被留下的那个对象无关。审计行（`asset.artifact.cleanup_failed`）是它的
+ * 持久痕迹，见 `delete` 的注释。
+ */
+export class ArtifactCleanupError extends Error {
+  constructor(
+    readonly key: string,
+    readonly attempts: number,
+    readonly reason: string,
+    /** 审计也写失败时的原因；正常为 `null`（那时审计行就是痕迹本身）。 */
+    readonly auditFailure: string | null,
+  ) {
+    super(
+      `密文对象删除失败（键 ${key}，已尝试 ${attempts} 次）：${reason}` +
+        (auditFailure === null ? '' : `；审计写入同样失败：${auditFailure}`),
+    );
+    this.name = 'ArtifactCleanupError';
   }
 }
 

@@ -11,7 +11,7 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { Policy } from '../../common/policy/policy.decorator.js';
 import { RateLimited } from '../../common/security/throttler.js';
 import { currentContext } from '../../common/context/request-context.js';
-import { ArchiveRejectedError, ArtifactUnreadableError, AssetService, type StoredArtifact } from './asset.service.js';
+import { ArchiveRejectedError, ArtifactCleanupError, ArtifactUnreadableError, AssetService, type StoredArtifact } from './asset.service.js';
 
 /**
  * multipart 里的文件字段名。控制器**与**上传适配器必须用同一个名字，
@@ -106,6 +106,11 @@ export class AssetController {
         // 500 而不是 4xx：这是服务端/存储侧的问题，别把服务端故障说成「你上传的东西不行」。
         // 明细不进响应体（那是内部诊断信息），只留一个可检索的代号。
         throw new InternalServerErrorException({ code: 'ASSET_ARTIFACT_UNREADABLE' });
+      }
+      if (error instanceof ArtifactCleanupError) {
+        // 归档确实被拒了，但**密文对象没删掉**：此刻制品库里多了一个没有版本记录的孤儿。
+        // 回 500 而不是 422——理由与痕迹都在 `AssetService.delete` 的注释里（含那行审计）。
+        throw new InternalServerErrorException({ code: 'ASSET_ARTIFACT_CLEANUP_FAILED' });
       }
       throw error;
     }

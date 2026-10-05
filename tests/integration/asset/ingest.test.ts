@@ -19,6 +19,7 @@ import { ARTIFACT_STORE, type ArtifactStore } from '@vca/api/modules/asset/store
 import { ArchiveRejectedError, AssetService } from '@vca/api/modules/asset/asset.service.js';
 import { decodeHeader } from '@vca/api/modules/asset/crypto/artifact-format.js';
 import { createKeyRing, type KeyRing } from '@vca/api/modules/asset/crypto/key-ring.js';
+import { LocalArtifactStore } from '@vca/api/modules/asset/store/local-artifact.store.js';
 import { EncryptedArtifactReader } from '@vca/api/modules/asset/store/random-access-reader.js';
 import { ARCHIVE_SAMPLES } from '../../fixtures/archives/generate.js';
 
@@ -53,6 +54,14 @@ import { ARCHIVE_SAMPLES } from '../../fixtures/archives/generate.js';
  */
 const STORE_DIR = process.env.ARTIFACT_STORE_DIR as string;
 const MAX_UPLOAD_BYTES = Number(testEnv.ARTIFACT_MAX_UPLOAD_BYTES);
+
+/**
+ * 真库客户端与用户序号放在**模块级**：两组用例（正常流程 / 删除失败处置）各自引导一个应用，
+ * 但共用同一个 testcontainer 与同一份用户序号，免得两处各写一份。
+ */
+let prisma: PrismaService;
+/** 会话用户的序号：`upload` 限流是 **10 次/天/用户**，每个用例一个用户才不会被上一条用例透支。 */
+let userSeq = 0;
 
 /** 样本字节（八样本表；惰性生成，这里取一份）。 */
 function sampleBytes(name: string): Buffer {
@@ -95,13 +104,10 @@ describe('加密即入库（D1）：上传流 → 加密写制品库 → 校验 
   let app: INestApplication;
   let redis: TestRedis;
   let pg: TestPg;
-  let prisma: PrismaService;
   let store: ArtifactStore;
   let assets: AssetService;
   let csrf: string;
   let sessionId: string;
-  /** 会话用户的序号：`upload` 限流是 **10 次/天/用户**，每个用例一个用户才不会被上一条用例透支。 */
-  let userSeq = 0;
 
   beforeAll(async () => {
     await rm(STORE_DIR, { recursive: true, force: true });
@@ -267,4 +273,142 @@ describe('加密即入库（D1）：上传流 → 加密写制品库 → 校验 
     expect(body).not.toHaveProperty('plaintextBytes');
     await expect(storedObjects()).resolves.toEqual([]);
   });
+
+  /**
+   * **删除密文对象失败时的处置**（规格 §5 第 3 条；brief 的「先验再做」第 1 条）。
+   *
+   * ## 选定：同步重试 N 次 → 记审计 → 抛错（500）
+   *
+   * 三个候选（同步重试+审计 / 待清理标记 + worker 兜底 / 两者结合）里，**前两个在本仓库里是同一件事**：
+   *
+   * - 「重试」在当下就能救回绝大多数瞬时失败（卷忙、杀软短暂占用、fd 没释放）；
+   * - 「待清理标记」需要一个**持久**的落点，而新建一张清理表是 **Task 7** 的 schema 所有权
+   *   （本任务明令不得自造 schema）。今天唯一现成的、持久的、append-only 的、可查询的落点就是
+   *   `audit_logs`——于是一行 `asset.artifact.cleanup_failed` 审计**同时就是那个标记**：
+   *   `resource_id` 是被留下的对象键（UUIDv7），运维与将来的 worker 可以按 `action` 扫出来清掉。
+   *   这就是「两者结合」，却没有自造任何表；
+   * - 最后仍然**抛错**（控制器回 500）：清理失败意味着制品库里多了一个没有版本记录的孤儿，
+   *   这时回 4xx 会把「服务端没清干净」说成「你上传的东西不行」。
+   *
+   * 失败的可见性因此有两层：可检索的审计行（持久）+ 500（当下）——**绝不静默吞掉**。
+   *
+   * ## 为什么注入的是「包装过的真实存储」
+   *
+   * 只把 `delete` 换成会失败的实现，写入 / 读取 / 解密 / 校验走的全是真实实现：
+   * 这样「拒绝路径要不要删、删几次、删不掉之后留下什么」才是被真正观测的东西。
+   */
+  describe('删除密文对象失败时的处置（重试 → 审计 → 500）', () => {
+    let failingApp: INestApplication;
+    let failing: DeleteFailingStore;
+    let failingSession: string;
+    let failingCsrf: string;
+
+    beforeAll(async () => {
+      failing = new DeleteFailingStore(new LocalArtifactStore(STORE_DIR));
+      failingApp = await createTestApp({
+        overrides: [
+          // 复用本文件已经起好的 Redis 与真库；唯一的差别是制品库换成一个「删除会失败」的包装
+          (builder) => builder.overrideProvider(REDIS).useValue(redis.newClient()),
+          (builder) => builder.overrideProvider(PrismaService).useValue(prisma),
+          (builder) => builder.overrideProvider(ARTIFACT_STORE).useValue(failing),
+        ],
+      });
+      failingCsrf = await fetchCsrfToken(failingApp);
+    }, 240_000);
+
+    afterAll(async () => {
+      await failingApp?.close();
+    });
+
+    beforeEach(async () => {
+      failing.failTimes = 0;
+      failing.deleteCalls = 0;
+      userSeq += 1;
+      failingSession = (
+        await failingApp
+          .get(SessionService)
+          .create(`user-cleanup-${userSeq}`, { ip: '127.0.0.1', userAgent: 'vitest' })
+      ).sessionId;
+    });
+
+    it('第一次删除失败、重试成功：仍然回 4xx，对象被删掉，且**没有**审计行', async () => {
+      failing.failTimes = 1; // 只有第一次失败
+
+      const res = await request(failingApp.getHttpServer())
+        .post('/assets/upload')
+        .set('Cookie', `${SESSION_COOKIE}=${failingSession}; ${CSRF_COOKIE}=${failingCsrf}`)
+        .set(CSRF_HEADER, failingCsrf)
+        .attach('file', sampleBytes('fake-mime.zip'), 'pkg.zip');
+
+      expect(res.status, `响应体=${res.text}`).toBe(422);
+      expect(failing.deleteCalls, '删除只试了一次——重试没有发生').toBeGreaterThanOrEqual(2);
+      await expect(storedObjects()).resolves.toEqual([]);
+      const rows = await prisma.auditLog.findMany({ where: { action: 'asset.artifact.cleanup_failed' } });
+      expect(rows, '重试成功之后不该留下「清理失败」的审计行').toHaveLength(0);
+    });
+
+    it('三次都失败：留下审计行（含对象键与尝试次数）并回 500，对象仍在库里', async () => {
+      failing.failTimes = Number.POSITIVE_INFINITY;
+
+      const res = await request(failingApp.getHttpServer())
+        .post('/assets/upload')
+        .set('Cookie', `${SESSION_COOKIE}=${failingSession}; ${CSRF_COOKIE}=${failingCsrf}`)
+        .set(CSRF_HEADER, failingCsrf)
+        .attach('file', sampleBytes('fake-mime.zip'), 'pkg.zip');
+
+      expect(res.status, `响应体=${res.text}`).toBe(500);
+      expect((res.body as { code?: string }).code).toBe('ASSET_ARTIFACT_CLEANUP_FAILED');
+      // 同步重试了 3 次（不是试一次就放弃）
+      expect(failing.deleteCalls).toBe(3);
+
+      // 对象**仍在**制品库里：这正是需要被看见、被兜底清掉的那个孤儿
+      const leftovers = await storedObjects();
+      expect(leftovers).toHaveLength(1);
+      const key = leftovers[0]?.name.split('/').pop() ?? '';
+      expect(key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7/);
+
+      // 可观测痕迹：一行 append-only 审计（它同时就是「待清理标记」，见本组用例的说明）
+      const rows = await prisma.auditLog.findMany({ where: { action: 'asset.artifact.cleanup_failed' } });
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.resourceId).toBe(key);
+      expect(rows[0]?.resource).toBe('AssetArtifact');
+      expect(rows[0]?.metadata).toMatchObject({ attempts: 3, errorName: 'Error' });
+    });
+  });
 });
+
+/**
+ * 制品库替身：**读路径全部委派**给真实存储，只有 `delete` 按注入的次数失败。
+ *
+ * 这是**故障注入**，不是把依赖换成假的：密文的写入、读取、解密与校验走的都是真实实现，
+ * 被注入的只有「删除会不会失败」这一件事——而它正是那组用例的判据。
+ */
+class DeleteFailingStore implements ArtifactStore {
+  /** 还会失败几次（每次 delete 先扣减）。`Infinity` = 一直失败。 */
+  failTimes = 0;
+  deleteCalls = 0;
+
+  constructor(private readonly inner: ArtifactStore) {}
+
+  putStream(source: Readable, opts: { maxBytes: number }): ReturnType<ArtifactStore['putStream']> {
+    return this.inner.putStream(source, opts);
+  }
+
+  getRange(key: string, start: number, endInclusive: number): Promise<Buffer> {
+    return this.inner.getRange(key, start, endInclusive);
+  }
+
+  stat(key: string): Promise<{ bytes: number }> {
+    return this.inner.stat(key);
+  }
+
+  async delete(key: string): Promise<void> {
+    this.deleteCalls += 1;
+    if (this.failTimes > 0) {
+      this.failTimes -= 1;
+      throw new Error('注入的删除失败：卷不可写');
+    }
+    return this.inner.delete(key);
+  }
+}
+

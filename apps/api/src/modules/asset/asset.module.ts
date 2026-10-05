@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { MulterModule } from '@nestjs/platform-express';
 import type { Env } from '../../config/env.schema.js';
 import { createStreamingStorage } from '../../common/upload/stream-upload.js';
+import { AuditModule } from '../audit/index.js';
 import { AssetController } from './asset.controller.js';
 import { AssetService } from './asset.service.js';
 import { ARTIFACT_STORE, type ArtifactStore } from './store/artifact-store.port.js';
@@ -34,6 +35,10 @@ import { LocalArtifactStore } from './store/local-artifact.store.js';
  * 好看一点，代价是让 Task 1 那份「为什么必须独立成模块」的记载与代码对不上号。
  */
 @Module({
+  // `AuditModule` 是跨模块的**显式接口**（`modules/audit/index.ts`，§3.3 第 2 条）：
+  // 制品清理失败时的处置要落一行 append-only 审计（它同时就是「待清理标记」，见
+  // `asset.service.ts` 的 `delete`）。**不得**重建一个写审计的服务。
+  imports: [AuditModule],
   providers: [
     {
       provide: ARTIFACT_STORE,
