@@ -7,10 +7,12 @@ import request from 'supertest';
 import type { INestApplication } from '@nestjs/common';
 import { createTestApp } from '../../helpers/app.js';
 import { startTestRedis, type TestRedis } from '../../helpers/redis.js';
+import { startPostgres, type TestPg } from '../../helpers/db.js';
 import { fetchCsrfToken } from '../../helpers/csrf.js';
 import { testEnv } from '../../helpers/env.js';
 import { buildZip } from '../../fixtures/archives/generate.js';
 import { REDIS } from '@vca/api/db/redis.module.js';
+import { PrismaService } from '@vca/api/db/prisma.service.js';
 import { SESSION_COOKIE } from '@vca/api/common/http/cookie.js';
 import { CSRF_COOKIE, CSRF_HEADER } from '@vca/api/common/security/csrf.middleware.js';
 import { SessionService } from '@vca/api/modules/auth/session.service.js';
@@ -32,6 +34,16 @@ import { SessionService } from '@vca/api/modules/auth/session.service.js';
  * - **流式**：请求进行中，对象已在盘上且大小在增长，同时目录里**只有对象本身**（无临时副本，C21）；
  * - **上限**：超限 ⇒ 413，且制品库里**一个残留都没有**（验收判据）；
  * - **身份**：未认证 ⇒ 403 且一个字节都没写（这条钉住「上传不是 @Public()」）。
+ *
+ * ## 据实记载（Task 9）：这一组需要一个**真库**了
+ *
+ * 本文件此前只起 Redis：上传路径当时**不落库**（`persistIngested` 还没有生产调用方），
+ * 因此 `PrismaService` 那一份指向「形状合法但不存在的库」的夹具连接串从未被真的用到
+ * （它惰性建连，`$connect()` 不碰数据库——见 `prisma.service.ts`）。
+ * 接线之后，一个 201 里**必然**包含作品/版本/元数据三行，于是「上传成功」这个断言
+ * 只有在一个真的能写库的应用上才成立。这里因此补上 `startPostgres()` 与
+ * `overrideProvider(PrismaService)`，并把会话用户换成**真用户**（`owner_id` 是 `uuid` 列）。
+ * 这不是「给流式用例加依赖」，而是它的断言（201 + 盘上一个对象）在接线之后**蕴含**了落库。
  */
 /**
  * 本套件的制品目录：由 `tests/setup/artifact-store.ts`（Vitest 的 `setupFiles`）按 worker 定下。
@@ -189,27 +201,36 @@ function upload(
 describe('上传接入与制品存储（Task 1）', () => {
   let app: INestApplication;
   let redis: TestRedis;
+  let pg: TestPg;
+  let prisma: PrismaService;
   let port: number;
   let sessionId: string;
   let csrf: string;
-  /** 会话用户名的序号：见 `beforeEach` 里「每个用例一个用户」的理由。 */
-  let userSeq = 0;
 
   beforeAll(async () => {
     await rm(STORE_DIR, { recursive: true, force: true });
     redis = await startTestRedis();
+    // 真库（理由见文件头「据实记载（Task 9）」那段）：接线之后 201 蕴含三行落库。
+    pg = await startPostgres();
+    prisma = new PrismaService(pg.appUri);
+    await prisma.$connect();
     app = await createTestApp({
-      overrides: [(builder) => builder.overrideProvider(REDIS).useValue(redis.newClient())],
+      overrides: [
+        (builder) => builder.overrideProvider(REDIS).useValue(redis.newClient()),
+        (builder) => builder.overrideProvider(PrismaService).useValue(prisma),
+      ],
     });
     const server = app.getHttpServer() as http.Server;
     await new Promise<void>((resolve) => server.listen(0, resolve));
     port = (server.address() as { port: number }).port;
 
     csrf = await fetchCsrfToken(app);
-  }, 180_000);
+  }, 240_000);
 
   afterAll(async () => {
     await app?.close();
+    await prisma?.$disconnect();
+    await pg?.stop();
     await redis?.stop();
     // 只删**本 worker 自己的**目录（每 worker 一个，见文件头）。不再动 `process.env`：
     // 那个值由 `tests/setup/artifact-store.ts` 定下，本进程内所有用例共用同一个目录，
@@ -228,12 +249,16 @@ describe('上传接入与制品存储（Task 1）', () => {
     // 共用一个用户时余量只剩 2 次：**下一个上传用例会以 429 红**，而那个失败看起来像产品缺陷
     // （状态码断言直接指向限流，没人会想到是夹具的账已透支）。
     // 每用例一个用户让「本用例用掉了几次配额」变成局部可算的量——余量永远是 10 减去本用例的次数。
-    userSeq += 1;
-    sessionId = (await app.get(SessionService).create(`user-uploader-${userSeq}`, { ip: '127.0.0.1', userAgent: 'vitest' }))
-      .sessionId;
+    //
+    // **Task 9 起这个用户必须是真的**（`asset.assets.owner_id` 是 `uuid` 列，而上传路径
+    // 现在会落库）：`user-uploader-N` 这样的编造身份会让合法上传以 500 结束。
+    const user = await prisma.user.create({ data: {} });
+    sessionId = (
+      await app.get(SessionService).create(user.id, { ip: '127.0.0.1', userAgent: 'vitest' })
+    ).sessionId;
   });
 
-  it('上传成功：明文加密后入库（密文对象），返回版本记录', async () => {
+  it('上传成功：明文加密后入库（密文对象），返回作品与版本的标识', async () => {
     // **Task 5 起这个负载必须是真的归档**：上传路径现在会在写完之后立刻校验内容
     // （加密即入库，D1），随便一段字节会在 `validateArchive` 那里以 422 结束。
     const body = buildZip([
@@ -244,13 +269,25 @@ describe('上传接入与制品存储（Task 1）', () => {
     ]);
 
     const res = await upload(port, body, { csrf, sessionId });
-    const parsed = JSON.parse(res.body) as { sha256: string; plaintextBytes: number; kind: string };
+    const parsed = JSON.parse(res.body) as {
+      assetId: string;
+      assetVersionId: string;
+      sha256: string;
+      plaintextBytes: number;
+      kind: string;
+    };
 
     expect(res.status, `响应体=${res.body}`).toBe(201);
-    // 响应是版本记录里可对外的那三个字段（Task 1 的 {key, bytes} 临时形态到此结束）
+    // 响应是「这次上传诞生的作品与版本」（Task 1 的 {key, bytes} 临时形态 → Task 5 的三个字段
+    // → Task 9 起再加上两个 id，理由见控制器的 `IngestResponse`）。
     expect(parsed.plaintextBytes).toBe(body.length);
     expect(parsed.kind).toBe('zip');
     expect(parsed.sha256).toBe(createHash('sha256').update(body).digest('hex'));
+    expect(parsed.assetVersionId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    // 两个 id 指向**库里真的存在**的行（一个 201 现在蕴含三行落库）
+    const version = await prisma.assetVersion.findUniqueOrThrow({ where: { id: parsed.assetVersionId } });
+    expect(version.assetId).toBe(parsed.assetId);
+    expect(version.plaintextBytes).toBe(body.length);
 
     const objects = await storedObjects();
     expect(objects).toHaveLength(1);

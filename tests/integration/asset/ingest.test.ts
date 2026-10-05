@@ -63,12 +63,29 @@ const STORE_DIR = process.env.ARTIFACT_STORE_DIR as string;
 const MAX_UPLOAD_BYTES = Number(testEnv.ARTIFACT_MAX_UPLOAD_BYTES);
 
 /**
- * 真库客户端与用户序号放在**模块级**：两组用例（正常流程 / 删除失败处置）各自引导一个应用，
- * 但共用同一个 testcontainer 与同一份用户序号，免得两处各写一份。
+ * 真库客户端放在**模块级**：三组用例（正常流程 / 删除失败处置 / 静态被改动）各自引导
+ * 一个应用，但共用同一个 testcontainer，免得三处各写一份。
  */
 let prisma: PrismaService;
-/** 会话用户的序号：`upload` 限流是 **10 次/天/用户**，每个用例一个用户才不会被上一条用例透支。 */
-let userSeq = 0;
+
+/**
+ * 造一个**真用户**并为他开一条会话（Task 9 起上传路径会落库，而 `Asset.ownerId` /
+ * `AssetVersion.uploadedById` 都是 `uuid` 列）。
+ *
+ * **每个用例一个新用户**：`upload` 限流是 10 次/天/用户，共用会让「本用例用掉了几次配额」
+ * 变成一个跨用例的账（修复轮 1 / Fix 6 的原始理由，接线之后依然成立）。
+ * 此前这里用的是 `create('user-ingest-N')`——一个**不是 UUID** 的编造身份：在上传路径
+ * 还不落库的时候它完全够用（没有任何一列接住它），而接线之后第一个上传用例就会以 `22P02`
+ * 失败（表现为 500 `ASSET_PERSIST_FAILED`）。判据因此不能靠「编一个身份」，必须用真的用户行
+ * ——这也正是「端到端」这个词在这里的实际含义。
+ */
+async function loginFreshUser(application: INestApplication): Promise<{ userId: string; sessionId: string }> {
+  const user = await prisma.user.create({ data: {} });
+  const { sessionId } = await application
+    .get(SessionService)
+    .create(user.id, { ip: '127.0.0.1', userAgent: 'vitest' });
+  return { userId: user.id, sessionId };
+}
 
 /** 样本字节（八样本表；惰性生成，这里取一份）。 */
 function sampleBytes(name: string): Buffer {
@@ -184,6 +201,8 @@ describe('加密即入库（D1）：上传流 → 加密写制品库 → 校验 
   let assets: AssetService;
   let csrf: string;
   let sessionId: string;
+  /** 本次用例的会话用户（`Asset.ownerId` 要与他逐字相同）。 */
+  let userId: string;
 
   beforeAll(async () => {
     await rm(STORE_DIR, { recursive: true, force: true });
@@ -212,10 +231,7 @@ describe('加密即入库（D1）：上传流 → 加密写制品库 → 校验 
 
   beforeEach(async () => {
     await rm(STORE_DIR, { recursive: true, force: true });
-    userSeq += 1;
-    sessionId = (
-      await app.get(SessionService).create(`user-ingest-${userSeq}`, { ip: '127.0.0.1', userAgent: 'vitest' })
-    ).sessionId;
+    ({ userId, sessionId } = await loginFreshUser(app));
   });
 
   /** 真实 multipart 上传（带会话与 CSRF 令牌；字段名与控制器一致）。 */
@@ -315,18 +331,38 @@ describe('加密即入库（D1）：上传流 → 加密写制品库 → 校验 
     });
   }
 
-  it('HTTP：合法 zip 走完上传 → 201 + 版本记录（**不含**存储键）+ 制品库里只有一个密文对象', async () => {
+  it('HTTP：合法 zip 走完上传 → 201 + 作品与版本**真的落库**（响应不含存储键）', async () => {
     const plaintext = sampleBytes('ok.zip');
+    const assetsBefore = await prisma.asset.count();
 
     const res = await uploadOverHttp(plaintext);
     const body = res.body as Record<string, unknown>;
 
     expect(res.status, `响应体=${res.text}`).toBe(201);
-    // 响应就是「作品/版本记录」的那三个非内部字段（Task 1 的 {key, bytes} 临时形态到此结束）
-    expect(body).toEqual({ sha256: sha256(plaintext), plaintextBytes: plaintext.length, kind: 'zip' });
+    /**
+     * Task 9 起响应里有**可以据以行动的东西**：`assetId`（这次上传诞生的作品）与
+     * `assetVersionId`（签发下载要用它）。三个旧字段照旧。
+     */
+    expect(Object.keys(body).sort()).toEqual(['assetId', 'assetVersionId', 'kind', 'plaintextBytes', 'sha256']);
+    expect(body.sha256).toBe(sha256(plaintext));
+    expect(body.plaintextBytes).toBe(plaintext.length);
+    expect(body.kind).toBe('zip');
     // 存储键属于服务端内部状态，**不**出现在响应里（Task 1 的控制器注释把这条写成了 Task 5 的义务）
     expect(JSON.stringify(body)).not.toContain('storageKey');
     expect(JSON.stringify(body)).not.toContain('fileId');
+
+    // **接线之后才可能成立的那一半**：那不是一个「待落库记录」，库里真的有三行
+    // （作品 / 版本 / 元数据），而作品的所有人就是这次会话的用户。
+    const assetId = body.assetId as string;
+    const versionId = body.assetVersionId as string;
+    const asset = await prisma.asset.findUniqueOrThrow({ where: { id: assetId } });
+    expect(asset.ownerId).toBe(userId);
+    await expect(prisma.asset.count()).resolves.toBe(assetsBefore + 1);
+    const version = await prisma.assetVersion.findUniqueOrThrow({ where: { id: versionId } });
+    expect(version.assetId).toBe(assetId);
+    expect(version.plaintextBytes).toBe(plaintext.length);
+    expect(version.uploadedById).toBe(userId);
+    await expect(prisma.assetMetadata.count({ where: { assetVersionId: versionId } })).resolves.toBe(1);
 
     // 落盘的是密文：目录里恰好一个对象，而且它比明文大（头 + tag + 索引 + 尾部）
     const objects = await storedObjects();
@@ -529,12 +565,10 @@ describe('加密即入库（D1）：上传流 → 加密写制品库 → 校验 
       failing.deleteCalls = 0;
       failing.lastKey = '';
       failing.failureError = () => new Error('注入的删除失败：卷不可写');
-      userSeq += 1;
-      failingSession = (
-        await failingApp
-          .get(SessionService)
-          .create(`user-cleanup-${userSeq}`, { ip: '127.0.0.1', userAgent: 'vitest' })
-      ).sessionId;
+      // 真用户 + 真会话（理由见 `loginFreshUser`）：本组上传的都是**被拒**的样本，
+      // 走不到落库，但用编造的身份就会让「为什么这一组不需要真用户」变成一条要靠推理的题
+      // ——而接线之后的形状随时会变（例如将来给拒绝路径也写一行审计）。
+      ({ sessionId: failingSession } = await loginFreshUser(failingApp));
     });
 
     it('第一次删除失败、重试成功：仍然回 4xx，对象被删掉，且**没有**审计行', async () => {
@@ -673,12 +707,8 @@ describe('加密即入库（D1）：上传流 → 加密写制品库 → 校验 
 
     beforeEach(async () => {
       tampering.mutate = null;
-      userSeq += 1;
-      tamperingSession = (
-        await tamperingApp
-          .get(SessionService)
-          .create(`user-tamper-${userSeq}`, { ip: '127.0.0.1', userAgent: 'vitest' })
-      ).sessionId;
+      // 真用户 + 真会话：理由与 `loginFreshUser` 上那段相同。
+      ({ sessionId: tamperingSession } = await loginFreshUser(tamperingApp));
     });
 
     function uploadThroughTamper(bytes: Buffer): request.Test {

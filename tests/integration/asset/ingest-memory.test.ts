@@ -10,12 +10,11 @@ import type { INestApplication } from '@nestjs/common';
 // 这层「类型静态、值动态」的分工是本文件能覆盖上传上限的全部机制，理由见文件头。
 import type { ArtifactStore } from '@vca/api/modules/asset/store/artifact-store.port.js';
 import type { EncryptedArtifactReader } from '@vca/api/modules/asset/store/random-access-reader.js';
+import type { PrismaService } from '@vca/api/db/prisma.service.js';
+import type { TestPg } from '../../helpers/db.js';
 // 夹具是**纯数据生成器**（不 import 任何应用代码），因此它可以静态 import：
 // 本文件的「应用侧一律动态 import」那条约束针对的是会读 `process.env` 的应用模块图。
 import { buildZip } from '../../fixtures/archives/generate.js';
-
-/** 会话用户名的序号：`upload` 限流是 10 次/天/用户，每个用例一个用户才不会被上一条透支。 */
-let userSeq = 0;
 
 /**
  * 「加密即入库」链路的**内存上界**：完整制品（≥ 2 × CHUNK_SIZE）走真实 HTTP 路径
@@ -61,6 +60,13 @@ let userSeq = 0;
  * 应用模块的求值因此被推迟到 `beforeAll` 里「把 `process.env.ARTIFACT_MAX_UPLOAD_BYTES`
  * 写大」之后。理由与做法在 `tests/setup/artifact-store.ts` 的文件头有同一条实测记载
  * （静态 import 会被提升到文件内所有语句之前，因此「import 之后再写 env」仍然太晚）。
+ *
+ * ## 据实记载（Task 9）：这一组同样需要一个**真库**了
+ *
+ * 上传路径接线到落库之后，一个 201 里必然包含作品/版本/元数据三行——「合法上传 → 201」
+ * 这条断言只有在一个真的能写库的应用上才成立。因此 `beforeAll` 里补上 `startPostgres()`
+ * 与 `overrideProvider(PrismaService)`，会话用户也换成**真用户**（`owner_id` 是 `uuid` 列）。
+ * 判据本身（未完成字节数峰值 < 2 × CHUNK_SIZE + 余量）一个字节都没有改。
  */
 const STORE_DIR = process.env.ARTIFACT_STORE_DIR as string;
 const BOUNDARY = 'vca-test-large-boundary-4b1e';
@@ -232,6 +238,8 @@ function uploadLarge(
 describe('完整制品（≥ 2 × CHUNK_SIZE）走 HTTP：内存上界与「HTTP 边界上的往返一致」', () => {
   let app: INestApplication;
   let redis: { newClient(): unknown; stop(): Promise<void> };
+  let pg: TestPg;
+  let prisma: PrismaService;
   let port: number;
   let csrf: string;
   let sessionId: string;
@@ -246,7 +254,9 @@ describe('完整制品（≥ 2 × CHUNK_SIZE）走 HTTP：内存上界与「HTTP
       const appHelper = await import('../../helpers/app.js');
       const redisHelper = await import('../../helpers/redis.js');
       const csrfHelper = await import('../../helpers/csrf.js');
+      const dbHelper = await import('../../helpers/db.js');
       const redisModule = await import('@vca/api/db/redis.module.js');
+      const prismaModule = await import('@vca/api/db/prisma.service.js');
       const cookieModule = await import('@vca/api/common/http/cookie.js');
       const csrfMiddleware = await import('@vca/api/common/security/csrf.middleware.js');
       const configModule = await import('@nestjs/config');
@@ -260,8 +270,19 @@ describe('完整制品（≥ 2 × CHUNK_SIZE）走 HTTP：内存上界与「HTTP
 
       await rm(STORE_DIR, { recursive: true, force: true });
       redis = (await redisHelper.startTestRedis()) as unknown as typeof redis;
+      /**
+       * **真库**（Task 9）：上传路径现在会落库，因此一个 201 里必然包含作品/版本/元数据三行
+       * ——「合法上传 → 201」这条断言只有在一个真的能写库的应用上才成立。
+       * 类型是静态 import 的（`import type` 会被擦除，不影响本文件的加载顺序设计）。
+       */
+      pg = await dbHelper.startPostgres();
+      prisma = new prismaModule.PrismaService(pg.appUri);
+      await prisma.$connect();
       app = await appHelper.createTestApp({
-        overrides: [(builder) => builder.overrideProvider(redisModule.REDIS).useValue(redis.newClient())],
+        overrides: [
+          (builder) => builder.overrideProvider(redisModule.REDIS).useValue(redis.newClient()),
+          (builder) => builder.overrideProvider(prismaModule.PrismaService).useValue(prisma),
+        ],
       });
       const server = app.getHttpServer() as http.Server;
       await new Promise<void>((resolve) => server.listen(0, resolve));
@@ -284,6 +305,8 @@ describe('完整制品（≥ 2 × CHUNK_SIZE）走 HTTP：内存上界与「HTTP
 
   afterAll(async () => {
     await app?.close();
+    await prisma?.$disconnect();
+    await pg?.stop();
     await redis?.stop();
     await rm(STORE_DIR, { recursive: true, force: true });
   });
@@ -292,10 +315,13 @@ describe('完整制品（≥ 2 × CHUNK_SIZE）走 HTTP：内存上界与「HTTP
   beforeEach(async () => {
     await rm(STORE_DIR, { recursive: true, force: true });
     const sessionModule = await import('@vca/api/modules/auth/session.service.js');
+    // **真用户**（Task 9）：`asset.assets.owner_id` 是 `uuid` 列，而上传路径现在会落库
+    // ——编造的身份（`user-large-N`）会让合法上传以 500 结束。
+    const user = await prisma.user.create({ data: {} });
     sessionId = (
       await app
         .get(sessionModule.SessionService)
-        .create(`user-large-${String(userSeq++)}`, { ip: '127.0.0.1', userAgent: 'vitest' })
+        .create(user.id, { ip: '127.0.0.1', userAgent: 'vitest' })
     ).sessionId;
   });
 
