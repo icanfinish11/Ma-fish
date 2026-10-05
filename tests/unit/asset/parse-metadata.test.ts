@@ -433,10 +433,12 @@ describe('Task 6 · 元数据解析', () => {
     });
 
     it('排序：字节降序；字节相同时按语言名升序（与归档顺序无关）', async () => {
+      // 归档顺序刻意**不是**字母序：三个 50 字节的桶按出现顺序是 Markdown / Go / JSON，
+      // 期望的顺序是 Go / JSON / Markdown —— 不按名字做次级排序就会红（探针 m32 验过）。
       const bytes = buildZip([
+        { name: 'm.md', data: bytesOf(50) },
         { name: 'z.go', data: bytesOf(50) },
         { name: 'a.json', data: bytesOf(50) },
-        { name: 'm.md', data: bytesOf(50) },
         { name: 'big.py', data: bytesOf(200) },
       ]);
       expect((await parseOf(bytes, 'zip')).languages.map((language) => language.name)).toEqual([
@@ -956,6 +958,16 @@ describe('Task 6 · 元数据解析', () => {
         { name: 'README.md', data, method: 8, declaredCompressedSize: truncated },
       ]);
       await expect(parseOf(bytes, 'zip')).rejects.toThrow();
+    });
+
+    it('tar.gz 侧同一处置：流在中途被截断 ⇒ 抛错（不是崩掉，也不是空元数据）', async () => {
+      const full = buildTarGz([
+        { name: 'README.md', data: Buffer.from('r'.repeat(5000)) },
+        { name: 'src/main.ts', data: Buffer.from('const x = 1;\n'.repeat(50)) },
+      ]);
+      // 砍掉后半段：解压流在条目中间断掉，'end' 永远不会到。
+      const cut = Buffer.from(full.subarray(0, Math.floor(full.length / 2)));
+      await expect(parseOf(cut, 'tar.gz')).rejects.toThrow();
     });
   });
 });
