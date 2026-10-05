@@ -177,6 +177,15 @@ AAD             `${fileId}:${position}:${isLast ? 'last' : 'more'}`（UTF-8）
 > **R1**：旧稿写的「头部定长 48」是**算术错误**（`4+2+1+16+4+8+8+4 = 47`）。**R3 之后头部为 `31+N` 字节**（`4+2+1+N+16+4+4`：magic/version/keyIdLen/keyId/fileId/chunkSize/noncePrefix），因为 `plaintextLength` 与 `chunkCount` 已移入尾部。**代码已按 31+N 实现并复审通过**；本计划下文若再出现 47/48 均为陈旧文本。
 > **R4**：0 字节输入 ⇒ `chunkCount = 0`、`plaintextLength = 0`。
 > **R5**：环境面为**键环** `ARTIFACT_KEYS`（JSON `{keyId: base64(32B)}`）+ `ARTIFACT_ACTIVE_KEY_ID`，且引导期校验 active ∈ keys。**R6**：删除无读取方的 `MASTER_ENCRYPTION_KEY`。
+>
+> **I3 裁定（最终全分支审查，2026-10-05；规格级决定，取代上面 R3 的两处数字）**：
+> `noncePrefix` 由 4 字节加宽到 **8 字节**、块序号由 BE64 收窄为 **BE32**（nonce 仍是 12 字节），
+> `formatVersion` 1 → **2**，定长头 `31+N` → **`35+N`**（`4+2+1+N+16+4+8`）。
+> 理由（4 字节前缀下跨文件生日界：~9.3k 份制品 ≈ 1% 前缀碰撞、~65k ≈ 39%；而 GCM 的 nonce 重用
+> **还会暴露认证子密钥**，即那把密钥下的可伪造性）、代价与「为什么不改成轮换策略」写在
+> `../specs/2026-10-05-p1-asset-artifact-design.md` 的 **D4**。
+> **本计划里 `31+N` 与 `noncePrefix(4)` 出现的地方都已被 I3 取代**——规格的 D2/D3/D4 是现行真值，
+> 本文件是当时的裁决记录（保留它是为了留下「为什么是 35 而不是 47/48」的完整来路）。
 
 **Interfaces（已按 R2/R3/R5 更新；以 `artifact-format.ts` 的实际导出为准）:**
 ```ts
