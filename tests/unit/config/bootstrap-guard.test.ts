@@ -94,6 +94,8 @@ describe('引导期 fail-fast 接线（app.module → ConfigModule → validate�
     // 环境里仍然缺 `ARTIFACT_KEYS`，而下面那条断言要求报错点名 `ARTIFACT_KEYS`。
     'ARTIFACT_KEYS',
     'ARTIFACT_ACTIVE_KEY_ID',
+    // P1 / Task 8：下载票据的 HMAC 密钥（D10）。它必填、无默认值 ⇒ 缺它同样不许启动。
+    'DOWNLOAD_URL_SECRET',
   ] as const;
 
   it('必填密钥全部缺失时，求值 app.module 会拒绝启动', async () => {

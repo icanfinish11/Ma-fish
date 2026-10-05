@@ -1,17 +1,31 @@
 import {
   BadRequestException,
+  ConflictException,
   Controller,
+  ForbiddenException,
+  Get,
+  HttpCode,
+  HttpException,
+  HttpStatus,
   InternalServerErrorException,
+  NotFoundException,
+  Param,
   Post,
+  Query,
+  StreamableFile,
   UnprocessableEntityException,
   UploadedFile,
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { Policy } from '../../common/policy/policy.decorator.js';
+import { Policy, Public } from '../../common/policy/policy.decorator.js';
 import { RateLimited } from '../../common/security/throttler.js';
 import { currentContext } from '../../common/context/request-context.js';
+import { AssetAccessService, AssetVersionNotFoundError, type AssetMetadataView } from './asset-access.service.js';
 import { ArchiveRejectedError, ArtifactCleanupError, ArtifactUnreadableError, AssetService, type StoredArtifact } from './asset.service.js';
+import { DownloadForbiddenError, DownloadService, DownloadTicketRejectedError, type IssuedDownload } from './download/download.service.js';
+import { UUID_IDENTIFIER } from './download/signed-url.js';
+import { AssetNotFoundError, SelfTransferRejectedError } from './ownership.service.js';
 
 /**
  * multipart 里的文件字段名。控制器**与**上传适配器必须用同一个名字，
@@ -35,7 +49,132 @@ export interface IngestResponse {
 }
 
 /**
- * 制品上传（P1 / Task 1 建立；**Task 5 起是「加密即入库」的入口**）。
+ * 签发响应的形状：一条**相对**路径 + 过期时刻（Unix 秒）。
+ *
+ * 相对路径的理由（本进程不知道自己的对外 origin，用 `Host` 拼绝对 URL 等于把一次下载
+ * 交给一个调用方可控的值）写在 `download/signed-url.ts` 的 `buildDownloadPath` 里。
+ */
+export type IssuedDownloadResponse = IssuedDownload;
+
+/**
+ * 下载响应的 `Content-Type`（按**推导**出来的归档类型）。
+ *
+ * 这里刻意没有第三种可能：`validateArchive` 的结论只有 `zip` / `tar.gz` 两种
+ * （`unknown` 走的是拒绝分支，不会到这一行）。
+ */
+const DOWNLOAD_CONTENT_TYPE = {
+  zip: 'application/zip',
+  'tar.gz': 'application/gzip',
+} as const;
+
+/**
+ * 领域错误 → HTTP 的**唯一**翻译表（Task 8）。
+ *
+ * ## 为什么是一张表，而不是散在各处理器的 `instanceof` 分支里
+ *
+ * 「同一种错误只有一处出口」是本仓库反复付过代价的一条：上传路径原先在处理器里内联了
+ * 三个分支，而 Task 7 又把两个领域错误（`AssetNotFoundError` / `SelfTransferRejectedError`）
+ * 交给 Task 8 裁定状态码。如果下载路径再内联一份，同一种错误就会有两个出口，
+ * 而它们迟早会给出不同的状态码——那时「谁对」要靠读两处代码来判断。
+ *
+ * 因此这里是**唯一**的映射点：四个处理器都经过它，`throw assetErrorToHttp(error) ?? error`
+ * 是每个 `catch` 的全部内容。
+ *
+ * ## 每一行的理由（状态码要说清**责任方**，这是本仓库的既定口径）
+ *
+ * | 错误 | 状态码 | 责任方与理由 |
+ * |---|---|---|
+ * | `AssetVersionNotFoundError` / `AssetNotFoundError` | 404 | 调用方指错了对象（版本 / 作品） |
+ * | `SelfTransferRejectedError` | **409** | 见下 |
+ * | `DownloadForbiddenError` | 403 | 身份可信、**判定为否**（`checkAccess`） |
+ * | `DownloadTicketRejectedError` | 403 | 票据不可用（伪造 / 过期 / 重放）——`code` 按理由分流 |
+ * | `ArchiveRejectedError` | 422 | **制品本身**不可接受（上传路径的四种理由；下载路径的带外长度/末块/内容） |
+ * | `ArtifactUnreadableError` | 500 | 服务端/存储侧读不回来（不是调用方的问题） |
+ * | `ArtifactCleanupError` | 500 | 密文对象删不掉（**制品库里多了一个孤儿**） |
+ *
+ * ## `SelfTransferRejectedError` 为什么不选 404 也不选 422（Task 7 留给 Task 8 的那条裁定）
+ *
+ * - **404 是错的**：作品**存在**，而且调用方通常就是它的所有人（「转给自己」的前提就是
+ *   他知道当前所有人是谁）。回 404 等于用「没有这个作品」去描述一个他拥有的作品，
+ *   而 Task 7 已经用 404 表示「不存在」（`AssetNotFoundError`）——两种因由共用一个码，
+ *   边界上就再也分不出「指错了」与「这次转让不成立」。
+ * - **422 不合适**：本仓库的 422 是**内容不可接受**（`ASSET_ARCHIVE_REJECTED`：炸弹、
+ *   穿越、自洽截断……）。而这里请求的内容完全合法，冲突在于**资源的当前状态**
+ *   （`toUserId` 恰好等于当前的 `ownerId`）——那正是 409 的定义，也是客户端唯一
+ *   正确的下一步（重新读一次当前所有人）所对应的语义。
+ * - **409 还带着「先裁决、再重试」的意思**：这不是一次参数错误（400/422），
+ *   而是一次与状态冲突的、本可以成立的请求。
+ *
+ * 今天没有任何路由抛 `SelfTransferRejectedError`（P1 没有转让端点，转让是 P2 的事），
+ * **据实记载**：这一行是为那次裁定而写的，并由
+ * `tests/unit/asset/asset-error-map.test.ts` 直接钉住——把裁定留在散文里，
+ * 下一个接线的人就会重新选一次。
+ */
+export function assetErrorToHttp(error: unknown): HttpException | null {
+  if (error instanceof AssetVersionNotFoundError || error instanceof AssetNotFoundError) {
+    return new NotFoundException({ code: 'ASSET_VERSION_NOT_FOUND' });
+  }
+  if (error instanceof SelfTransferRejectedError) {
+    return new ConflictException({ code: 'ASSET_SELF_TRANSFER_REJECTED' });
+  }
+  if (error instanceof DownloadForbiddenError) {
+    return new ForbiddenException({ code: 'ASSET_DOWNLOAD_NOT_AUTHORIZED' });
+  }
+  if (error instanceof DownloadTicketRejectedError) {
+    // 一个状态码（403）+ 四种可区分的 `code`：`code` 是给客户端与告警规则用的，
+    // 而状态码只需要说清「这件事不成立」。
+    return new ForbiddenException({ code: `ASSET_DOWNLOAD_TICKET_${error.reason.toUpperCase()}` });
+  }
+  if (error instanceof ArchiveRejectedError) {
+    // 拒绝理由只带非机密量（C11）：类型与一句话理由，没有明文、没有密钥。
+    return new UnprocessableEntityException({
+      code: 'ASSET_ARCHIVE_REJECTED',
+      kind: error.kind,
+      reason: error.reason,
+    });
+  }
+  if (error instanceof ArtifactUnreadableError) {
+    // 500 而不是 4xx：这是服务端/存储侧的问题，别把服务端故障说成「你上传的东西不行」。
+    // 明细不进响应体（那是内部诊断信息），只留一个可检索的代号。
+    return new InternalServerErrorException({ code: 'ASSET_ARTIFACT_UNREADABLE' });
+  }
+  if (error instanceof ArtifactCleanupError) {
+    // 归档确实被拒了，但**密文对象没删掉**：此刻制品库里多了一个没有版本记录的孤儿。
+    // 回 500 而不是 422——理由与痕迹都在 `AssetService.delete` 的注释里（含那行审计）。
+    return new InternalServerErrorException({ code: 'ASSET_ARTIFACT_CLEANUP_FAILED' });
+  }
+  return null;
+}
+
+/**
+ * 制品模块的 HTTP 边界（P1 / Task 1 建立上传，**Task 8 补下载与元数据**）。
+ *
+ * ## 五条路由与它们的声明（`Asset` 资源 × 动作）
+ *
+ * | 路由 | 策略 | 限流 | 谁 |
+ * |---|---|---|---|
+ * | `POST /assets/upload` | `Asset.create` | `upload` | 任何已登录用户 |
+ * | `POST /assets/versions/:versionId/download-url` | `Asset.download` | `search` | 登录 + `checkAccess`（属主） |
+ * | `GET /assets/download` | `@Public()` | `search` | 持有效票据者（签名即凭证） |
+ * | `GET /assets/versions/:versionId/metadata` | `@Public()` | `search` | 所有人（§9 矩阵的一行） |
+ *
+ * ## 限流归属：三个新端点为什么都写 `@RateLimited('search')`（**据实记载**）
+ *
+ * 威胁 #13 点名的是五类端点（登录/注册/出价/上传/搜索），下载与元数据都不在其中，
+ * 因此**表里没有为它们准备的一档**。两条路：
+ *
+ * 1. **在 `RATE_LIMITS` 里加一档 `download`**——但那张表是设计文档 §4.1 威胁 #13 的投影，
+ *    `tests/security/rate-limit.test.ts` 逐条断言它与设计一致。**新增一个安全参数是一次
+ *    设计裁定**（阈值定多少、按 IP 还是按用户，都要有依据），不是实现者可以顺手做的；
+ * 2. **归入表里唯一「按 IP、短窗口」的那一档（`search`，60 次/分钟）**——不新增任何安全
+ *    参数，用的仍然是 P0 那套机制（同一个装饰器、同一个守卫、同一个 Redis 存储、
+ *    同一道覆盖率门）。**代价如实记录：名字叫 `search`，而挂的是下载与元数据**；
+ *    若控制器裁定下载需要自己的一档，改法是一行表项 + 设计文档一行 + 这里的三个装饰器。
+ *
+ * 这条归属不靠自觉：策略/限流覆盖率门断言了这三条路由**各自**的声明（含层名），
+ * 集成套件另有一条「打到第 61 次必须 429」的行为见证。
+ *
+ * ## 制品上传（P1 / Task 1 建立；**Task 5 起是「加密即入库」的入口**）
  *
  * ## 这条路径今天做四件事，顺序即语义
  *
@@ -64,14 +203,19 @@ export interface IngestResponse {
  *
  * 设计文档 §9 的权限矩阵里**没有** `Asset.create` 这一行（矩阵只有元数据 read、制品
  * download、asset update/delete 等）——据实记载：这里取的是矩阵里最保守的一档
- * （「任何已登录用户」），Task 8 会带着访问判定矩阵回来收口这条声明。
+ * （「任何已登录用户」），Task 8 的越权矩阵把它作为「受权但仍受资源判定的路由」
+ * 之外的一格照实断言（登录后 400「没有文件字段」，而不是 403）。
  *
  * `@RateLimited('upload')` 同样是必须的：C12 点名「上传 10 次/天（用户）」，
  * 而 `tests/security/rate-limit-coverage.test.ts` 会要求每条路由表态。
  */
 @Controller('assets')
 export class AssetController {
-  constructor(private readonly assets: AssetService) {}
+  constructor(
+    private readonly assets: AssetService,
+    private readonly access: AssetAccessService,
+    private readonly downloads: DownloadService,
+  ) {}
 
   @Policy({ resource: 'Asset', action: 'create' })
   @RateLimited('upload')
@@ -94,25 +238,117 @@ export class AssetController {
       const version = await this.assets.finalize(file, { uploadedById: currentContext()?.userId ?? null });
       return { sha256: version.sha256, plaintextBytes: version.plaintextBytes, kind: version.kind };
     } catch (error) {
-      if (error instanceof ArchiveRejectedError) {
-        // 拒绝理由只带非机密量（C11）：类型与一句话理由，没有明文、没有密钥。
-        throw new UnprocessableEntityException({
-          code: 'ASSET_ARCHIVE_REJECTED',
-          kind: error.kind,
-          reason: error.reason,
-        });
-      }
-      if (error instanceof ArtifactUnreadableError) {
-        // 500 而不是 4xx：这是服务端/存储侧的问题，别把服务端故障说成「你上传的东西不行」。
-        // 明细不进响应体（那是内部诊断信息），只留一个可检索的代号。
-        throw new InternalServerErrorException({ code: 'ASSET_ARTIFACT_UNREADABLE' });
-      }
-      if (error instanceof ArtifactCleanupError) {
-        // 归档确实被拒了，但**密文对象没删掉**：此刻制品库里多了一个没有版本记录的孤儿。
-        // 回 500 而不是 422——理由与痕迹都在 `AssetService.delete` 的注释里（含那行审计）。
-        throw new InternalServerErrorException({ code: 'ASSET_ARTIFACT_CLEANUP_FAILED' });
-      }
-      throw error;
+      // 翻译只有一处（`assetErrorToHttp`）：403/404/409/422/500 的每一档都在那里说明责任方。
+      throw assetErrorToHttp(error) ?? error;
+    }
+  }
+
+  /**
+   * 签发一张 ≤5 分钟、单次有效的下载票据（D10 / D11 的 `signDownloadUrl`）。
+   *
+   * ## 声明里**没有** condition（这处刻意，不是漏写）
+   *
+   * `Asset` + `download` 的声明只表达「登录即可进入这条路由」，资源级判定由
+   * `DownloadService` 里的 `checkAccess` 做——D11 要求它是**唯一**的授权入口。
+   * 把它做成策略条件（`condition: 'assetDownload'`）看起来更「声明式」，代价是：
+   * ①判定要在守卫里再解析一次路径参数、再查一次库；②**判定结果没有地方写审计**
+   * （守卫拒绝时处理器根本没跑），而 D10 要求成功与失败都留下审计行。
+   * 于是判定留在处理器里、由那一个入口做，声明只负责「这条路由属于谁」。
+   *
+   * ## 为什么是 POST 而不是 GET
+   *
+   * 签发会写一行审计（有副作用），而且 GET 语义意味着「可以被浏览器/中间层预取与缓存」
+   * ——一个可以被预取的「签发凭证」不是好东西。POST 还顺带落在 CSRF 双提交令牌的
+   * 保护范围内（C13：全部写操作校验令牌）。
+   *
+   * 状态码取 **200** 而不是 POST 默认的 201：这条路径没有创建任何**可寻址的资源**
+   * （票据就是那串 URL，它没有 id、不占任何表，且 5 分钟后就不存在了）。
+   * 与 `auth/login` 的处置同一条理由。
+   */
+  @Policy({ resource: 'Asset', action: 'download' })
+  // 归属 `search` 那一层（60 次/分钟，按 IP）——理由见类注释末尾的限流一节。
+  @RateLimited('search')
+  @HttpCode(HttpStatus.OK)
+  @Post('versions/:versionId/download-url')
+  async issueDownloadUrl(@Param('versionId') versionId: string): Promise<IssuedDownloadResponse> {
+    try {
+      // 形状不对的路径参数在**碰数据库之前**回 404：非 UUID 打到 Postgres 会以
+      // `22P02` 失败，那会把一次调用方错误变成一次 500（Task 7 把参数校验移交给了本任务）。
+      if (!UUID_IDENTIFIER.test(versionId)) throw new AssetVersionNotFoundError(versionId);
+      // 身份来自会话上下文（`SessionMiddleware`）：`PolicyGuard` 已经保证它存在
+      // （无 condition 的声明仍然要求身份，方案 B）。
+      return await this.downloads.issueDownloadUrl(versionId, currentContext()?.userId ?? '');
+    } catch (error) {
+      throw assetErrorToHttp(error) ?? error;
+    }
+  }
+
+  /**
+   * 兑换票据并**流出**制品明文（D10 的「单次有效签名 URL」那一半）。
+   *
+   * ## 为什么这条路由是 `@Public()`
+   *
+   * 凭证就是那串签名，不是 cookie：签名 URL 的意义正是「把它交给下载工具或浏览器直开」。
+   * 要求会话会把它退化成一条普通鉴权接口，而威胁 #3 指名的三条控制是
+   * **≤5 分钟 + 单次使用 + 每次写审计**——它们都在 `DownloadService` 里，与会话无关。
+   * 票据里的 `userId` 仍然是当事人（签名保护它不被改），并会在兑换时**再判一次**
+   * `checkAccess`（转让之后前手那张票立刻失效）。
+   *
+   * ## 「被拒就不发字节」是**结构性**的，不是这条处理器记得别写
+   *
+   * `openDownload` 返回之前所有判定都已完成（验签、期限、授权、nonce 消费、
+   * 带外长度核对、末块认证、归档校验），被拒时它抛出——`StreamableFile` 因此
+   * 一个字节都没构造出来。集成用例断言的正是这件事：422 + 响应体里没有制品的字节。
+   */
+  @Public()
+  // 同 `search` 层：这条路由是**公开**的，没有限流时它是一个任何人都能打的解密入口
+  // （伪造票据在验签处就被挡掉，但请求本身仍然会走到验签）。
+  @RateLimited('search')
+  @Get('download')
+  async download(@Query() query: Record<string, unknown>): Promise<StreamableFile> {
+    try {
+      const opened = await this.downloads.openDownload(query);
+      return new StreamableFile(opened.stream, {
+        type: DOWNLOAD_CONTENT_TYPE[opened.kind],
+        // 声明长度让客户端能判断「读到的是不是全部」——下载路径上这一点尤其重要：
+        // 中途某个非末块被篡改时响应会被中断，而有了 Content-Length，截断是可检测的。
+        length: opened.length,
+        disposition: `attachment; filename="asset-${opened.assetVersionId}.${opened.kind === 'zip' ? 'zip' : 'tar.gz'}"`,
+      });
+    } catch (error) {
+      throw assetErrorToHttp(error) ?? error;
+    }
+  }
+
+  /**
+   * 元数据读取（设计文档 §9 矩阵：`Asset` 元数据 read = **所有人**，因此 `@Public()`）。
+   *
+   * ## 「所有人可读」是矩阵里的**一行**，不是默认
+   *
+   * 默认仍然是拒绝（`PolicyGuard` 未声明即 403）；这一行是显式写出来的授权，
+   * 而它授权的范围在 `AssetAccessService.readMetadata` 里被卡死在元数据本身上：
+   * 存储键、`fileId`、`keyId`、`sha256` 一列都不在 `select` 里（取不到，不是过滤掉）。
+   * 换句话说：**这条路由公开的是「项目是什么」，不是「制品是什么」。**
+   *
+   * ## 限流归属
+   *
+   * 它是公开读端点，因此同样归 `search` 层（表里唯一按 IP 的短窗口档，60 次/分钟）。
+   * 这条声明有一条端到端用例（打到第 61 次必须 429）——见集成套件；它同时是
+   * 「新路由真的被接进了 P0 的限流器」的行为见证。
+   */
+  @Public()
+  @RateLimited('search')
+  @Get('versions/:versionId/metadata')
+  async readMetadata(@Param('versionId') versionId: string): Promise<AssetMetadataView> {
+    try {
+      if (!UUID_IDENTIFIER.test(versionId)) throw new AssetVersionNotFoundError(versionId);
+      const view = await this.access.readMetadata(versionId);
+      // 版本不存在、或该版本还没有元数据行：两者都是 404（**「没有」与「空」不是同一件事**，
+      // Task 6 §3.1 为 README 写过同一条；这里也一样——不返回一个「全是 null 的元数据」）。
+      if (view === null) throw new AssetVersionNotFoundError(versionId);
+      return view;
+    } catch (error) {
+      throw assetErrorToHttp(error) ?? error;
     }
   }
 }

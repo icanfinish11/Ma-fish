@@ -4,7 +4,6 @@ import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
-import { ConfigService } from '@nestjs/config';
 import { Client } from 'pg';
 import { startPostgres, type TestPg } from '../../helpers/db.js';
 import { testEnv } from '../../helpers/env.js';
@@ -243,11 +242,16 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
     await prisma.$connect();
     storeDir = await mkdtemp(join(tmpdir(), 'vca-t7-store-'));
     store = new LocalArtifactStore(storeDir);
-    // `AssetService` 的三个依赖都注入**真的**那一个：存储（真目录）、配置（测试夹具）、
-    // 审计（真库）。`ConfigService` 的类型参数是 `get()` 的重载形状，构造期不需要它。
+    // `AssetService` 的三个依赖都注入**真的**那一个：存储（真目录）、密钥环（测试夹具）、
+    // 审计（真库）。
+    //
+    // **Task 8 改了这里的第二个入参**：密钥环原先由 `AssetService` 在自己的构造期从
+    // `ConfigService` 现建，Task 8 把它提取成 `KEY_RING` 提供者（下载路径是第二个消费者，
+    // 这正是 Task 5 的注释预告的时机）。因此这里给的是 `ringFromEnv()`——**同一份**环境夹具
+    // 算出的同一个环，而不是另造一个。
     assets = new AssetService(
       store,
-      new ConfigService(testEnv),
+      ringFromEnv(),
       new AuditService(prisma),
     );
     versions = new AssetVersionService(prisma);
@@ -506,9 +510,10 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
     // （另一个文件正在用的对象被删），而不是静默跑错。
     await rm(storeDir, { recursive: true, force: true });
     store = new LocalArtifactStore(storeDir);
+    // 第二个入参是密钥环（Task 8 起从 `ConfigService` 换成 `KEY_RING`，理由见第 2 节的同一条）。
     assets = new AssetService(
       store,
-      new ConfigService(testEnv),
+      ringFromEnv(),
       new AuditService(prisma),
     );
     versions = new AssetVersionService(prisma);

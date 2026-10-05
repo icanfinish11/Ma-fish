@@ -51,6 +51,9 @@ const FULL_ENV = {
   ARTIFACT_MAX_UPLOAD_BYTES: '4194304',
   ARTIFACT_KEYS: envWith().ARTIFACT_KEYS,
   ARTIFACT_ACTIVE_KEY_ID: 'v1',
+  // P1 / Task 8 新增（见 tests/helpers/env.ts 的 K9 清单）：下载票据的 HMAC 密钥。
+  // 本文件只用到密钥环，这一行是为了让这份「完整合法 env」仍然是完整的。
+  DOWNLOAD_URL_SECRET: 'test-download-url-secret-0123456789abcdef',
 } as unknown as NodeJS.ProcessEnv;
 
 describe('createKeyRing（keyId → 密钥）', () => {

@@ -29,6 +29,9 @@ const VALID = {
   // P1 / Task 2 新增（同上清单）。修复轮 1 起是**密钥环**（R5），不再是单个主密钥。
   ARTIFACT_KEYS: ring({ v1: base64Key('cb') }),
   ARTIFACT_ACTIVE_KEY_ID: 'v1',
+  // P1 / Task 8 新增（见 tests/helpers/env.ts 的 K9 清单）：下载票据的 HMAC 密钥（D10）。
+  // 这里只是**一次性测试值**，不是密钥。
+  DOWNLOAD_URL_SECRET: 'test-download-url-secret-0123456789abcdef',
 } as unknown as NodeJS.ProcessEnv;
 
 describe('parseEnv', () => {

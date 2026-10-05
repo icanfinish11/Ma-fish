@@ -53,6 +53,10 @@ const VALID = {
   // 「占位词当 keyId」误报成「不在环里」，让红的含义不再唯一。
   ARTIFACT_KEYS: ring({ [KEY_ID]: KEY_B64 }),
   ARTIFACT_ACTIVE_KEY_ID: KEY_ID,
+  // P1 / Task 8 新增（同上清单）：下载票据的 HMAC 密钥（D10）。**它是一个密钥字段**，
+  // 因此与 GITHUB_CLIENT_SECRET 同侧——本文件要证明的是「占位层不越界到非密钥字段」，
+  // 它在这里只负责凑出「完整 env」，值本身不含占位词（否则基线自己就过不了）。
+  DOWNLOAD_URL_SECRET: 'baseline-download-signing-secret-0123456789',
 } as unknown as NodeJS.ProcessEnv;
 
 describe('nonPlaceholder 的使用边界（只作用于密钥字段）', () => {

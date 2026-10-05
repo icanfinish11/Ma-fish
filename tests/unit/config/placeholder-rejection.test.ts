@@ -50,6 +50,10 @@ const ENV_EXAMPLE_PLACEHOLDERS = {
   // 环境面是密钥环，R5）。`ARTIFACT_ACTIVE_KEY_ID` 是标识符，同样只为凑出「完整 env」。
   ARTIFACT_KEYS: '{"v1":"CHANGE_ME_BASE64_OF_32_BYTES"}',
   ARTIFACT_ACTIVE_KEY_ID: 'v1',
+  // P1 / Task 8 新增（同上清单）：**逐字取自 `.env.example` 的那一行**。它同时给本文件
+  // 补回一颗牙——`CHANGE_ME_AT_LEAST_32_CHARS_LONG_DOWNLOAD` **通过** `min(32)`，
+  // 唯一拦得住它的是占位层（与 I-2 删掉 `SESSION_SECRET` 时失去的那一颗同一个形状）。
+  DOWNLOAD_URL_SECRET: 'CHANGE_ME_AT_LEAST_32_CHARS_LONG_DOWNLOAD',
 };
 
 describe('占位值拒绝规则（C10 / 威胁 #15）', () => {

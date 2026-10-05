@@ -48,6 +48,8 @@ describe('trust proxy 的取值解析（I-6：IP 维度限流的信任边界）'
       // （JSON `{keyId: base64(32 字节)}`），不再是单个 `ARTIFACT_MASTER_KEY`。
       ARTIFACT_KEYS: '{"v1":"q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s="}',
       ARTIFACT_ACTIVE_KEY_ID: 'v1',
+      // P1 / Task 8 新增（同上清单）：下载票据的 HMAC 密钥（D10）。本用例只验 TRUST_PROXY。
+      DOWNLOAD_URL_SECRET: 'test-download-url-secret-0123456789abcdef',
     });
     expect(parsed.TRUST_PROXY).toBe(DEFAULT_TRUST_PROXY);
     expect(parseTrustProxy(parsed.TRUST_PROXY)).toEqual(parseTrustProxy(undefined));

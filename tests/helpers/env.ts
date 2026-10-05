@@ -16,9 +16,10 @@
  * **应用侧只有这一处**：不要再往 `vitest.config.ts` 内联字面量、也不要各测试文件自行 set：
  * 那样会散成多份互相看不出关系的副本，遗漏时排查成本极高。
  *
- * **但「新增必填变量只改这一处」是不准确的**，据实记载：另有**四处**手写的完整
+ * **但「新增必填变量只改这一处」是不准确的**，据实记载：另有**五处**手写的完整
  * 合法环境（它们刻意不 import 本文件：有的要构造非法变体、有的只取 schema 做局部断言），
- * 外加一份「必填清单」。**P1 Task 1 逐个核对过**（此前文件里写的是「另有两处」，不准）：
+ * 外加一份「必填清单」。**P1 Task 1 逐个核对过**（此前文件里写的是「另有两处」，不准），
+ * **P1 Task 8 又核对了第二次**（见下）：
  *
  * 1. `tests/unit/config/env.schema.test.ts` 的 `VALID`（要构造缺字段/非法值的变体）
  * 2. `tests/unit/config/placeholder-boundary.test.ts` 的 `VALID`（显式 `production`）
@@ -28,8 +29,15 @@
  *    （只验 `TRUST_PROXY` 的默认值与单一来源）
  * 5. `tests/unit/config/bootstrap-guard.test.ts` 的 `REQUIRED_KEYS`
  *    （缺任意一个都必须让引导期拒绝启动，因此**新必填变量必须加进那份清单**）
+ * 6. `tests/unit/asset/key-ring.test.ts` 的 `FULL_ENV`
+ *    （「完整合法 env」的对照，用来断言 schema 与模块两处 keyId 正则一致）
  *
- * 新增必填变量时这五处都要改；漏改的表现是那些文件里的断言变红（快速失败，不会静默放行）。
+ * **据实记载（Task 8 的核对结果）**：第 6 处**此前不在上面这张清单里**——
+ * 上面那版把它漏了（Task 1 写「四处」，Task 2 加 keyId 时没有回来登记）。
+ * 它当时之所以没出事，是因为加变量时逐文件 grep 到了它；而**靠 grep 而不是靠清单**
+ * 正是这一节要防的形态。Task 8 因此把清单补齐到六处，并把 `key-ring.test.ts` 明确写进来。
+ *
+ * 新增必填变量时这六处都要改；漏改的表现是那些文件里的断言变红（快速失败，不会静默放行）。
  *
  * **修复轮 1 的 K9 复核（R5/R6，据实记载）**：这一轮改动的不是「新增」而是**替换**——
  * `MASTER_ENCRYPTION_KEY` 与 `ARTIFACT_MASTER_KEY` **被删除**，改成一个 `ARTIFACT_KEYS`
@@ -172,4 +180,13 @@ export const testEnv = Object.freeze({
   // 因此这里用的是 `'ab'.repeat(32)` / `'cd'.repeat(32)` 这两个可辨认的字节模式的 base64。
   ARTIFACT_KEYS: '{"v1":"q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=","v2":"zc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0="}',
   ARTIFACT_ACTIVE_KEY_ID: 'v2',
+  // ── P1 / Task 8 起 ────────────────────────────────────────────────────────────
+  // 下载票据的 HMAC 密钥（规格 D10）。**一次性测试值，绝不是密钥**——本文件按定义是公开的。
+  //
+  // 为什么它必须在这里（K9）：`AppModule` 在模块求值期就解析整份 env schema，因此
+  // 缺了它，**任何** `import '@vca/api'` 的测试都加载不了模块图。它是必填项、无默认值，
+  // 与 `ARTIFACT_KEYS` 同一个形状（安全参数不做「悄悄生效的默认值」）。
+  //
+  // 长度 ≥32 是为了在生产侧拦住弱密钥；测试值同样满足（否则这份夹具本身过不了 schema）。
+  DOWNLOAD_URL_SECRET: 'test-download-url-secret-0123456789abcdef',
 } as const satisfies Partial<NodeJS.ProcessEnv>);

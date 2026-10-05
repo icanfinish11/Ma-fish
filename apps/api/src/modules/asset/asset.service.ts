@@ -1,9 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import { createHash } from 'node:crypto';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import type { Env } from '../../config/env.schema.js';
 import { AuditService } from '../audit/index.js';
 import type { ArchiveKind } from './archive/sniff.js';
 import { validateArchive, type ArchiveVerdict } from './archive/validate-archive.js';
@@ -16,7 +14,7 @@ import {
   encodeHeader,
 } from './crypto/artifact-format.js';
 import { ChunkEncryptor } from './crypto/chunk-cipher.js';
-import { createKeyRing, type KeyRing } from './crypto/key-ring.js';
+import { KEY_RING, type KeyRing } from './crypto/key-ring.js';
 import { ARTIFACT_STORE, ArtifactTooLargeError, type ArtifactStore } from './store/artifact-store.port.js';
 import { EncryptedArtifactReader } from './store/random-access-reader.js';
 
@@ -73,27 +71,27 @@ export class AssetService {
   private readonly audit: AuditService;
 
   /**
-   * 密钥环在**构造期**建立（而不是每次上传现取）：
+   * 密钥环来自 `KEY_RING` 提供者（**Task 8 提取**，原先是本类构造期自己建的）。
    *
-   * - `createKeyRing` 会在缺 `ARTIFACT_KEYS` / 活动 keyId 不在环里时**立刻抛错**，
-   *   而本服务是应用启动期就在的提供者 ⇒ 配置错误在**引导期**暴露，而不是等一次上传
-   *   走到一半才发现（D5 的 fail-fast 要求）；
-   * - 它**不做**「取不到就回退到默认键」——那是 `key-ring.ts` 的硬约束。
+   * Task 5 的注释把这条移交写得很清楚：「今天只有本类一个消费者（C16 不建空抽象）。
+   * 第二个消费者出现时（下载路径 Task 8）再把它提出来，那时它是被依赖逼出来的，
+   * 不是猜的。」下载路径必须按制品头里的 keyId 选键，于是它就是那个消费者。
    *
-   * 刻意**没有**把密钥环单独做成一个 provider：今天只有本类一个消费者（C16 不建空抽象）。
-   * 第二个消费者出现时（下载路径 Task 8）再把它提出来，那时它是被依赖逼出来的，不是猜的。
+   * **fail-fast 没有丢**：`createKeyRing` 缺 `ARTIFACT_KEYS` / 活动 keyId 不在环里时
+   * 立刻抛错，而那个提供者的工厂在**模块装配期**执行（`AssetStoreModule` 的
+   * `useFactory`）——配置错误照样在引导期暴露，而不是等一次上传走到一半。
+   *
+   * 刻意**没有**把 `ConfigService` 从构造参数里删掉：本类不再需要它（环的输入只有
+   * 那两个环境变量），把不用的依赖留在签名里正是「看起来还需要」的那类噪音。
    */
   constructor(
     @Inject(ARTIFACT_STORE) store: ArtifactStore,
-    config: ConfigService<Env, true>,
+    @Inject(KEY_RING) ring: KeyRing,
     audit: AuditService,
   ) {
     this.store = store;
     this.audit = audit;
-    this.ring = createKeyRing({
-      ARTIFACT_KEYS: config.get('ARTIFACT_KEYS', { infer: true }),
-      ARTIFACT_ACTIVE_KEY_ID: config.get('ARTIFACT_ACTIVE_KEY_ID', { infer: true }),
-    });
+    this.ring = ring;
   }
 
   /**

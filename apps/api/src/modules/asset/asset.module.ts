@@ -5,8 +5,11 @@ import type { Env } from '../../config/env.schema.js';
 import { createStreamingStorage } from '../../common/upload/stream-upload.js';
 import { AuditModule } from '../audit/index.js';
 import { AssetController } from './asset.controller.js';
+import { AssetAccessService } from './asset-access.service.js';
 import { AssetService } from './asset.service.js';
 import { AssetVersionService } from './asset-version.service.js';
+import { createKeyRing, KEY_RING, type KeyRing } from './crypto/key-ring.js';
+import { DownloadService } from './download/download.service.js';
 import { OwnershipService } from './ownership.service.js';
 import { ARTIFACT_STORE, type ArtifactStore } from './store/artifact-store.port.js';
 import { LocalArtifactStore } from './store/local-artifact.store.js';
@@ -50,6 +53,23 @@ import { LocalArtifactStore } from './store/local-artifact.store.js';
         // 时引导期就已经拒绝了（schema 必填），这里能拿到的必然是显式配置过的值。
         new LocalArtifactStore(config.get('ARTIFACT_STORE_DIR', { infer: true })),
     },
+    /**
+     * 密钥环（Task 8 从 `AssetService` 的构造期提取，见 `KEY_RING` 的注释）。
+     *
+     * 工厂跑在**模块装配期**：`createKeyRing` 对缺 `ARTIFACT_KEYS` / 活动 keyId 不在环里
+     * 一律抛错，因此配置错误照样在引导期暴露（这是 Task 5 的 fail-fast 要求，
+     * 提取提供者不能把它丢掉）。刻意**不写 `useValue: createKeyRing(...)`**：
+     * 那会在**模块求值期**（import 时）就执行，配置错误的表现会变成「测试进程加载不了模块」。
+     */
+    {
+      provide: KEY_RING,
+      inject: [ConfigService],
+      useFactory: (config: ConfigService<Env, true>): KeyRing =>
+        createKeyRing({
+          ARTIFACT_KEYS: config.get('ARTIFACT_KEYS', { infer: true }),
+          ARTIFACT_ACTIVE_KEY_ID: config.get('ARTIFACT_ACTIVE_KEY_ID', { infer: true }),
+        }),
+    },
     // 加密即入库的接入服务：`putStream`（落盘的是密文）+ `finalize`（校验）+ `delete`（清理）。
     AssetService,
     // 接入记录与元数据的落库（Task 7）：`AssetService` 那一半产出**待落库**的记录，
@@ -58,8 +78,20 @@ import { LocalArtifactStore } from './store/local-artifact.store.js';
     AssetVersionService,
     // 所有权转让（Task 7）：指针 + 一行 append-only 历史，同一事务，**不碰制品**。
     OwnershipService,
+    // 读与授权（Task 8）：`checkAccess` + `readMetadata`（D11 的四条对外接口里的两条）。
+    AssetAccessService,
+    // 签名下载（Task 8）：签发 + 兑换（D10/D11 的另外两条）。
+    DownloadService,
   ],
-  exports: [ARTIFACT_STORE, AssetService, AssetVersionService, OwnershipService],
+  exports: [
+    ARTIFACT_STORE,
+    KEY_RING,
+    AssetService,
+    AssetVersionService,
+    OwnershipService,
+    AssetAccessService,
+    DownloadService,
+  ],
 })
 export class AssetStoreModule {}
 

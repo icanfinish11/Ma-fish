@@ -59,6 +59,31 @@ export interface KeyRing {
 }
 
 /**
+ * 密钥环的注入令牌（P1 / Task 8 提取）。
+ *
+ * ## 为什么 Task 8 才把它提出来（而不是 Task 5 顺手做的）
+ *
+ * Task 5 的 `AssetService` 在**构造期**自己 `createKeyRing(...)`，理由写在那里：
+ * 「今天只有本类一个消费者（C16 不建空抽象）。第二个消费者出现时（下载路径 Task 8）
+ * 再把它提出来，那时它是被依赖逼出来的，不是猜的。」下载路径正是那个消费者：
+ * 它必须按制品头里的 keyId 选键（`EncryptedArtifactReader.open` 的入参）。
+ *
+ * 两个消费者各建一个环**不会**加解密错（同一份环境变量 ⇒ 同样的字节），
+ * 但会让「环是怎么配的」这件事有两处实现，而其中一处将来会先漂移
+ * （例如加上「环里的键必须互不相同」这类校验时）。
+ *
+ * ## 令牌为什么住在这里而不是 `asset.module.ts`
+ *
+ * `db/redis.module.ts` 的 `REDIS` 令牌与提供者同处一地，是因为那个文件**不 import
+ * 任何消费者**（反过来是消费者 import 它），因此没有环。这里如果把令牌放进
+ * `asset.module.ts`，`asset.service.ts` / `download.service.ts` 就要 import 那个模块文件，
+ * 而它反过来 import 这两个服务——一个真实的循环（`.dependency-cruiser.cjs` 的
+ * `no-circular` 会立刻报出来）。令牌因此跟它的**类型**放在一起（`KeyRing` 就在上面），
+ * 提供者仍然在 `asset.module.ts`（与 `ARTIFACT_STORE` 同一个模块）。
+ */
+export const KEY_RING = Symbol('VCA_ARTIFACT_KEY_RING');
+
+/**
  * AES-256 的密钥长度：32 字节。
  *
  * 刻意**不**把它做成导出的 `KEY_BYTES`（上一版有过，随后因无人读取而删除）：唯一需要

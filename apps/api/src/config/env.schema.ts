@@ -305,6 +305,35 @@ export const envSchema = z.object({
       ARTIFACT_KEY_ID_PATTERN,
       'ARTIFACT_ACTIVE_KEY_ID 必须是 1..64 位的 ASCII 标识符（字母或数字开头，可含 . _ -）',
     ),
+
+  /**
+   * 下载票据的 HMAC 密钥（P1 / Task 8，规格 D10）。
+   *
+   * 签名 URL 的全部安全性都落在这一把密钥上：拿到它的人可以自己签出任意
+   * `assetVersionId | userId | expiresAt | nonce` 的票据。因此：
+   *
+   * - **必填、无默认值**——一个「没配就用某个默认值」的密钥等于没有密钥；
+   * - **≥32 字符**（256 位熵的常见下限；HMAC-SHA256 的密钥可以更长，但不能更短）；
+   * - 走 P0 的**占位值拒绝**层（`nonPlaceholder`）：`CHANGE_ME…` 这类模板值必须在
+   *   引导期被拒，而不是成为一把人人皆知的生产密钥（威胁 #15）。
+   *
+   * ## 为什么它**不叫** `SESSION_SECRET`，也不复用它
+   *
+   * `SESSION_SECRET` 在 P0 最终评审时被删除：会话是「服务端随机 id + Redis 状态」，
+   * CSRF 是不签名的双提交令牌——两者都不需要服务器密钥，而一个「必填、却什么都不保护」
+   * 的密钥既违反 C16、又给运维一个错误的保证。下载签名**确实**需要一个密钥，
+   * 因此这是一个**新的、有真实读取方**的变量，而不是把那个名字复活。
+   *
+   * ## 为什么不复用 `ARTIFACT_KEYS` 里的活动密钥
+   *
+   * 那是 AES-256-GCM 的**加密**密钥。用同一份字节同时做加密与 HMAC 是把两个不同的
+   * 密码学用途绑在一起（一个用途的泄露或算法迁移会同时影响另一个），而在环境变量里
+   * 多一行是零成本的——密钥**分开**是这里唯一需要付的代价。
+   *
+   * 生成一把：`node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"`
+   * （形状只要求长度，不要求编码，因此也可以用 hex）。
+   */
+  DOWNLOAD_URL_SECRET: nonPlaceholder('DOWNLOAD_URL_SECRET').pipe(z.string().min(32)),
 })
   /**
    * **跨字段判据：活动 keyId 必须真的在环里**（R5 的 fail-fast）。
