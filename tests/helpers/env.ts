@@ -148,4 +148,10 @@ export const testEnv = Object.freeze({
   // 这是刻意的测试期取值，不是把生产上限改小（生产的 `.env.example` 是 1 GiB）。
   ARTIFACT_STORE_DIR: artifactRoot,
   ARTIFACT_MAX_UPLOAD_BYTES: '4194304',
+  // ── P1 / Task 2 起 ────────────────────────────────────────────────────────────
+  // 制品主密钥与写入 keyId。**一次性的测试值，绝不是密钥**（本文件按定义是公开的）。
+  // MASTER_ENCRYPTION_KEY 用的是 `'ab'.repeat(32)`，这里刻意换一个前缀，
+  // 免得「把两个密钥弄混」这种错误在测试里看不出来。
+  ARTIFACT_MASTER_KEY: 'cd'.repeat(32),
+  ARTIFACT_ACTIVE_KEY_ID: 'v1',
 } as const satisfies Partial<NodeJS.ProcessEnv>);

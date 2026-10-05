@@ -29,6 +29,10 @@ const VALID = {
   // P1 / Task 1 新增（见 tests/helpers/env.ts 的 K9 清单）
   ARTIFACT_STORE_DIR: 'C:\\Temp\\vca-artifacts-fixture',
   ARTIFACT_MAX_UPLOAD_BYTES: '4194304',
+  // P1 / Task 2 新增（同上清单）。ARTIFACT_ACTIVE_KEY_ID **不是**密钥，
+  // 因此它在这一组里只负责凑出「完整 env」——它不受占位层约束，也不该受。
+  ARTIFACT_MASTER_KEY: '0123456789abcdef'.repeat(4),
+  ARTIFACT_ACTIVE_KEY_ID: 'example-v1',
 } as unknown as NodeJS.ProcessEnv;
 
 describe('nonPlaceholder 的使用边界（只作用于密钥字段）', () => {
@@ -71,6 +75,24 @@ describe('nonPlaceholder 的使用边界（只作用于密钥字段）', () => {
     expect(result.success).toBe(false);
     if (!result.success) {
       expect(result.error.issues.map((i) => i.path.join('.'))).toContain('GITHUB_CLIENT_SECRET');
+    }
+  });
+
+  it('放行含 example / todo 的 ARTIFACT_ACTIVE_KEY_ID —— 它是标识符，不是密钥', () => {
+    // 判别式：把 nonPlaceholder 套到 ARTIFACT_ACTIVE_KEY_ID（或 ARTIFACT_MASTER_KEY 之外的
+    // 任何制品变量）上，这三条立刻变红。它会逐字写进每份制品的文件头、也会出现在日志里，
+    // 因此拿 `test` / `example` 这类词当 keyId 是**合法**的运维选择。
+    for (const keyId of ['example-v1', 'todo', 'test-v2']) {
+      const result = envSchema.safeParse({ ...VALID, ARTIFACT_ACTIVE_KEY_ID: keyId });
+
+      if (!result.success) {
+        throw new Error(
+          `ARTIFACT_ACTIVE_KEY_ID 不是密钥字段，不应受占位规则约束；keyId=${keyId}，实际报错=${result.error.issues
+            .map((i) => `${i.path.join('.')}: ${i.message}`)
+            .join(' | ')}`,
+        );
+      }
+      expect(result.data.ARTIFACT_ACTIVE_KEY_ID).toBe(keyId);
     }
   });
 });

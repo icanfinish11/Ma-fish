@@ -56,7 +56,16 @@ const PLACEHOLDER_SUBSTRINGS = [
 /**
  * 占位值拒绝层。**使用边界（硬性约定，不可扩大）：只允许用于「密钥」字段。**
  *
- * 当前恰好用在两个字段上：`MASTER_ENCRYPTION_KEY`、`GITHUB_CLIENT_SECRET`。
+ * 当前恰好用在三个字段上：`MASTER_ENCRYPTION_KEY`、`ARTIFACT_MASTER_KEY`、
+ * `GITHUB_CLIENT_SECRET`。
+ *
+ * **这三者里只有 `GITHUB_CLIENT_SECRET` 真正靠本层拦下东西**（它的下游只有 `min(1)`）。
+ * 两个 64 位 hex 的密钥字段上，占位层**不改变接受/拒绝的结果**：词表里没有任何一个词
+ * 是合法的 hex 串（`change_me` 含 `g`/`_`、`example` 含 `x`/`m`/`p`/`l`、`todo` 含 `t`/`o`……），
+ * 所以下游的 64 位 hex 正则自己就会拒掉每一个占位值。留着它是为了让报错文案直说
+ * 「这是占位值」，而不是「不是 64 位 hex」。**变异实测**：把 `ARTIFACT_MASTER_KEY` 上的
+ * 本层删掉，`env.schema.test.ts` 的占位用例**照旧全绿**（`evidence/t2-mutation-mp13-artifact-master-key-without-placeholder-layer.txt`）
+ * ——即那一层在该字段上不是承重件，这一点据实记载，不让它冒充证据。
  *
  * 为什么不能用于非密钥字段：上面的清单含 `example`、`todo` 这类**通用词**，
  * 而合法配置里出现它们完全正常，例如 `MAIL_FROM=no-reply@example.com`、
@@ -126,6 +135,46 @@ export const envSchema = z.object({
    * 因此这里只校验形状（正整数字节数），不替运维选数。
    */
   ARTIFACT_MAX_UPLOAD_BYTES: z.coerce.number().int().positive(),
+
+  /**
+   * 制品加密主密钥（P1 / Task 2，规格 D5）：32 字节 = 64 位 hex。
+   *
+   * **它与 `MASTER_ENCRYPTION_KEY` 是两个变量，这不是笔误**：规格 D5 逐字指定了
+   * `ARTIFACT_MASTER_KEY` 这个名字，且要求「沿用 P0 的占位值拒绝机制」。
+   * 两者今天都必填、都是 32 字节 hex、都无人读错的后果 —— 已知的重叠已记入
+   * `task-2-report.md` 的 Concerns（`MASTER_ENCRYPTION_KEY` 至今没有任何读取方），
+   * 由控制器裁定是删掉哪一个、还是让制品层复用它。**在裁定之前不允许出现「取不到
+   * ARTIFACT_MASTER_KEY 就回退用 MASTER_ENCRYPTION_KEY」这种代码**：那是本任务
+   * 明令禁止的默认键回退，且会把一次配置错误变成一次用错密钥的静默加密。
+   *
+   * 绝不入库、不入 git（C10）。`.env.example` 里只放占位值，且该占位值必须被拒绝。
+   */
+  ARTIFACT_MASTER_KEY: nonPlaceholder('ARTIFACT_MASTER_KEY').pipe(
+    z.string().regex(/^[0-9a-fA-F]{64}$/, 'ARTIFACT_MASTER_KEY 必须是 64 位十六进制（32 字节）'),
+  ),
+
+  /**
+   * 当前**写入**使用的 keyId（P1 / Task 2，规格 D5）。
+   *
+   * 轮换 = 新增一个 keyId、把新写入指到它；旧制品继续按自己头部里的 keyId 可读。
+   * 因此这个值不是密钥、也不会被隐藏：它会逐字写进每一份制品的文件头。
+   *
+   * **它不受占位层约束**（占位层只允许用于密钥字段，见上面的使用边界）：
+   * `v1` / `test` 这类名字是完全合法的 keyId。
+   *
+   * 形状受限的**理由**（不是格式洁癖）：
+   * 1. 它按 1 字节长度写进文件头 ⇒ 必须 ≤ 255 字节。限成 ASCII 且 ≤ 64 字符后，
+   *    「字符数」与「UTF-8 字节数」这两个口径不再有分歧；
+   * 2. 它会出现在错误信息与日志里 ⇒ 不允许空白与控制字符（`\n` 能把一行日志劈成两行）；
+   * 3. 首字符必须是字母或数字，`-`/`.`/`_` 只允许出现在中间 ⇒ 排除 `-` / `--` 这类
+   *    会被命令行工具当成选项的值。
+   */
+  ARTIFACT_ACTIVE_KEY_ID: z
+    .string()
+    .regex(
+      /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/,
+      'ARTIFACT_ACTIVE_KEY_ID 必须是 1..64 位的 ASCII 标识符（字母或数字开头，可含 . _ -）',
+    ),
 });
 
 export type Env = z.infer<typeof envSchema>;

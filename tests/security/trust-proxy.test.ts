@@ -41,6 +41,9 @@ describe('trust proxy 的取值解析（I-6：IP 维度限流的信任边界）'
       // P1 / Task 1 新增（见 tests/helpers/env.ts 的 K9 清单）
       ARTIFACT_STORE_DIR: 'C:\\Temp\\vca-artifacts-fixture',
       ARTIFACT_MAX_UPLOAD_BYTES: '4194304',
+      // P1 / Task 2 新增（同上清单）
+      ARTIFACT_MASTER_KEY: 'a'.repeat(64),
+      ARTIFACT_ACTIVE_KEY_ID: 'v1',
     });
     expect(parsed.TRUST_PROXY).toBe(DEFAULT_TRUST_PROXY);
     expect(parseTrustProxy(parsed.TRUST_PROXY)).toEqual(parseTrustProxy(undefined));

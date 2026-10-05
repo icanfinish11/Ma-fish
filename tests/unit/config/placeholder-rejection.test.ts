@@ -38,6 +38,10 @@ const ENV_EXAMPLE_PLACEHOLDERS = {
   // 这两个字段**不是**密钥，因此刻意也**不**受占位层约束——它们在这里只为凑出「完整 env」。
   ARTIFACT_STORE_DIR: 'C:\\Temp\\vca-artifacts-fixture',
   ARTIFACT_MAX_UPLOAD_BYTES: '4194304',
+  // P1 / Task 2 新增（同上清单）。`ARTIFACT_MASTER_KEY` 是密钥；`ARTIFACT_ACTIVE_KEY_ID`
+  // 是标识符（逐字取自 .env.example）。
+  ARTIFACT_MASTER_KEY: 'CHANGE_ME_64_HEX_CHARS',
+  ARTIFACT_ACTIVE_KEY_ID: 'v1',
 };
 
 describe('占位值拒绝规则（C10 / 威胁 #15）', () => {
@@ -50,7 +54,11 @@ describe('占位值拒绝规则（C10 / 威胁 #15）', () => {
       );
     }
     const fields = result.error.issues.map((i) => i.path.join('.'));
-    for (const field of ['MASTER_ENCRYPTION_KEY', 'GITHUB_CLIENT_SECRET']) {
+    // `ARTIFACT_MASTER_KEY` 是 P1 / Task 2 新增的**第二个** 64 位 hex 密钥字段，
+    // 处境与 `MASTER_ENCRYPTION_KEY` 逐字相同：拒掉它的是下游的 hex 正则，
+    // **不是**占位层（变异实测：把该字段上的占位层删掉，本用例照旧全绿，
+    // 见 `evidence/t2-mutation-m13-*`）。写进断言是为了钉住「它必须被拒」这个结果。
+    for (const field of ['MASTER_ENCRYPTION_KEY', 'ARTIFACT_MASTER_KEY', 'GITHUB_CLIENT_SECRET']) {
       if (!fields.includes(field)) {
         throw new Error(`字段 ${field} 的占位值未被拒绝；实际被拒字段=${fields.join(',')}`);
       }

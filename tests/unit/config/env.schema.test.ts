@@ -16,6 +16,9 @@ const VALID = {
   // P1 / Task 1 新增（见 tests/helpers/env.ts 的 K9 清单）
   ARTIFACT_STORE_DIR: 'C:\\Temp\\vca-artifacts-fixture',
   ARTIFACT_MAX_UPLOAD_BYTES: '4194304',
+  // P1 / Task 2 新增（同上清单）
+  ARTIFACT_MASTER_KEY: 'c'.repeat(64),
+  ARTIFACT_ACTIVE_KEY_ID: 'v1',
 } as unknown as NodeJS.ProcessEnv;
 
 describe('parseEnv', () => {
@@ -57,5 +60,72 @@ describe('parseEnv', () => {
 
   it('拒绝未知的 NODE_ENV', () => {
     expect(() => parseEnv({ ...VALID, NODE_ENV: 'staging' } as NodeJS.ProcessEnv)).toThrowError(/NODE_ENV/);
+  });
+});
+
+/**
+ * 制品密钥（P1 / Task 2，C10 / 规格 D5）。
+ *
+ * `ARTIFACT_MASTER_KEY` 是**密钥**：必填、64 位 hex、占位值拒绝，且绝不入库不入 git。
+ * `ARTIFACT_ACTIVE_KEY_ID` 是**标识符**而非密钥（它会逐字写进每份制品的头部），
+ * 因此它**不**受占位层约束（见 `placeholder-boundary.test.ts` 的边界说明），
+ * 但形状必须受限：它要按 1 字节长度写进文件头，且会出现在错误信息里。
+ */
+describe('制品密钥与 keyId（C10 / D5）', () => {
+  it('缺少 ARTIFACT_MASTER_KEY 时拒绝启动', () => {
+    const rest = { ...VALID };
+    delete rest.ARTIFACT_MASTER_KEY;
+
+    expect(() => parseEnv(rest as NodeJS.ProcessEnv)).toThrowError(/ARTIFACT_MASTER_KEY/);
+  });
+
+  it('拒绝占位值与长度不足的 ARTIFACT_MASTER_KEY', () => {
+    // 逐字取自 .env.example 的占位值
+    expect(() =>
+      parseEnv({ ...VALID, ARTIFACT_MASTER_KEY: 'CHANGE_ME_64_HEX_CHARS' } as NodeJS.ProcessEnv),
+    ).toThrowError(/ARTIFACT_MASTER_KEY/);
+    // 63 位 hex：长度门差一位也不行
+    expect(() =>
+      parseEnv({ ...VALID, ARTIFACT_MASTER_KEY: 'ab'.repeat(31) + 'a' } as NodeJS.ProcessEnv),
+    ).toThrowError(/ARTIFACT_MASTER_KEY/);
+    // 64 个字符但不是 hex
+    expect(() =>
+      parseEnv({ ...VALID, ARTIFACT_MASTER_KEY: 'zz'.repeat(32) } as NodeJS.ProcessEnv),
+    ).toThrowError(/ARTIFACT_MASTER_KEY/);
+  });
+
+  it('缺少 ARTIFACT_ACTIVE_KEY_ID 时拒绝启动（没有「悄悄用某个默认 keyId」这条路）', () => {
+    const rest = { ...VALID };
+    delete rest.ARTIFACT_ACTIVE_KEY_ID;
+
+    expect(() => parseEnv(rest as NodeJS.ProcessEnv)).toThrowError(/ARTIFACT_ACTIVE_KEY_ID/);
+  });
+
+  it('ARTIFACT_ACTIVE_KEY_ID 的形状受限（空串 / 空格 / 超长 / 控制字符）', () => {
+    const bad = ['', '   ', 'v 1', 'v1\n', 'k'.repeat(65), '轮换', '-v1', 'v1:'];
+    for (const value of bad) {
+      expect(
+        () => parseEnv({ ...VALID, ARTIFACT_ACTIVE_KEY_ID: value } as NodeJS.ProcessEnv),
+        `ARTIFACT_ACTIVE_KEY_ID=${JSON.stringify(value)} 不该被接受`,
+      ).toThrowError(/ARTIFACT_ACTIVE_KEY_ID/);
+    }
+  });
+
+  it('接受合法的制品密钥与 keyId，并在一次报错里同时点名两者', () => {
+    const env = parseEnv(VALID);
+    expect(env.ARTIFACT_MASTER_KEY).toBe('c'.repeat(64));
+    expect(env.ARTIFACT_ACTIVE_KEY_ID).toBe('v1');
+
+    const rest = { ...VALID };
+    delete rest.ARTIFACT_MASTER_KEY;
+    delete rest.ARTIFACT_ACTIVE_KEY_ID;
+    try {
+      parseEnv(rest as NodeJS.ProcessEnv);
+      throw new Error('缺少两个制品变量却启动了');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      expect(message).toContain('ARTIFACT_MASTER_KEY');
+      expect(message).toContain('ARTIFACT_ACTIVE_KEY_ID');
+    }
   });
 });

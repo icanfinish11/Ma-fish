@@ -88,6 +88,9 @@ describe('引导期 fail-fast 接线（app.module → ConfigModule → validate�
     // P1 / Task 1：制品卷与上传上限都是必填（无默认值），缺一个也不许启动。
     'ARTIFACT_STORE_DIR',
     'ARTIFACT_MAX_UPLOAD_BYTES',
+    // P1 / Task 2：制品主密钥与写入 keyId 同样必填（D5：缺当前写入键 ⇒ 拒绝）。
+    'ARTIFACT_MASTER_KEY',
+    'ARTIFACT_ACTIVE_KEY_ID',
   ] as const;
 
   it('必填密钥全部缺失时，求值 app.module 会拒绝启动', async () => {
@@ -126,7 +129,7 @@ describe('引导期 fail-fast 接线（app.module → ConfigModule → validate�
     expect(reason).toBeInstanceOf(Error);
     const message = reason instanceof Error ? reason.message : String(reason);
     expect(message).toContain('环境变量校验失败，服务拒绝启动');
-    for (const key of ['MASTER_ENCRYPTION_KEY', 'GITHUB_CLIENT_SECRET']) {
+    for (const key of ['MASTER_ENCRYPTION_KEY', 'ARTIFACT_MASTER_KEY', 'GITHUB_CLIENT_SECRET']) {
       expect(message).toContain(key);
     }
   });
