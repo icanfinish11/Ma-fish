@@ -93,7 +93,8 @@ interface BlockSpan {
  * 1. **索引区几何**：`indexOffset` 不早于块数据区、索引区长度非负且是 `24` 的整数倍；
  * 2. **三条完整性校验**：`chunkCount === 索引区实际记录数`、
  *    `chunkCount === ceil(plaintextLength / chunkSize)`、`Σ ciphertextLength === plaintextLength`；
- * 3. **索引自身**：`offset` 严格递增、每条记录的区间落在块数据区内。
+ * 3. **索引自身**：`offset` 严格递增、第 0 条从块数据区起点开始、块之间连续、
+ *    每条记录的区间落在块数据区内。
  *
  * **一处据实记载**：这三条**挡不住「整块截断 + 尾部改得完全自洽」**——把一个 3 块制品
  * 截成 2 块、删掉对应的索引记录、把尾部改小，三条全部满足。挡住它的是末块的 `isLast`
@@ -396,6 +397,11 @@ function validateIndexContents(input: {
   footer: ArtifactFooter;
 }): void {
   const { header, entries, footer } = input;
+  /**
+   * 块数据区的起点：头部长度（`31 + keyId` 字节）。**不是**索引里任何自称值，
+   * 因此它可以用来校验「第 0 条记录从哪儿开始」。
+   */
+  const dataStart = BigInt(blockDataOffset(header.keyId.length));
 
   // ---- 校验 1：尾部自称的块数 === 索引区里实际存在的记录数 ----
   if (footer.chunkCount !== BigInt(entries.length)) {
@@ -421,9 +427,10 @@ function validateIndexContents(input: {
     );
   }
 
-  // ---- 索引自身：offset 严格递增、每条记录的区间落在块数据区内 ----
+  // ---- 索引自身：offset 严格递增、从块数据区起点开始、块之间连续、每条记录的区间落在块数据区内 ----
   // 「严格」而不是「非递减」：写入端从不产出 0 字节的块，因此两条记录同一起点只可能是伪造。
   let previous = -1;
+  let expectedStart = dataStart;
   for (let position = 0; position < entries.length; position++) {
     const entry = entries[position];
     if (entry === undefined) break; // 不可达（上面的循环界就是 entries.length）；让类型收窄
@@ -434,12 +441,32 @@ function validateIndexContents(input: {
         `索引 offset 不是严格递增：第 ${position} 条记录的 offset=${entry.offset}，前一条是 ${previous}`,
       );
     }
+    /**
+     * 块数据区是**连续**的：第 0 条记录从头部末尾开始，此后每条紧接上一条。
+     *
+     * 只校验「递增 + 区间上界」是**只从上界卡**：一个把中段记录往前挪几字节的伪造索引
+     * 仍然满足递增与上界（`previous` 是上一条记录的起点，不受影响），于是坐标会被
+     * 结构性地接受——payload 在**读的时候**因认证失败而拒，但错误信息指向「密文被篡改」，
+     * 而真实原因是索引坐标不连续。这一条把坐标本身钉死。
+     *
+     * 它**不是**新的安全边界（篡改仍然在第一次读该块时被拒），而是给同一类拒绝
+     * 一个指向**坐标**的诊断：与 Step 6 的其它判据同一类，成本是一行。
+     */
+    if (entry.offset !== expectedStart) {
+      throw new Error(
+        position === 0
+          ? `第 0 条记录的起点必须是块数据区起点：offset=${entry.offset}，而头部之后从 ${dataStart} 开始`
+          : `索引记录不连续：第 ${position} 条记录的 offset=${entry.offset}，` +
+              `而前一条记录的终点（含 ${TAG_BYTES} 字节 tag）是 ${expectedStart}`,
+      );
+    }
     if (end > footer.indexOffset) {
       throw new Error(
         `第 ${position} 条记录的区间越出块数据区：[${entry.offset}, ${end})，而索引起点是 ${footer.indexOffset}`,
       );
     }
     previous = start;
+    expectedStart = end;
   }
 }
 

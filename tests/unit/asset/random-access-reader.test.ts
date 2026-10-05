@@ -2,30 +2,44 @@ import { describe, expect, it } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Readable, Writable } from 'node:stream';
+import { Readable } from 'node:stream';
 import { crc32 } from 'node:zlib';
 import * as yauzl from 'yauzl';
-import { pipeline } from 'node:stream/promises';
 import {
   FOOTER_BYTES,
   INDEX_ENTRY_SIZE,
-  TAG_BYTES,
   blockDataOffset,
   decodeFooter,
-  decodeHeader,
-  decodeIndex,
-  encodeFooter,
-  encodeHeader,
-  encodeIndex,
   headerByteLength,
-  type ArtifactHeader,
   type IndexEntry,
 } from '@vca/api/modules/asset/crypto/artifact-format.js';
-import { ChunkEncryptor } from '@vca/api/modules/asset/crypto/chunk-cipher.js';
-import { createKeyRing, type KeyRing } from '@vca/api/modules/asset/crypto/key-ring.js';
-import type { ArtifactStore } from '@vca/api/modules/asset/store/artifact-store.port.js';
+import { createKeyRing } from '@vca/api/modules/asset/crypto/key-ring.js';
 import { LocalArtifactStore } from '@vca/api/modules/asset/store/local-artifact.store.js';
 import { EncryptedArtifactReader } from '@vca/api/modules/asset/store/random-access-reader.js';
+// 制品的构造与伪造（含 C20 调换、整块截断）住在共享夹具里：`security` 门要**复用**
+// 同一批辅助函数来断言「这些伪造必须被拒」，而不是把同一条用例复制成两份。
+// 见 `tests/helpers/craft-encrypted-artifact.ts` 的文件头。
+import {
+  KEY_BYTES,
+  MemoryStore,
+  at,
+  collect,
+  entriesOf,
+  fakeRing,
+  openForged,
+  openForgedReader,
+  pattern,
+  readRange,
+  recordRange,
+  sectionsOf,
+  seedArtifact,
+  swapRecords,
+  truncateLastBlocks,
+  withChunkSize,
+  withFooter,
+  withIndexEntry,
+  type SeededArtifact,
+} from '../../helpers/craft-encrypted-artifact.js';
 
 /**
  * 加密制品的随机访问读取器（P1 / Task 3 的读取端）。
@@ -44,7 +58,9 @@ import { EncryptedArtifactReader } from '@vca/api/modules/asset/store/random-acc
  * 2. **完整性**（三条校验 + 索引自身校验 + C20）：制品的头部与尾部**都不在任何 AAD 里**，
  *    因此总量字段是不可信输入；`offset` / `ciphertextLength` 同样未被认证。
  *    **写入端的 `decodeIndex` 有意不做这些检查**（它只负责「24 字节 → 记录」），
- *    它们是读取端的责任。
+ *    它们是读取端的责任。安全门（`tests/security/asset-artifact-integrity.test.ts`）
+ *    用同一批夹具断言这些伪造**必须被拒**——本文件负责判据的**判别力**（每条校验都有一条
+ *    孤立用例 + 变异探针），安全门负责「控制还在不在」。
  *
  * ## 一处据实记载：三条完整性校验**挡不住整块截断**
  *
@@ -52,144 +68,23 @@ import { EncryptedArtifactReader } from '@vca/api/modules/asset/store/random-acc
  * 全部满足（见本文件那条用例的算术）。挡住它的是末块的 `isLast` AAD 标记：被删块之后
  * 的那一块当初是用 `more` 建的，而读取端会把它当末块（`last`）去认证 ⇒ 拒绝。
  * 这条边界必须写清楚，否则「三条校验 = 充分」这句话会让人以为整块截断在 open 阶段就被拦下。
- */
-
-/** 固定密钥（与 Task 2/3 的其它用例同款）。 */
-const KEY_BYTES = Buffer.from('000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f', 'hex');
-
-/** 测试替身：固定密钥、固定 keyId。 */
-function fakeRing(keyId = 'v1', key: Buffer = KEY_BYTES): KeyRing {
-  return {
-    activeKeyId: () => keyId,
-    keyFor: (asked: string): Buffer => {
-      if (asked !== keyId) throw new Error(`未知的制品 keyId：${JSON.stringify(asked)}`);
-      return Buffer.from(key);
-    },
-  };
-}
-
-/** 确定性明文：第 i 字节 = (seed + i) % 251。 */
-function pattern(bytes: number, seed = 0): Buffer {
-  const buffer = Buffer.alloc(bytes);
-  for (let i = 0; i < bytes; i++) buffer[i] = (seed + i) % 251;
-  return buffer;
-}
-
-function at<T>(items: readonly T[], position: number): T {
-  const item = items[position];
-  if (item === undefined) throw new Error(`测试期望第 ${position} 项存在`);
-  return item;
-}
-
-/** 一次 `getRange` 请求（含键、闭区间），供「解密了多少块」这类断言使用。 */
-interface RangeRequest {
-  key: string;
-  start: number;
-  endInclusive: number;
-}
-
-/**
- * 内存制品存储：`ArtifactStore` 的测试替身，**记录每一次区间请求**。
  *
- * 「只解密所需块」这条验收只能从**请求了哪些区间**上看出来（解密发生在读取器内部）。
- * 请求区间与块范围的对应关系由本文件按索引算，而不是由实现自报——否则就是自我对照。
+ * **修复轮 1 的补强（复审的精确化）**：这条防线是**完整**的——截断到 n 块必然逼着读取端
+ * 把真实的第 n-1 块当末块去认证，而那块的标记是 `more` ⇒ 必拒。唯一的条件是
+ * **读取必须走到自称的末尾**。因此本文件与安全门都直接断言这件事：
+ * 「走到自称末尾的那次读**确实认证了最后一块**」（见 `最后一块` 那两条用例），
+ * 而不是把这条义务留在注释里。
  */
-class MemoryStore implements ArtifactStore {
-  readonly requests: RangeRequest[] = [];
-  private readonly objects = new Map<string, Buffer>();
-  private counter = 0;
 
-  /** 直接放入一段字节并返回键（测试里的制品是现拼的，不必走 `putStream`）。 */
-  seed(bytes: Buffer): string {
-    const key = `object-${++this.counter}`;
-    this.objects.set(key, Buffer.from(bytes));
-    return key;
+/** 明文偏移 → 落在哪一块（本文件自己算，不问实现）。 */
+function blockOf(entries: readonly IndexEntry[], offset: number): number {
+  let cursor = 0;
+  for (let position = 0; position < entries.length; position++) {
+    const length = at(entries, position).ciphertextLength;
+    if (offset < cursor + length) return position;
+    cursor += length;
   }
-
-  async putStream(source: Readable, opts: { maxBytes: number }): Promise<{ key: string; bytes: number }> {
-    const chunks: Buffer[] = [];
-    let bytes = 0;
-    for await (const chunk of source) {
-      const buffer = Buffer.from(chunk as Buffer);
-      bytes += buffer.length;
-      if (bytes > opts.maxBytes) throw new Error(`超过上限 ${opts.maxBytes}`);
-      chunks.push(buffer);
-    }
-    return { key: this.seed(Buffer.concat(chunks)), bytes };
-  }
-
-  async getRange(key: string, start: number, endInclusive: number): Promise<Buffer> {
-    this.requests.push({ key, start, endInclusive });
-    const object = this.objects.get(key);
-    if (object === undefined) throw new Error(`对象不存在：${key}`);
-    if (start < 0 || endInclusive < start || endInclusive >= object.length) {
-      throw new Error(`区间越界：[${start}, ${endInclusive}]，对象只有 ${object.length} 字节`);
-    }
-    return Buffer.from(object.subarray(start, endInclusive + 1));
-  }
-
-  async stat(key: string): Promise<{ bytes: number }> {
-    const object = this.objects.get(key);
-    if (object === undefined) throw new Error(`对象不存在：${key}`);
-    return { bytes: object.length };
-  }
-
-  async delete(key: string): Promise<void> {
-    this.objects.delete(key);
-  }
-
-  /** 本次区间请求取回的**总字节数**（不是请求次数）。 */
-  bytesRequested(): number {
-    return this.requests.reduce((sum, request) => sum + (request.endInclusive - request.start + 1), 0);
-  }
-
-  /** 清空请求记录（把「open 阶段」与「读阶段」分开计量）。 */
-  reset(): void {
-    this.requests.length = 0;
-  }
-}
-
-interface SeededArtifact {
-  key: string;
-  artifact: Buffer;
-  header: ArtifactHeader;
-  entries: IndexEntry[];
-  plaintext: Buffer;
-}
-
-/** 加密 → 按 R3 的顺序拼出制品 → 放进内存存储。 */
-async function seedArtifact(
-  store: MemoryStore,
-  plaintext: Buffer,
-  opts: { chunkSize?: number; ring?: KeyRing } = {},
-): Promise<SeededArtifact> {
-  const encryptor = new ChunkEncryptor(opts.ring ?? fakeRing(), opts.chunkSize ? { chunkSize: opts.chunkSize } : {});
-  const collected: Buffer[] = [];
-  const sink = new Writable({
-    write(chunk: Buffer, _encoding, callback): void {
-      collected.push(Buffer.from(chunk));
-      callback();
-    },
-  });
-  await pipeline(Readable.from([plaintext]), encryptor.transform(), sink);
-
-  const { header, index, footer } = encryptor.result();
-  const artifact = Buffer.concat([encodeHeader(header), Buffer.concat(collected), index, footer]);
-  const entries = decodeIndex(index);
-  return { key: store.seed(artifact), artifact, header, entries, plaintext };
-}
-
-/** 一条记录在制品里的闭区间（密文 + tag）。 */
-function recordRange(entry: IndexEntry): { start: number; endInclusive: number } {
-  const start = Number(entry.offset);
-  return { start, endInclusive: start + entry.ciphertextLength + TAG_BYTES - 1 };
-}
-
-/** 把一段流收成 Buffer。 */
-async function collect(stream: Readable): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of stream) chunks.push(Buffer.from(chunk as Buffer));
-  return Buffer.concat(chunks);
+  throw new Error(`明文偏移 ${offset} 不在任何块里`);
 }
 
 /**
@@ -252,17 +147,6 @@ function buildStoredZip(name: string, content: Buffer): Buffer {
   end.writeUInt16LE(0, 20); // 注释长度
 
   return Buffer.concat([local, nameBytes, content, central, nameBytes, end]);
-}
-
-/** 明文偏移 → 落在哪一块（本文件自己算，不问实现）。 */
-function blockOf(entries: readonly IndexEntry[], offset: number): number {
-  let cursor = 0;
-  for (let position = 0; position < entries.length; position++) {
-    const length = at(entries, position).ciphertextLength;
-    if (offset < cursor + length) return position;
-    cursor += length;
-  }
-  throw new Error(`明文偏移 ${offset} 不在任何块里`);
 }
 
 describe('EncryptedArtifactReader 的区间语义（明文视图）', () => {
@@ -358,18 +242,45 @@ describe('只解密所需块（验收：读尾部 N 字节解密的块数 ≤ 2�
     expect(reader.plaintextLength).toBe(plaintext.length);
   });
 
-  it('读尾部 22 字节只解密**最后一块**（不是整份制品）', async () => {
+  /**
+   * 「读到末尾的尾巴」——这条用例是 Task 4 义务的**唯一机械判据**（修复轮 1 / Fix 3）。
+   *
+   * 三条断言各自钉住一件 Task 4 依赖的事：
+   * 1. 区间真的落在**最后一块的后半段**（不是块中间某处）；
+   * 2. 末字节在返回的字节里 —— 也就是**读到了制品自称的最后一字节**；
+   * 3. 解密的块**恰好是索引的最后一条记录**（`isLast = true` 的那一块）⇒ 它的 GCM
+   *    tag 被真实验证过。没有这一条，一次「走到自称末尾但不认证末块」的读
+   *    （例如把 `serveRange` 提前 return）会全绿，而 Task 4 的全部截断检测都压在
+   *    「末块被认证」这件事上。
+   */
+  it('读**真正的尾部** 22 字节：落在最后一块内、读到末字节，且只有那一次请求 ⇒ 末块被认证', async () => {
     const store = new MemoryStore();
     const plaintext = pattern(5 * 64, 6);
     const seeded = await seedArtifact(store, plaintext, { chunkSize: 64 });
+    const lastPosition = seeded.entries.length - 1;
+    const lastBlock = at(seeded.entries, lastPosition);
+
     const reader = await EncryptedArtifactReader.open(store, seeded.key, fakeRing());
+    // 起点必须落在**最后一块**里（前缀和算，不问实现），而不是块中间
+    expect(blockOf(seeded.entries, plaintext.length - 22)).toBe(lastPosition);
+    // 而且它确实在最后一块的**后半段**：最后一块从 `plaintext.length - 64` 开始
+    // （**注意坐标系统**：`entry.offset` 是**制品内**的密文偏移，不是明文偏移，
+    //  两者差着一个头部长度 —— 第一版就是拿它当明文偏移去比才红的）
+    const lastBlockPlaintextStart = seeded.entries
+      .slice(0, lastPosition)
+      .reduce((sum, entry) => sum + entry.ciphertextLength, 0);
+    expect(plaintext.length - 22).toBeGreaterThan(lastBlockPlaintextStart);
+    expect(lastBlock.ciphertextLength).toBe(64);
     store.reset();
 
     const out = await collect(reader._readStreamForRange(plaintext.length - 22, plaintext.length));
 
     expect(out.equals(plaintext.subarray(plaintext.length - 22))).toBe(true);
-    // 恰好一次请求，且它就是**最后一条记录**的区间 ⇒ 解密的块数 = 1
-    expect(store.requests).toEqual([{ key: seeded.key, ...recordRange(at(seeded.entries, 4)) }]);
+    // 末字节确实回来了：`_readStreamForRange` 的 end 是独占的，`plaintextLength` 是自称末尾
+    expect(reader.plaintextLength).toBe(plaintext.length);
+    expect(out.subarray(out.length - 1).equals(plaintext.subarray(plaintext.length - 1))).toBe(true);
+    // 恰好一次请求，且它就是**最后一条记录**的区间 ⇒ 解密的块数 = 1，且这一块按 `last` 认证
+    expect(store.requests).toEqual([{ key: seeded.key, ...recordRange(lastBlock) }]);
   });
 
   it('读中间任意区间只解密与之相交的块，且每块最多请求一次', async () => {
@@ -462,114 +373,6 @@ describe('越界与生命周期', () => {
 });
 
 describe('读取端的校验：三条完整性校验 + 索引自身（写入端的 decodeIndex 有意不做）', () => {
-  /** 制品的各段位置（**按实际字节**算，不用任何自称值——自称值正是被测对象）。 */
-  function sectionsOf(artifact: Buffer): { headerBytes: number; indexOffset: number; indexBytes: number } {
-    const { keyIdLength } = decodeHeader(artifact);
-    const footer = decodeFooter(artifact.subarray(artifact.length - FOOTER_BYTES));
-    return {
-      headerBytes: headerByteLength(keyIdLength),
-      indexOffset: Number(footer.indexOffset),
-      indexBytes: Number(footer.chunkCount) * INDEX_ENTRY_SIZE,
-    };
-  }
-
-  function entriesOf(artifact: Buffer): IndexEntry[] {
-    const { indexOffset, indexBytes } = sectionsOf(artifact);
-    return decodeIndex(artifact.subarray(indexOffset, indexOffset + indexBytes));
-  }
-
-  /** 复制一份制品并重写尾部（其余字节不动）。 */
-  function withFooter(
-    artifact: Buffer,
-    patch: Partial<{ indexOffset: bigint; chunkCount: bigint; plaintextLength: bigint }>,
-  ): Buffer {
-    const out = Buffer.from(artifact);
-    const current = decodeFooter(artifact.subarray(artifact.length - FOOTER_BYTES));
-    encodeFooter({ ...current, ...patch }).copy(out, artifact.length - FOOTER_BYTES);
-    return out;
-  }
-
-  /** 复制一份制品并重写头部里的 `chunkSize`（头部未被认证 ⇒ 它可以被单独篡改）。 */
-  function withChunkSize(artifact: Buffer, chunkSize: number): Buffer {
-    const { header, keyIdLength } = decodeHeader(artifact);
-    const out = Buffer.from(artifact);
-    encodeHeader({ ...header, chunkSize }).copy(out, 0, 0, headerByteLength(keyIdLength));
-    return out;
-  }
-
-  /** 复制一份制品并只改写第 `position` 条索引记录（24 字节）。 */
-  function withIndexEntry(artifact: Buffer, position: number, entry: IndexEntry): Buffer {
-    const { indexOffset } = sectionsOf(artifact);
-    const out = Buffer.from(artifact);
-    encodeIndex([entry]).copy(out, indexOffset + position * INDEX_ENTRY_SIZE);
-    return out;
-  }
-
-  /**
-   * 「整体调换两条记录」：互换两条记录的**存储字节**，并互换它们各自的自称序号。
-   *
-   * 调换之后，整份制品在「信任自称序号」的解读下**完全自洽**（offset / 长度 / 条数 /
-   * 合计都没变），因此三条完整性校验与索引自身校验**全部通过**——只有 C20 的位置比对
-   * 能发现它。这正是预检实测的那个漏洞形态。
-   */
-  function swapRecords(artifact: Buffer, left: number, right: number): Buffer {
-    const entries = entriesOf(artifact);
-    const leftRange = recordRange(at(entries, left));
-    const rightRange = recordRange(at(entries, right));
-    if (leftRange.endInclusive - leftRange.start !== rightRange.endInclusive - rightRange.start) {
-      throw new Error('本用例只调换等长记录');
-    }
-    const out = Buffer.from(artifact);
-    const moved = Buffer.from(out.subarray(rightRange.start, rightRange.endInclusive + 1));
-    // 两个区间不相交，因此可以直接 copy；最后再把暂存的那段放回去
-    out.copy(out, rightRange.start, leftRange.start, leftRange.endInclusive + 1);
-    moved.copy(out, leftRange.start);
-
-    // 自称序号：字节 12..19（见 artifact-format.ts 的布局说明）。用临时变量交换
-    // ——`a = b; b = a` 会把两处写成同一个值（本文件第一版就是这么错的）。
-    const selfOf = (position: number): bigint => at(entries, position).index;
-    const swapped = entries.map((entry) => ({ ...entry }));
-    at(swapped, left).index = selfOf(right);
-    at(swapped, right).index = selfOf(left);
-    const { indexOffset } = sectionsOf(artifact);
-    encodeIndex(swapped).copy(out, indexOffset);
-    return out;
-  }
-
-  /**
-   * **整块截断**：删掉末尾一整块**连同它的索引记录**，并把尾部改得完全自洽
-   * （`indexOffset` 前移、`chunkCount` 减一、`plaintextLength` 减一个块长）。
-   */
-  function truncateLastBlock(artifact: Buffer): Buffer {
-    const { indexOffset } = sectionsOf(artifact);
-    const entries = entriesOf(artifact);
-    const last = at(entries, entries.length - 1);
-    const kept = entries.slice(0, entries.length - 1);
-    const recordBytes = last.ciphertextLength + TAG_BYTES;
-    const newIndexOffset = indexOffset - recordBytes;
-    return Buffer.concat([
-      artifact.subarray(0, newIndexOffset),
-      artifact.subarray(indexOffset, indexOffset + kept.length * INDEX_ENTRY_SIZE),
-      encodeFooter({
-        indexOffset: BigInt(newIndexOffset),
-        chunkCount: BigInt(kept.length),
-        plaintextLength: kept.reduce((sum, entry) => sum + BigInt(entry.ciphertextLength), 0n),
-      }),
-    ]);
-  }
-
-  /** 打开一份「被改过」的制品，返回它抛出的那句话（没抛就返回空串）。 */
-  async function openForged(artifact: Buffer): Promise<string> {
-    const store = new MemoryStore();
-    const key = store.seed(artifact);
-    try {
-      await EncryptedArtifactReader.open(store, key, fakeRing());
-    } catch (error) {
-      return error instanceof Error ? error.message : String(error);
-    }
-    return '';
-  }
-
   /**
    * 三条完整性校验各自的**孤立**伪造。
    *
@@ -619,10 +422,18 @@ describe('读取端的校验：三条完整性校验 + 索引自身（写入端�
     expect(message).toMatch(/plaintextLength=192/);
   });
 
+  /**
+   * **整块截断**：三条校验全绿、`open()` 成功，但走到自称末尾的那次读**必须**响。
+   *
+   * 修复轮 1（Fix 1）把这条用例的判据从「注释里写着 Task 4 要用末块认证」改成**机械判据**：
+   * 第四条断言逐条比对 `store.requests`，要求这次读请求的区间**恰好**是索引最后一条记录，
+   * 也就是「**末块确实被解密器认证过**」。把 `serveRange` 改成不读末块（或提前 return），
+   * 这条断言立刻变红——义务不再只住在注释里。
+   */
   it('三条校验**合起来仍挡不住整块截断**：尾部改得自洽时 open 通过，但读末块被 `isLast` 拒绝', async () => {
     const store = new MemoryStore();
     const seeded = await seedArtifact(store, pattern(192, 21), { chunkSize: 64 });
-    const forged = truncateLastBlock(seeded.artifact);
+    const forged = truncateLastBlocks(seeded.artifact);
     const key = store.seed(forged);
 
     // 算术复核（据实记载，别把它读成「三条校验足够」）：
@@ -632,7 +443,18 @@ describe('读取端的校验：三条完整性校验 + 索引自身（写入端�
     expect(reader.plaintextLength).toBe(128);
 
     // 挡住它的是末块的 AAD 标记：这一块当初是用 `more` 建的，而读取端按 `last` 去认证。
-    await expect(collect(reader._readStreamForRange(64, 128))).rejects.toThrow(/第 1 块认证失败/);
+    store.reset();
+    const readToDeclaredEnd = await readRange(reader, 64, reader.plaintextLength);
+    expect(readToDeclaredEnd.message).toMatch(/第 1 块认证失败/);
+    expect(readToDeclaredEnd.bytes).toBeNull();
+    // **Fix 1 的核心断言**：这次读解密的块恰好是**伪造制品**索引的最后一条记录
+    // ⇒ 「走到自称末尾 ⇒ 末块被认证」这件事被机械地钉住了。
+    // 少了它，把末块从读取路径里去掉（探针 `last-block-not-read`）不会红任何东西。
+    const forgedEntries = entriesOf(forged);
+    const expectedLastRead = { key, ...recordRange(at(forgedEntries, forgedEntries.length - 1)) };
+    expect(store.requests.at(-1)).toEqual(expectedLastRead);
+    expect(store.requests.filter((request) => request.start === expectedLastRead.start)).toHaveLength(1);
+
     // 而它前面的那一块照常可读（说明拒绝来自末块标记，不是实现整体坏掉）
     expect((await collect(reader._readStreamForRange(0, 64))).equals(seeded.plaintext.subarray(0, 64))).toBe(true);
   });
@@ -648,18 +470,57 @@ describe('读取端的校验：三条完整性校验 + 索引自身（写入端�
     expect(await openForged(withFooter(seeded.artifact, { plaintextLength: 2n ** 60n }))).toMatch(/超出可安全表示/);
   });
 
-  it('索引自身：`offset` 必须严格递增，且每条记录的区间落在块数据区内', async () => {
+  /**
+   * 索引自身的结构判据。三条断言的**判别力各自孤立**（各自有变异探针）：
+   *
+   * - 严格递增：第 1 条与第 0 条同一起点；
+   * - **第 0 条必须从块数据区起点开始**（修复轮 1 补的判据之一）：把第 0 条往后挪 8 字节；
+   * - **块之间必须连续**（修复轮 1 补的另一条）：把第 1 条记录**往前**挪 8 字节
+   *   （压到上一块尾部那 8 个字节上）。此时 `previous` 没变 ⇒ **递增仍然成立**、
+   *   区间上界仍然成立、条数与合计都没动 ⇒ 三条完整性校验全绿。
+   *
+   * 少了后两条，一个指向头部区域或与相邻块重叠的伪造索引会被 `open()` **结构性地接受**：
+   * 读的时候确实会因 GCM 认证失败而拒（fail closed），但错误信息指向「密文被篡改」，
+   * 而真实原因是**索引坐标**不自洽。这两条把坐标本身钉死，属于同一类检查（Step 6）。
+   */
+  it('索引自身：`offset` 必须严格递增、第 0 条从块数据区起点开始、块之间连续', async () => {
     const seeded = await threeFullBlocks();
     const entries = entriesOf(seeded.artifact);
-    const { indexOffset, headerBytes } = sectionsOf(seeded.artifact);
+    const { headerBytes } = sectionsOf(seeded.artifact);
 
     // 非递增：第 1 条与第 0 条同一起点
     const notIncreasing = withIndexEntry(seeded.artifact, 1, { ...at(entries, 1), offset: BigInt(headerBytes) });
     expect(await openForged(notIncreasing)).toMatch(/不是严格递增/);
 
-    // 区间越界：第 2 条记录的起点被挪到索引起点上，于是它的区间越过块数据区
-    const outOfRange = withIndexEntry(seeded.artifact, 2, { ...at(entries, 2), offset: BigInt(indexOffset) });
-    expect(await openForged(outOfRange)).toMatch(/区间越出块数据区/);
+    // 第 0 条不从块数据区起点开始 ⇒ 索引与文件几何不自洽
+    const notAtDataStart = withIndexEntry(seeded.artifact, 0, {
+      ...at(entries, 0),
+      offset: BigInt(headerBytes + 8),
+    });
+    expect(await openForged(notAtDataStart)).toMatch(/第 0 条记录的起点必须是块数据区起点/);
+
+    // 不连续：第 1 条往前挪 8 字节（递增仍成立、上界仍成立、条数与合计都没动）
+    const overlapping = withIndexEntry(seeded.artifact, 1, {
+      ...at(entries, 1),
+      offset: at(entries, 1).offset - 8n,
+    });
+    expect(await openForged(overlapping)).toMatch(/索引记录不连续/);
+
+    // 原来那条「把第 2 条挪到索引起点上」的伪造，本轮实测**改由连续性报错**
+    // （`索引记录不连续：第 2 条记录的 offset=273，而前一条记录的终点…是 193`）：
+    // 它同时违反两条判据，因此它的判别力不唯一，不适合断言具体是哪一个。
+    //
+    // **据实记载（一个反直觉的发现）**：在「递增 + 第 0 条起点 + 连续性 + 校验 3」都成立之后，
+    // 「每条记录的区间落在 `[0, indexOffset)` 内」这条上界判据**无法在合法几何下被单独触发**：
+    // 连续性把最后一条记录的终点钉在 `indexOffset` 上、校验 3 把各块长度之和钉在
+    // `plaintextLength` 上，于是「越界」蕴含「Σ+ciphertextLength > plaintextLength」，
+    // 那已经在校验 3 被拒了。（我按这个方向构造了四条伪造、逐条实测，
+    // 全部被更早的几何或校验 3 接住。）因此**它没有一条独立的用例与探针**，
+    // 实现里那一行是防御性的第二道闸；我没有据此删掉它（那是 Task 3 之外的范围），
+    // 也没有为它编造一条「红」——`index-range-in-bounds` 探针因此**没有判别力**。
+
+    // 负向对照：上面几条判据不是「任何制品都拒绝」——原样制品必须照常打开
+    expect(await openForged(seeded.artifact)).toBe('');
   });
 
   it('0 块制品的几何：`chunkCount = 0` 时 `indexOffset` 必须等于头部长度', async () => {
@@ -687,6 +548,20 @@ describe('读取端的校验：三条完整性校验 + 索引自身（写入端�
     await expect(collect(reader._readStreamForRange(64, 128))).rejects.toThrow(/位置 1 处的记录自称序号 0/);
     // 没被调换的那一块照常可读
     expect((await collect(reader._readStreamForRange(128, 192))).equals(seeded.plaintext.subarray(128, 192))).toBe(true);
+  });
+
+  it('`openForgedReader` 的负向对照：没被改过的制品能打开，改过的才返回错误信息', async () => {
+    // 这条用例是给安全门的夹具本身做的对照：夹具不能「对什么都报错」，
+    // 否则安全门那几条「必须被拒」的断言会变成同义反复。
+    const store = new MemoryStore();
+    const seeded = await seedArtifact(store, pattern(192, 26), { chunkSize: 64 });
+    const untouched = await openForgedReader(seeded.artifact);
+    expect(untouched.message).toBe('');
+    expect(untouched.reader).not.toBeNull();
+
+    const forged = await openForgedReader(withChunkSize(seeded.artifact, 96));
+    expect(forged.message).toMatch(/块数公式不符/);
+    expect(forged.reader).toBeNull();
   });
 });
 
@@ -726,6 +601,11 @@ describe('密钥选择与真实存储的端到端', () => {
   it('真实 `LocalArtifactStore` 上端到端：putStream 写入 → 读取器按区间取回明文', async () => {
     // 前面所有用例用的都是内存替身；这一条证明与**真实存储端口**的接线成立
     // （它的 `getRange` 是闭区间、键必须是 UUIDv7、短读会抛错）。
+    //
+    // 目录必须**本用例自己造**：`unit` project 没有 `setupFiles`
+    // （只有 integration / security 有 `tests/setup/artifact-store.ts`），
+    // 因此 `process.env.ARTIFACT_STORE_DIR` 在这里**没有值**——第一版就是直接读它
+    // 才把一个相对路径当成了制品根目录。这四个 import 因此是**在用**的，不是死代码。
     const dir = await mkdtemp(join(tmpdir(), 'vca-reader-'));
     const root = dir.split('\\').join('/');
     try {

@@ -55,7 +55,11 @@ const ROOT = path.resolve(import.meta.dirname, '..');
  * 「跑了测试并全绿」这句本身承担，而它们的规模与构成会频繁变化，钉死条数只会制造噪音。
  */
 const GATES = {
-  security: 49,
+  // 修复轮 1（P1 / Task 3）：原先是 **49，而实际执行 53** —— 与上面「数字与当前实际条数对齐」
+  // 那句话不符。低的这 4 条让「静默删掉最多 4 条安全用例」不会红，正是本文件开头那段话
+  // 要防的形状。本轮把制品完整性控制纳入 security 门（`tests/security/asset-artifact-integrity.test.ts`
+  // 6 条），并把下限**对齐到实际执行数**：49 → 59。任何删除现在都会红一次。
+  security: 59,
   architecture: 5,
 };
 
