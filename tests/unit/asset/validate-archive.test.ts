@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { randomBytes } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { createGunzip } from 'node:zlib';
 import { fileTypeFromBuffer } from 'file-type';
-import { Parser } from 'tar';
+import { Parser, ReadEntry } from 'tar';
 import * as yauzl from 'yauzl';
 import {
   ARCHIVE_LIMITS,
@@ -16,12 +17,13 @@ import {
 } from '@vca/api/modules/asset/archive/limits.js';
 import { SNIFF_BYTES, sniffArchive } from '@vca/api/modules/asset/archive/sniff.js';
 import { inspectZip } from '@vca/api/modules/asset/archive/zip-inspector.js';
+import { inspectTarGz } from '@vca/api/modules/asset/archive/targz-inspector.js';
 import { EncryptedArtifactReader } from '@vca/api/modules/asset/store/random-access-reader.js';
 // 制品（密文外壳）的构造与观察住在 Task 3 的共享夹具里：Task 4 的输入是
 // `EncryptedArtifactReader`，因此这里的「样本」是**先加密成制品、再打开读取器**。
 import { MemoryStore, fakeRing, seedArtifact } from '../../helpers/craft-encrypted-artifact.js';
 // 样本一律**代码生成**，不入库二进制（见生成器的文件头）。
-import { ARCHIVE_SAMPLES, BOMB_BYTES, buildZip } from '../../fixtures/archives/generate.js';
+import { ARCHIVE_SAMPLES, BOMB_BYTES, buildTarGz, buildZip, gzip } from '../../fixtures/archives/generate.js';
 
 /**
  * 归档校验器（P1 / Task 4）。
@@ -49,11 +51,21 @@ import { ARCHIVE_SAMPLES, BOMB_BYTES, buildZip } from '../../fixtures/archives/g
  * 因此：合法样本的接受用例 + 依赖契约用例（直接断言 `file-type` 的返回值）**两条都要有**。
  */
 
-/** 8 个样本里按名字取一个（缺失即响亮，而不是 undefined 流到后面）。 */
+/**
+ * 8 个样本里按名字取一个（缺失即响亮，而不是 undefined 流到后面）。
+ *
+ * **带缓存**：`bomb.zip` / `bomb.tar.gz` 每次生成都要 deflate/gzip 100 MiB，
+ * 而同一个样本会被多条用例取用。缓存的只是**最终字节**（约 100 KB），中间的大缓冲随即释放。
+ */
+const sampleCache = new Map<string, Buffer>();
 function sampleBytes(name: string): Buffer {
+  const cached = sampleCache.get(name);
+  if (cached !== undefined) return cached;
   const sample = ARCHIVE_SAMPLES.find((candidate) => candidate.name === name);
   if (sample === undefined) throw new Error(`样本表里没有 ${name}`);
-  return sample.bytes();
+  const bytes = sample.bytes();
+  sampleCache.set(name, bytes);
+  return bytes;
 }
 
 /**
@@ -441,5 +453,135 @@ describe('zip：只读中央目录 + 解析器抛错计为拒绝（D6 的两条�
     expect(reasonOf(result)).toContain('invalid characters');
     expect(reasonOf(result)).toContain('\\x0a');
     expect(reasonOf(result)).not.toContain('\n');
+  });
+});
+
+describe('tar.gz：仅凭头部判定 + 提前中止（D8、C19）', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * 直接调 inspector。默认块大小取 4 KiB（生产 8 MiB）：块小，才能用「请求了哪些块」
+   * 判断中止发生在**头几个块**内，而不是「读完了整份制品」。
+   */
+  async function inspectTarGzOf(
+    plaintext: Buffer,
+    limits = ARCHIVE_LIMITS,
+    chunkSize = 4096,
+  ): Promise<{ result: { ok: true } | { ok: false; reason: string }; store: MemoryStore }> {
+    const { store, reader } = await openPlaintext(plaintext, { chunkSize });
+    return { result: await inspectTarGz(reader, reader.plaintextLength, limits), store };
+  }
+
+  it('合法 tar.gz 放行（反向用例）', async () => {
+    const { result } = await inspectTarGzOf(sampleBytes('ok.tar.gz'));
+    expect(result).toEqual({ ok: true });
+  });
+
+  it('炸弹：**仅凭第一个条目的头部**就拒（压缩比）', async () => {
+    const { result } = await inspectTarGzOf(sampleBytes('bomb.tar.gz'));
+    expect(result.ok).toBe(false);
+    expect(reasonOf(result)).toContain('压缩比');
+  });
+
+  it('C19 验收：炸弹在**第一个条目头**上就被判掉，且从未消费任何条目数据', async () => {
+    // 结构性判据，而不是字节数：tar 是前向流，不 `resume()` 条目解析器就不前进
+    // ⇒「从未 resume」同时证明了「一个条目数据字节都没被消费」与「没有把炸弹走完」。
+    // （探针实测：只停止消费而不销毁上游会死锁，因此能 settle 本身也是一条证据。）
+    const resume = vi.spyOn(ReadEntry.prototype, 'resume');
+    const bomb = sampleBytes('bomb.tar.gz');
+    const { result, store } = await inspectTarGzOf(bomb);
+    expect(result.ok).toBe(false);
+    expect(reasonOf(result)).toContain('压缩比');
+    expect(resume).not.toHaveBeenCalled();
+    // 读到的**压缩**字节数同样是有界的：制品共 25 块，而这里只请求了头几个。
+    // 注意口径——它由 Node 流的预读窗口（16 KiB）决定，**与归档大小无关**；
+    // 不能拿它当「解压了多少明文」的证据（零字节压缩流里能解出几 MB）。
+    expect(store.requests.length).toBeGreaterThan(0);
+    expect(store.requests.length).toBeLessThanOrEqual(8);
+  });
+
+  it('提前中止 = **销毁上游**：读取器给的流在判定之后处于 destroyed 状态', async () => {
+    const { reader } = await openPlaintext(sampleBytes('bomb.tar.gz'));
+    const streams: Readable[] = [];
+    const original = reader.createReadStream.bind(reader);
+    vi.spyOn(reader, 'createReadStream').mockImplementation((options: { start: number; end: number }) => {
+      const stream = original(options);
+      streams.push(stream);
+      return stream;
+    });
+    expect((await inspectTarGz(reader, reader.plaintextLength, ARCHIVE_LIMITS)).ok).toBe(false);
+    expect(streams).toHaveLength(1);
+    expect(streams[0]?.destroyed).toBe(true);
+    // 再放一轮事件循环：销毁产生的 'error'（ERR_STREAM_PREMATURE_CLOSE 之类）若无人接住，
+    // 这里会以未处理错误的形式炸出来——那正是「一次恶意上传变成一次崩溃」的形态。
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  });
+
+  it('头部自称 1.1 GiB 而实际不含数据 ⇒ 用**真实阈值**拒（累计未压缩大小）', async () => {
+    // 这就是 D8 说的「头部声明的 size 就是分帧依据」：不需要真的提供 1.1 GiB 数据，
+    // 判定发生在解析器的第一个 entry 事件里，比它去读那块数据早得多。
+    const archive = buildTarGz([{ name: 'huge.bin', declaredSize: 1_100_000_000 }]);
+    const { result } = await inspectTarGzOf(archive);
+    expect(result.ok).toBe(false);
+    expect(reasonOf(result)).toContain('累计未压缩大小');
+  });
+
+  it('tar 侧的路径穿越由**我们自己**拒（tar 没有 yauzl 那种自带防护）', async () => {
+    const archive = buildTarGz([{ name: '../../../../etc/evil.txt', data: Buffer.from('pwned') }]);
+    const { result } = await inspectTarGzOf(archive);
+    expect(result.ok).toBe(false);
+    expect(reasonOf(result)).toContain('.. 段');
+  });
+
+  it('tar 的符号链接与硬链接（typeflag 2 / 1）被拒', async () => {
+    const symlink = buildTarGz([{ name: 'escape', typeflag: '2', linkName: '../../etc/passwd' }]);
+    const symlinkResult = await inspectTarGzOf(symlink);
+    expect(reasonOf(symlinkResult.result)).toContain('符号链接');
+
+    const hardlink = buildTarGz([{ name: 'hard', typeflag: '1', linkName: 'a.txt' }]);
+    const hardlinkResult = await inspectTarGzOf(hardlink);
+    expect(reasonOf(hardlinkResult.result)).toContain('硬链接');
+  });
+
+  it('20,001 个条目的 tar.gz ⇒ 条目数上限（真实阈值）', async () => {
+    const archive = buildTarGz(
+      Array.from({ length: 20_001 }, (_unused, index) => ({ name: `f${index}.txt` })),
+    );
+    const { result } = await inspectTarGzOf(archive);
+    expect(result.ok).toBe(false);
+    expect(reasonOf(result)).toContain('条目数');
+  });
+
+  it('空 tar.gz（0 个条目）**拒绝**：tar 的「没有任何有效条目」与「不是 tar」是同一条信号', async () => {
+    // 这是刻意 fail-closed 的一侧。理由：`tar` 的 Parser 在 DONE 时用
+    // `SAW_VALID_ENTRY === false` 同时覆盖「空归档」与「压根不是 tar」，
+    // 而放行前者就等于放行后者（任何 .gz 都能冒充 tar.gz）。
+    const { result } = await inspectTarGzOf(buildTarGz([]));
+    expect(result.ok).toBe(false);
+    expect(reasonOf(result)).toContain('不合法');
+    expect(reasonOf(result)).toContain('TAR_BAD_ARCHIVE');
+  });
+
+  it('损坏的 gzip（尾部 CRC 被改）⇒ 拒绝而不是崩溃：解压层的错误也是一次判定', async () => {
+    const broken = Buffer.from(sampleBytes('ok.tar.gz'));
+    broken[broken.length - 1] = (broken[broken.length - 1] ?? 0) ^ 0xff;
+    const { result } = await inspectTarGzOf(broken);
+    expect(result.ok).toBe(false);
+    expect(reasonOf(result)).toContain('解压失败');
+  });
+
+  it('合法 gzip 但内容不是 tar ⇒ 在**第一个块**上就被拒（不是把整条流走完才发现）', async () => {
+    // 载荷取 8 MiB 伪随机字节：它**不可压缩**，所以 .gz 本身就有 8 MB。
+    // 「走完整条流才发现」要请求整份制品（约 2000 个块）；「第一个块就拒」只请求预读窗口内
+    // 的那几个块。两者相差两个数量级——这就是这条用例的判别力所在。
+    const notATar = gzip(randomBytes(8 * 1024 * 1024));
+    const { result, store } = await inspectTarGzOf(notATar);
+    expect(result.ok).toBe(false);
+    expect(reasonOf(result)).toContain('不合法');
+    const blocks = Math.ceil(notATar.length / 4096);
+    expect(blocks).toBeGreaterThan(500);
+    expect(store.requests.length).toBeLessThanOrEqual(16);
   });
 });
