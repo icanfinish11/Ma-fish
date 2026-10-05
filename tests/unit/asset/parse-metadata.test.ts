@@ -1,0 +1,256 @@
+import { once } from 'node:events';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { gunzipSync } from 'node:zlib';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { ChildProcess, spawn, spawnSync } from 'node:child_process';
+import { EncryptedArtifactReader } from '@vca/api/modules/asset/store/random-access-reader.js';
+import { parseMetadata, type ParsedMetadata } from '@vca/api/modules/asset/metadata/parse-metadata.js';
+import { MemoryStore, fakeRing, seedArtifact } from '../../helpers/craft-encrypted-artifact.js';
+import { buildTarGz, buildZip } from '../../fixtures/archives/generate.js';
+
+/**
+ * 元数据解析（P1 / Task 6；设计 D9；约束 C2）。
+ *
+ * 分节按 brief 的步骤走：**Step 1 是「绝不执行」的正向证据**（判据 12），
+ * 其余各节对应 README / 文件树 / 语言分布 / 依赖清单 / 完整度评分。
+ *
+ * 判据里的阈值一律**写成字面量**（500 / 8 / 2000 / 200 / …），不从被测模块 import：
+ * 从实现 import 会让「上限被改小」时用例跟着一起变——那是判据漂移，不是判据
+ * （与 Task 5 §13.1 对 `2 × CHUNK_SIZE` 的处理同一理由）。
+ */
+
+// ── 子进程计数（两条打点；覆盖面见 §Step 1 的用例注释）─────────────────────
+
+const probes = vi.hoisted(() => ({ mocked: 0, prototype: 0 }));
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  const wrap = <A extends unknown[], R>(fn: (...args: A) => R): ((...args: A) => R) => {
+    return (...args: A): R => {
+      probes.mocked += 1;
+      return fn(...args);
+    };
+  };
+  return {
+    ...actual,
+    default: actual,
+    spawn: wrap(actual.spawn),
+    spawnSync: wrap(actual.spawnSync),
+    exec: wrap(actual.exec),
+    execSync: wrap(actual.execSync),
+    execFile: wrap(actual.execFile),
+    execFileSync: wrap(actual.execFileSync),
+    fork: wrap(actual.fork),
+  };
+});
+
+/**
+ * 第二道打点：`ChildProcess.prototype.spawn`（**进程内任何模块**的异步启动都会经过它，
+ * 包括不进 vite-node 变换的外部化依赖——这是 `vi.mock` 盖不到的那一侧）。
+ * 同步族（`spawnSync` 等）**不经过**它，因此两条打点互补，而不是重复。
+ *
+ * 它**不在 `@types/node` 的公开声明里**（与 Task 3 的 `ref`/`unref` 同一种缺口），
+ * 因此这里显式断言形状——探针实测过它存在且可替换（`evidence/t6-probe-spy.txt` 的 D 行）。
+ */
+interface PrototypeSpawnHost {
+  spawn: (options: unknown) => void;
+}
+const prototypeSpawnHost = ChildProcess.prototype as unknown as PrototypeSpawnHost;
+const originalPrototypeSpawn = prototypeSpawnHost.spawn;
+prototypeSpawnHost.spawn = function countedPrototypeSpawn(this: ChildProcess, options: unknown): void {
+  probes.prototype += 1;
+  originalPrototypeSpawn.call(this, options);
+};
+
+afterAll(() => {
+  prototypeSpawnHost.spawn = originalPrototypeSpawn;
+});
+
+// ── 夹具 ────────────────────────────────────────────────────────────────────
+
+/** 打开一份制品（已按 Task 4 的契约「加密 → 打开读取器」），并清掉 open 阶段的读计数。 */
+async function openReader(bytes: Buffer): Promise<{ store: MemoryStore; reader: EncryptedArtifactReader }> {
+  const store = new MemoryStore();
+  const { key } = await seedArtifact(store, bytes, { chunkSize: 64 * 1024 });
+  const reader = await EncryptedArtifactReader.open(store, key, fakeRing());
+  store.reset(); // open 阶段读的是头/索引/尾部，不是「解析读了多少内容」
+  return { store, reader };
+}
+
+/** 解析一份制品，返回元数据。 */
+async function parseOf(bytes: Buffer, kind: 'zip' | 'tar.gz'): Promise<ParsedMetadata> {
+  const { reader } = await openReader(bytes);
+  return await parseMetadata(reader, kind);
+}
+
+// ── Step 1：绝不执行（C2 / 判据 12）的样本 ─────────────────────────────────
+
+/** 归档里 `package.json` 的 postinstall 命令。 */
+const PAYLOAD_COMMAND = 'node evil.cjs';
+
+/**
+ * 可执行载荷的源码（**同一份字符串**同时进归档、并作为自检时故意执行的副本，
+ * 因此两者逐字节相同）。
+ *
+ * 它做两件事，都是**从归档之外可断言**的外部副作用：写哨兵文件、造出 `node_modules`。
+ */
+function payloadSource(sentinelPath: string, nodeModulesPath: string): string {
+  return [
+    '// 一旦被任何机制执行：写哨兵 + 造出 node_modules。',
+    "const fs = require('node:fs');",
+    `fs.writeFileSync(${JSON.stringify(sentinelPath)}, 'executed');`,
+    `fs.mkdirSync(${JSON.stringify(nodeModulesPath)}, { recursive: true });`,
+    '',
+  ].join('\n');
+}
+
+/** 第二个形状（brief 点名的 `evil.sh`）。Windows 上没有可依赖的 `sh`，因此它**只作为样本形状**存在。 */
+function shellPayload(sentinelPath: string, nodeModulesPath: string): string {
+  return ['#!/bin/sh', `: > ${JSON.stringify(sentinelPath)}`, `mkdir -p ${JSON.stringify(nodeModulesPath)}`, ''].join(
+    '\n',
+  );
+}
+
+interface ExecutableSample {
+  readonly kind: 'zip' | 'tar.gz';
+  readonly bytes: Buffer;
+  /** 归档里 `package.json` 的内容（用于「样本真的装着陷阱」的独立断言）。 */
+  readonly manifest: string;
+}
+
+interface Sandbox {
+  readonly dir: string;
+  readonly sentinelPath: string;
+  readonly nodeModulesPath: string;
+  readonly payloadPath: string;
+  readonly payload: string;
+  readonly shell: string;
+}
+
+function sampleEntries(sandbox: Sandbox): { packageJson: string; evilCjs: string; evilSh: string } {
+  return {
+    packageJson: JSON.stringify(
+      {
+        name: 'vca-t6-execution-probe',
+        version: '1.0.0',
+        scripts: { postinstall: PAYLOAD_COMMAND, build: 'sh evil.sh' },
+        dependencies: { 'left-pad': '^1.3.0' },
+      },
+      null,
+      2,
+    ),
+    evilCjs: payloadSource(sandbox.sentinelPath, sandbox.nodeModulesPath),
+    evilSh: shellPayload(sandbox.sentinelPath, sandbox.nodeModulesPath),
+  };
+}
+
+function buildSamples(sandbox: Sandbox): ExecutableSample[] {
+  const { packageJson, evilCjs, evilSh } = sampleEntries(sandbox);
+  const zipEntries = [
+    { name: 'README.md', data: Buffer.from('# 探针项目\n') },
+    { name: 'package.json', data: Buffer.from(packageJson) },
+    { name: 'evil.cjs', data: Buffer.from(evilCjs) },
+    { name: 'evil.sh', data: Buffer.from(evilSh) },
+    { name: 'src/index.ts', data: Buffer.from('export const answer = 42;\n') },
+  ];
+  const tarEntries = zipEntries.map((entry) => ({ name: entry.name, data: entry.data }));
+  return [
+    { kind: 'zip', bytes: buildZip(zipEntries), manifest: packageJson },
+    { kind: 'tar.gz', bytes: buildTarGz(tarEntries), manifest: packageJson },
+  ];
+}
+
+describe('Task 6 · 元数据解析', () => {
+  describe('Step 1：绝不执行归档里的脚本（C2 / 判据 12）', () => {
+    let sandbox: Sandbox;
+    let samples: ExecutableSample[] = [];
+    /** 探针是否已自证「活着」。未武装时下面两条用例**直接失败**，而不是安静地通过。 */
+    let armed = false;
+
+    beforeAll(async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'vca-t6-c2-'));
+      sandbox = {
+        dir,
+        sentinelPath: join(dir, 'sentinel-would-be-written.txt'),
+        nodeModulesPath: join(dir, 'node_modules'),
+        payloadPath: join(dir, 'evil.cjs'),
+        payload: '',
+        shell: '',
+      };
+      const entries = sampleEntries(sandbox);
+      sandbox = { ...sandbox, payload: entries.evilCjs, shell: entries.evilSh };
+      // 自检用的副本：与归档里的 `evil.cjs` **同一份字符串**。
+      await writeFile(sandbox.payloadPath, entries.evilCjs);
+      samples = buildSamples(sandbox);
+    });
+
+    afterAll(async () => {
+      await rm(sandbox.dir, { recursive: true, force: true });
+    });
+
+    it('探针自检：样本真的装着陷阱，且两条打点与哨兵路径都是活的', async () => {
+      // ---- 第一半：陷阱字节确实在归档里（不经过被测代码）----
+      for (const sample of samples) {
+        // tar.gz 是压缩流，按字节搜文本会落空 ⇒ 先解开再搜。
+        const raw = sample.kind === 'zip' ? sample.bytes : gunzipSync(sample.bytes);
+        expect(raw.includes(Buffer.from(PAYLOAD_COMMAND))).toBe(true);
+        // 载荷里写的是 `JSON.stringify(路径)`（反斜杠转义过），因此按**同一种写法**搜。
+        expect(raw.includes(Buffer.from(JSON.stringify(sandbox.sentinelPath)))).toBe(true);
+        expect(raw.includes(Buffer.from(sandbox.payload))).toBe(true);
+      }
+
+      // ---- 第二半甲：故意执行一次载荷（同步族 ⇒ 走 vi.mock 那条打点）----
+      const beforeSync = { mocked: probes.mocked, prototype: probes.prototype };
+      const executed = spawnSync(process.execPath, [sandbox.payloadPath], { cwd: sandbox.dir });
+      expect(executed.status).toBe(0);
+      expect(existsSync(sandbox.sentinelPath)).toBe(true);
+      expect(existsSync(sandbox.nodeModulesPath)).toBe(true);
+      expect(probes.mocked - beforeSync.mocked).toBe(1);
+      // 同步族**不经过**原型方法：这一条是「哪条打点覆盖哪一侧」的实测证据，不是冗余断言。
+      expect(probes.prototype - beforeSync.prototype).toBe(0);
+
+      // ---- 第二半乙：故意执行一次异步 spawn（走原型那条打点）----
+      await rm(sandbox.sentinelPath, { force: true });
+      await rm(sandbox.nodeModulesPath, { recursive: true, force: true });
+      const beforeAsync = { mocked: probes.mocked, prototype: probes.prototype };
+      const child = spawn(process.execPath, ['-e', 'process.exit(0)']);
+      await once(child, 'exit');
+      expect(probes.prototype - beforeAsync.prototype).toBe(1);
+
+      // ---- 清场 + 复位：从这里开始数的是**解析期间**有没有子进程 ----
+      expect(existsSync(sandbox.sentinelPath)).toBe(false);
+      expect(existsSync(sandbox.nodeModulesPath)).toBe(false);
+      probes.mocked = 0;
+      probes.prototype = 0;
+      armed = true;
+    });
+
+    for (const index of [0, 1]) {
+      it(`解析含可执行脚本的样本（${index === 0 ? 'zip' : 'tar.gz'}）：解析正常返回，且哨兵 / node_modules / 子进程一个都没有`, async () => {
+        // 自检的**第二半**：这条断言只有在探针被证明活着之后才有意义。
+        expect(armed, '探针未武装（自检用例没跑或失败）——这条断言不能自证，直接判红').toBe(true);
+        const sample = samples[index];
+        expect(sample).toBeDefined();
+        if (sample === undefined) return;
+
+        probes.mocked = 0;
+        probes.prototype = 0;
+
+        const metadata = await parseOf(sample.bytes, sample.kind);
+
+        // 解析**确实碰过**这个归档（否则「什么都没发生」是恒真的）。
+        const paths = metadata.fileTree.map((file) => file.path);
+        expect(paths).toEqual(expect.arrayContaining(['README.md', 'package.json', 'evil.cjs', 'evil.sh']));
+
+        // 三条副作用断言。
+        expect(existsSync(sandbox.sentinelPath)).toBe(false);
+        expect(existsSync(sandbox.nodeModulesPath)).toBe(false);
+        expect(probes.mocked, '解析期间有子进程被启动（vi.mock 打点）').toBe(0);
+        expect(probes.prototype, '解析期间有子进程被启动（原型打点）').toBe(0);
+      });
+    }
+  });
+});
