@@ -26,6 +26,25 @@ allowBuilds:
 overrides:
   testcontainers: 12.0.4
 
+  # ── P2 / Task 1：让 fast-check 在仓库里**只有一个版本** ──────────────────────
+  #
+  # `@fast-check/vitest@0.5.0` 把 `fast-check` 声明成**普通依赖**（不是 peer），
+  # 范围是 `^3.0.0 || ^4.0.0`。于是 pnpm 复用了 store 里**已经存在**的 3.23.2——
+  # 那是 `effect@3.20.0` → Prisma 的传递依赖——而根 `devDependencies` 的直接依赖是 4.10.2。
+  # 实测（`require.resolve('fast-check', { paths: [<@fast-check/vitest 的真实目录>] })`）：
+  # 两处解析到**不同的模块实例**（`.pnpm/fast-check@3.23.2` vs `.pnpm/fast-check@4.10.2`），
+  # 即同一个属性测试文件里会同时存在两个版本的 fast-check。
+  #
+  # 这也是预检 §D.1「判断依赖可用性一律以 `require.resolve` 为准，不以目录存在为准」的
+  # 同一形状：`fast-check@3.23.2` 在 lockfile 与 `.pnpm` 里都**真实存在**，但它是别人的依赖。
+  #
+  # 为什么这条 override 不构成「未测组合」：4.10.2 **落在适配器自己声明的范围之内**
+  # （`^3.0.0 || ^4.0.0`），它只是把两个都可接受的版本钉到同一个。
+  # 为什么用 `parent>child` 选择器而不是全局 `fast-check: 4.10.2`：后者会**跨大版本**
+  # 改掉 `effect@3.20.0`（Prisma 的依赖，精确锁 3.23.2）的子树——那才是未测组合，
+  # 与上面 `deepmerge-ts` 的取舍同一条理由。
+  '@fast-check/vitest>fast-check': 4.10.2
+
 # ── 依赖审计的**书面豁免**（威胁 #14；验收 13.2 第 9 条）────────────────────────
 #
 # 背景：`pnpm audit --audit-level high` 在 Task 9 落地时**报红**，3 条全部来自
