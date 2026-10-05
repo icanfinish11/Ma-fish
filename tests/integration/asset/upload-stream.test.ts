@@ -89,15 +89,26 @@ async function storedObjects(): Promise<Array<{ name: string; size: number }>> {
 interface UploadResult {
   status: number;
   body: string;
-  /** 请求过程中采到的：目录里的文件数、是否见过「写到一半」的对象、未完成字节数峰值。 */
+  /**
+   * 请求过程中采到的：最大文件数、采样次数、是否见过「写到一半」的对象、未完成字节数峰值。
+   *
+   * `peakUnfinished` 在本文件里**没有断言**（理由见下面 `upload()` 的注释与那条用例里的整段记载）。
+   */
   observed: { maxFiles: number; samples: number; sawPartial: boolean; peakUnfinished: number };
 }
-
 /**
  * 真实 multipart 上传：逐块写、每块之间让出事件循环，并在发送期间采样制品库。
  *
- * 采样得到的三件事正好对上三条验收判据：`sawPartial`（真流式）、
- * `maxFiles`（无临时副本）、`peakUnfinished`（未完成字节数有界，不用 RSS）。
+ * 采样得到的两件事对上前两条判据：`sawPartial`（请求还没结束对象已在盘上）、
+ * `maxFiles`（无临时副本，C21）。
+ *
+ * **`peakUnfinished` 仍然采着，但本文件里没有任何断言用它的值**（修复轮 1 的据实记载）：
+ * 本文件的上传上限是 4 MiB、生产块大小是 8 MiB ⇒ 每个合法负载都落在**一块之内**，
+ * 而加密器对末块要「押后」⇒ 这个量≈负载长度的形态**恒成立**，
+ * 无论 HTTP 层有没有攒整份 body（详见下面那条用例里的整段记载）。
+ * 判据 13 的**端到端**见证因此搬到了 `ingest-memory.test.ts`：那里用 24 MiB 的载荷
+ * （= 3 个生产块）走真实 HTTP 路径，断言它 `< 2 × CHUNK_SIZE`——只有超过两块，
+ * 这个量才能把流式实现与「攒够再写」的实现分开。
  */
 function upload(
   port: number,
@@ -282,6 +293,24 @@ describe('上传接入与制品存储（Task 1）', () => {
      * `tests/unit/asset/chunk-cipher.test.ts` 上用 16/64/128 MiB 的**未完成字节数**量过
      * （Task 2，`evidence/t2-probe-crypto-8mib.txt`）；本文件能证明的是另外两件事：
      * 请求还没结束对象就已经在盘上（`sawPartial`），以及目录里**始终只有对象本身**（C21：无临时副本）。
+     *
+     * ---
+     *
+     * **修复轮 1 的补充（据实记载）：上面这段「删除」在判据 13 这一侧留下了一个洞。**
+     *
+     * 本文件**留下的**两条判据都拦不住「攒够再写」的实现：`sawPartial` 只要求
+     * `0 < 已落盘 < 负载`（整份攒在内存里、最后一口气写下去**同样满足**），
+     * 而 `maxFiles ≤ 1` 只排除临时副本。上面「本文件能证明的是另外两件事」这句话因此
+     * 需要收窄：**它证明的其实是「请求还没结束时磁盘上已经有那个对象」，不是「边收边写」。**
+     * （实测：对象落盘的第一批字节就是**制品头**那 33 字节。）
+     *
+     * 判据 13（内存上界与文件大小无关，用未完成字节数而不是 RSS）的**端到端**见证因此
+     * 放到了 `tests/integration/asset/ingest-memory.test.ts`：那里把上传上限按文件抬到 64 MiB
+     * （本文件的 4 MiB 上限下，16 MiB 以上的载荷会被 multer 以 413 先拦掉），
+     * 用 **24 MiB（3 个生产块）的合法 zip 走真实 HTTP 路径**，断言
+     * 「已发出的明文 − 已落盘的制品字节」的峰值 `< 2 × CHUNK_SIZE + 256 KiB`。
+     * 只有载荷超过 `2 × CHUNK_SIZE` 时这个量才有判别力——两条变异探针实测：
+     * 上游攒整份 ⇒ `25,166,033`，下游攒整份 ⇒ `25,166,102`（上界 `17,039,360`），两条都变红。
      */
   });
 
