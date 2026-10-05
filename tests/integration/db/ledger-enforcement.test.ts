@@ -429,6 +429,53 @@ describe('账本的数据库强制点（不变式 #1 / #3 / #5）', () => {
     expect(after.rows[0].s).toBe('0');
   });
 
+  it('运行期角色对 `ledger.accounts` 的 `DELETE` 也被真实拒绝（控制器裁定：P2 没有任何删账户的路径）', async () => {
+    // ## 为什么这条判据必须存在（控制器裁定 2026-10-06）
+    //
+    // Task 4 把 ledger 段写成「schema 级广播 + 只对 entries/transactions 逐表撤权」，
+    // 于是 `accounts` 保留了四个动词（Task 4 报告 §6.1 自己记下了这件事并请裁定）。
+    // 裁定是：**撤掉 `DELETE`**（保留 `SELECT` / `INSERT` / `UPDATE`）。三条理由：
+    //
+    //   ① P2 **没有任何删账户的代码路径**（没有原语、没有路由、没有 worker 任务）——
+    //      这个能力**没有合法使用者**。一张钱表上一个没人用的能力，是本项目那类反复
+    //      复发的缺陷的**反形**：不是「声明了但未强制」，而是**授予了但从未声明**。
+    //   ② 两层兜底（`entries_account_id_fkey ON DELETE RESTRICT` 与不变式 #2 的对账）
+    //      护的是**完整性**，不是**可用性**——**一行被删掉的账户无法被对账恢复**。
+    //   ③ 双角色模型的全部意义是最小权限，而账本账户上的 `DELETE` 不是最小权限。
+    //
+    // ## 为什么判据落在「没有分录的账户」上
+    //
+    // 有分录的账户会被 `entries_account_id_fkey ON DELETE RESTRICT` 挡下，那条拒绝来自
+    // **外键**、与 ACL 无关。用它当判据会得出错误结论（「怎么都拒」）。这里刻意用一个
+    // balance=0、**没有分录**的账户：去掉 REVOKE 之后它是**真的会被删掉**的
+    // （变异探针实测：`.rejects` 变成「promise resolved」）。
+    //
+    // ## 两个方向都在同一条用例里
+    //
+    // `INSERT` 由 **app_user 自己**发出并必须成功（接受方向：撤 DELETE 没有把正常业务
+    // 一起挡掉），紧随其后的 `DELETE` 必须被拒（拒绝方向）。只测拒绝时，「怎么都拒」
+    // 也能满足它。
+    const created = await app.query(
+      `INSERT INTO ledger.accounts (id, kind, owner_user_id, balance)
+       VALUES (gen_random_uuid(),'USER_AVAILABLE',gen_random_uuid(),0) RETURNING id`,
+    );
+    const id = created.rows[0].id as string;
+
+    await expect(app.query(`DELETE FROM ledger.accounts WHERE id = $1`, [id])).rejects.toThrow(
+      /permission denied/i,
+    );
+
+    // 拒绝本身不是判据：**那一行必须还在**（被删掉的账户无法被对账恢复）。
+    const after = await owner.query(
+      `SELECT count(*)::int AS n FROM ledger.accounts WHERE id = $1`,
+      [id],
+    );
+    expect(after.rows[0].n).toBe(1);
+
+    // 清理：这条账户没有任何分录，属主删得掉（不影响别的用例的计数）。
+    await owner.query(`DELETE FROM ledger.accounts WHERE id = $1`, [id]);
+  });
+
   it('反面对照：运行期角色**能**写 entries 与 accounts（撤权没有把正常业务一起挡掉）', async () => {
     const tx = randomUUID();
     await app.query('BEGIN');
@@ -463,11 +510,14 @@ describe('账本的数据库强制点（不变式 #1 / #3 / #5）', () => {
               has_table_privilege('app_user','ledger.transactions','DELETE') AS t_d`,
     );
     expect(r.rows[0]).toEqual({
-      // accounts 是**可写**的（物化余额），append-only 不适用于它。
-      // 注意 DELETE 在这里是 `true`：`apply-grants.sql` 只对 entries / transactions 逐表撤权，
-      // 这是本计划 Step 3 明写的形状。它与「余额只能由账本推导」（C27）的张力记在
-      // Task 4 报告的 self-review 里（有 entries 外键挡着删账户，且不变式 #2 会抓到差额）。
-      a_s: true, a_i: true, a_u: true, a_d: true,
+      // accounts 是**可写**的（物化余额），append-only 不适用于它：`SELECT` / `INSERT` /
+      // `UPDATE` 三个动词都在。
+      //
+      // `a_d: false` —— `DELETE` 是**刻意撤掉**的（控制器裁定 2026-10-06，理由逐条写在
+      // 上面那条拒绝用例的注释里）：P2 没有任何删账户的路径，这个能力没有合法使用者；
+      // 而外键与对账护的是完整性、不是可用性（删掉的行恢复不回来）。
+      // 这一格从 `true` 翻成 `false` 正是那次裁定的机器见证。
+      a_s: true, a_i: true, a_u: true, a_d: false,
       e_s: true, e_i: true, e_u: false, e_d: false,
       t_s: true, t_i: true, t_u: false, t_d: false,
     });
@@ -486,7 +536,7 @@ describe('账本的数据库强制点（不变式 #1 / #3 / #5）', () => {
         ORDER BY c.relname`,
     );
     expect(acl.rows).toEqual([
-      { relname: 'accounts', privs: 'DELETE,INSERT,SELECT,UPDATE' },
+      { relname: 'accounts', privs: 'INSERT,SELECT,UPDATE' },
       { relname: 'entries', privs: 'INSERT,SELECT' },
       { relname: 'transactions', privs: 'INSERT,SELECT' },
     ]);

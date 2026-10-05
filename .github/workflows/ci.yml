@@ -79,13 +79,17 @@ jobs:
           psql "$MIGRATE_DATABASE_URL" -v ON_ERROR_STOP=1 -f infra/db/apply-grants.sql
 
       # Ruling 1 的闭环：上一步「没报错」不等于「授权真的生效」。这里直接问 PostgreSQL
-      # **十四件事**——运行期角色**能用**什么、**不能用**什么，以及能不能碰到迁移台账。
+      # **十五件事**——运行期角色**能用**什么、**不能用**什么，以及能不能碰到迁移台账。
       #
       # 扩到 ledger（P2 / Task 4）与 asset.ownership_history（补 P1 的漏）的理由：
       # 预检实测这条断言此前**只覆盖 auth/audit 五项**，连 P1 新增的 append-only 表都不查
       # ——也就是说「ownership_history 不可改写」与「ledger 不可改写」这两条不变式在 CI 里
       # **没有见证**，只有集成用例（那是本机的，不是流水线的）。
-      # 期望值 t|t|f|f|f|f|f|t|t|t|f|f|f|f 的逐项含义见下面的 echo。
+      # 期望值 t|t|f|f|f|f|f|t|t|f|t|f|f|f|f 的逐项含义见下面的 echo。
+      #
+      # 第 10 项（`ledger.accounts` 的 `DELETE` = **f**）是控制器 2026-10-06 的裁定：
+      # P2 没有任何删账户的路径 ⇒ 这个能力没有合法使用者，而删掉的行恢复不回来
+      # （对账护的是完整性、不是可用性）。理由逐条写在 `infra/db/apply-grants.sql` 那段注释里。
       #
       # 第二条腿（`relacl`）不是重复：`has_table_privilege` 回答的是「PostgreSQL 现在怎么
       # 判」，而 `aclexplode(relacl)` 读的是**授权记录本身**。两者一起才排得掉
@@ -106,21 +110,23 @@ jobs:
                    has_table_privilege('app_user','asset.ownership_history','DELETE'),
                    has_table_privilege('app_user','ledger.accounts','UPDATE'),
                    has_table_privilege('app_user','ledger.accounts','INSERT'),
+                   has_table_privilege('app_user','ledger.accounts','DELETE'),
                    has_table_privilege('app_user','ledger.entries','INSERT'),
                    has_table_privilege('app_user','ledger.entries','UPDATE'),
                    has_table_privilege('app_user','ledger.entries','DELETE'),
                    has_table_privilege('app_user','ledger.transactions','UPDATE'),
                    has_table_privilege('app_user','ledger.transactions','DELETE')")
-          echo "auth.users SELECT | audit_logs INSERT/UPDATE/DELETE | migrations SELECT | ownership_history UPDATE/DELETE | accounts UPDATE/INSERT | entries INSERT/UPDATE/DELETE | transactions UPDATE/DELETE = $actual"
-          if [ "$actual" != "t|t|f|f|f|f|f|t|t|t|f|f|f|f" ]; then
-            echo "::error::运行期角色权限不符合预期（期望 t|t|f|f|f|f|f|t|t|t|f|f|f|f）：$actual"
-            echo "::error::多半是引导顺序错了（授权跑在迁移之前 → 对空 schema 静默授予零个对象），或 append-only 的 REVOKE UPDATE, DELETE 被删。"
+          echo "auth.users SELECT | audit_logs INSERT/UPDATE/DELETE | migrations SELECT | ownership_history UPDATE/DELETE | accounts UPDATE/INSERT/DELETE | entries INSERT/UPDATE/DELETE | transactions UPDATE/DELETE = $actual"
+          if [ "$actual" != "t|t|f|f|f|f|f|t|t|f|t|f|f|f|f" ]; then
+            echo "::error::运行期角色权限不符合预期（期望 t|t|f|f|f|f|f|t|t|f|t|f|f|f|f）：$actual"
+            echo "::error::多半是引导顺序错了（授权跑在迁移之前 → 对空 schema 静默授予零个对象），或 append-only 的 REVOKE UPDATE, DELETE 被删，或 ledger.accounts 那条 REVOKE DELETE 被删。"
             exit 1
           fi
 
           # 第二条腿：直接读授权记录（`relacl`），逐表列出 app_user 的**能力集合**。
           # entries / transactions 必须恰好是 `INSERT,SELECT`——多一个字母就意味着
-          # append-only 不成立。accounts 是可写的（物化余额），所以它本来就该有四个。
+          # append-only 不成立。accounts 是可写的（物化余额），但**只有三个动词**：
+          # `DELETE` 由控制器裁定撤掉（P2 没有删账户的路径）。
           acl=$(psql "$MIGRATE_DATABASE_URL" -tA -v ON_ERROR_STOP=1 -c "
             SELECT string_agg(c.relname || '=' || p.privs, '|' ORDER BY c.relname)
               FROM pg_class c
@@ -131,9 +137,9 @@ jobs:
               ) p
              WHERE n.nspname = 'ledger' AND c.relkind = 'r'")
           echo "ledger relacl（app_user 的直接授权）: $acl"
-          if [ "$acl" != "accounts=DELETE,INSERT,SELECT,UPDATE|entries=INSERT,SELECT|transactions=INSERT,SELECT" ]; then
-            echo "::error::ledger 的 ACL 不符合预期（期望 accounts 四项、entries/transactions 只有 INSERT,SELECT）：$acl"
-            echo "::error::最可能的原因：apply-grants.sql 里 `REVOKE UPDATE, DELETE ON ledger.entries`（或 transactions 那一对）被删了。"
+          if [ "$acl" != "accounts=INSERT,SELECT,UPDATE|entries=INSERT,SELECT|transactions=INSERT,SELECT" ]; then
+            echo "::error::ledger 的 ACL 不符合预期（期望 accounts 三项、entries/transactions 只有 INSERT,SELECT）：$acl"
+            echo "::error::最可能的原因：apply-grants.sql 里 `REVOKE UPDATE, DELETE ON ledger.entries`（或 transactions 那一对）、或 `REVOKE DELETE ON ledger.accounts` 被删了。"
             exit 1
           fi
 

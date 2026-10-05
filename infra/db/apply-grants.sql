@@ -87,7 +87,8 @@ REVOKE UPDATE, DELETE ON ALL TABLES IN SCHEMA audit FROM app_user;
 
 -- ── ledger：账本（P2 / Task 4，设计 §8.3 不变式 #5）──────────────────────
 -- `accounts` 是**要可写**的（余额是物化值，过账就是改它），因此先发 schema 级广播；
--- `entries` 与 `transactions` 是 **append-only**，紧随其后逐表撤权。
+-- `entries` 与 `transactions` 是 **append-only**，紧随其后逐表撤权；
+-- `accounts` 本身另有一条更窄的撤权——**只撤 `DELETE`**（控制器裁定，见下面那一段）。
 --
 -- ⚠️ 这一对语句**不能省**：实测新建 schema 上只写 schema 级 `GRANT … ON ALL TABLES` 时
 -- `has_table_privilege(app_user, …, 'UPDATE') = 'true'`，而且 app_user **真的**把一条分录
@@ -107,6 +108,31 @@ REVOKE UPDATE, DELETE ON ALL TABLES IN SCHEMA audit FROM app_user;
 -- 补上序列授权后被接受，然后把它删掉。将来谁在这里加自增主键，那条用例会指出必须补授权
 -- （而不是等到生产上第一次写入）。
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ledger TO app_user;
+
+-- ledger.accounts：撤掉 `DELETE`，保留 `SELECT` / `INSERT` / `UPDATE`（**控制器裁定 2026-10-06**）
+--
+-- Task 4 交付时这里是四个动词（schema 级广播顺带把 DELETE 也授了出去），该任务在报告的
+-- self-review §6.1 里记下这件事并请控制器裁定。裁定：**撤掉 DELETE**。三条理由：
+--
+--   ① **P2 没有任何删账户的代码路径**（没有原语、没有路由、没有 worker 任务），因此这个
+--      能力**没有合法使用者**。一张钱表上一个没人用的能力，是本项目那类反复复发的缺陷的
+--      **反形**：不是「声明了但未强制」，而是**授予了但从未声明**。
+--   ② 两层兜底（`entries_account_id_fkey ON DELETE RESTRICT` 与不变式 #2 的对账）护的是
+--      **完整性**，不是**可用性**——**一行被删掉的账户无法被对账恢复**：Σ 余额照样是 0
+--      （钱随账户一起消失），没有任何一条不变式会红。
+--   ③ 双角色模型的全部意义是最小权限，而账本账户上的 `DELETE` 不是最小权限。
+--
+-- `SELECT` / `INSERT` / `UPDATE` 一个都不能少：过账要读余额、惰性建账户要 INSERT（D2）、
+-- 物化余额就是靠 UPDATE 改的（C27）。**只有 `DELETE` 没有使用者。**
+--
+-- 见证（两层，缺一不可）：`tests/integration/db/ledger-enforcement.test.ts` 里
+-- 「运行期角色对 `ledger.accounts` 的 `DELETE` 也被真实拒绝」**真的**以 app_user 发一次
+-- DELETE（打在一个**没有分录**的账户上——有分录的账户会被外键挡下，那条拒绝与 ACL 无关），
+-- 断言它被拒且那一行还在；同文件的 ACL 用例另查 `has_table_privilege` 与 `aclexplode`。
+-- CI 的「运行期角色的权限事实」那一步也查这一格（第 10 项，期望 `f`）。
+-- **删掉下面这一行会让那三处一起变红**（变异探针实测：DELETE 从「被拒」变成 `rowCount: 1`，
+-- 账户行真的没了）。
+REVOKE DELETE ON ledger.accounts FROM app_user;
 
 -- ledger.entries：**append-only**（不变式 #5）——分录是账本的事实，写进去就不能改、
 -- 不能删。一行改过的分录会让「这笔钱去哪了」这个问题永久失去答案。
@@ -148,7 +174,11 @@ ALTER DEFAULT PRIVILEGES FOR ROLE vca_owner IN SCHEMA audit
 ALTER DEFAULT PRIVILEGES FOR ROLE vca_owner IN SCHEMA asset
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_user;
 -- ledger 同 asset 的形状：`accounts` 要可写（物化余额），`entries` / `transactions`
--- 靠上面那两对逐表 GRANT/REVOKE 例外出来。**默认权限只影响此后新建的表**，而每次
--- `migrate deploy` 之后本文件都会重跑，因此「新表拿到什么权限」只有这一份定义。
+-- 靠上面那两对逐表 GRANT/REVOKE 例外出来，`accounts` 的 `DELETE` 靠它自己那条 REVOKE
+-- 例外出来。**默认权限只影响此后新建的表**，而每次 `migrate deploy` 之后本文件都会重跑，
+-- 因此「新表拿到什么权限」只有这一份定义。
+-- ⚠️ 因此**将来在 ledger 里新建的、不该被删的表**（例如任何 append-only 或只增不改的表）
+-- 必须像 `accounts` / `entries` / `transactions` 一样在下面补一条逐表 `REVOKE`——
+-- 这一行 `ALTER DEFAULT PRIVILEGES` 会把 `DELETE` 一并授予它。
 ALTER DEFAULT PRIVILEGES FOR ROLE vca_owner IN SCHEMA ledger
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_user;
