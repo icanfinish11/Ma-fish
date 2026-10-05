@@ -382,6 +382,12 @@ describe('加密即入库（D1）：上传流 → 加密写制品库 → 校验 
     expect(new Set(results.map((item) => item.version.fileId)).size).toBe(4);
     // 四条都通过了校验 ⇒ 四个对象都留在库里
     await expect(storedObjects()).resolves.toHaveLength(4);
+
+    // **本用例自己收尾**（修复轮 1）：这四条是**接受路径**的产物，不是残留，
+    // 留着它们等于把「库是干净的」这件事记在下一条用例的 `beforeEach` 上——
+    // 一条用例的起点于是取决于执行顺序，而这正是「无残留」那类断言最怕的形状。
+    for (const item of results) await store.delete(item.version.storageKey);
+    await expect(storedObjects()).resolves.toEqual([]);
   });
 
   it('明文限额的边界：恰好 maxBytes 放行，maxBytes + 1 中止且零残留', async () => {
@@ -521,6 +527,8 @@ describe('加密即入库（D1）：上传流 → 加密写制品库 → 校验 
     beforeEach(async () => {
       failing.failTimes = 0;
       failing.deleteCalls = 0;
+      failing.lastKey = '';
+      failing.failureError = () => new Error('注入的删除失败：卷不可写');
       userSeq += 1;
       failingSession = (
         await failingApp
@@ -541,11 +549,16 @@ describe('加密即入库（D1）：上传流 → 加密写制品库 → 校验 
       expect(res.status, `响应体=${res.text}`).toBe(422);
       expect(failing.deleteCalls, '删除只试了一次——重试没有发生').toBeGreaterThanOrEqual(2);
       await expect(storedObjects()).resolves.toEqual([]);
-      const rows = await prisma.auditLog.findMany({ where: { action: 'asset.artifact.cleanup_failed' } });
+      // **按 `resourceId` 过滤**（修复轮 1）：只按 `action` 过滤时，这条断言的正确性依赖
+      // 「同组别的用例没有留下同动作的行」——那是一个跨用例的假设。
+      // `resource_id` 就是那个刚被删掉的对象键（`resourceId` 的唯一来源是存储键）。
+      const rows = await prisma.auditLog.findMany({
+        where: { action: 'asset.artifact.cleanup_failed', resourceId: failing.lastKey },
+      });
       expect(rows, '重试成功之后不该留下「清理失败」的审计行').toHaveLength(0);
     });
 
-    it('三次都失败：留下审计行（含对象键与尝试次数）并回 500，对象仍在库里', async () => {
+    it('三次都失败：留下审计行（含对象键、尝试次数与**有界的失败类别**）并回 500，对象仍在库里', async () => {
       failing.failTimes = Number.POSITIVE_INFINITY;
 
       const res = await request(failingApp.getHttpServer())
@@ -565,12 +578,53 @@ describe('加密即入库（D1）：上传流 → 加密写制品库 → 校验 
       const key = leftovers[0]?.name.split('/').pop() ?? '';
       expect(key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7/);
 
-      // 可观测痕迹：一行 append-only 审计（它同时就是「待清理标记」，见本组用例的说明）
-      const rows = await prisma.auditLog.findMany({ where: { action: 'asset.artifact.cleanup_failed' } });
+      // 可观测痕迹：一行 append-only 审计（它同时就是「待清理标记」，见本组用例的说明）。
+      // 同样按 `resourceId`（= 被留下的那个对象键）过滤，与执行顺序无关。
+      const rows = await prisma.auditLog.findMany({
+        where: { action: 'asset.artifact.cleanup_failed', resourceId: key },
+      });
       expect(rows).toHaveLength(1);
       expect(rows[0]?.resourceId).toBe(key);
       expect(rows[0]?.resource).toBe('AssetArtifact');
-      expect(rows[0]?.metadata).toMatchObject({ attempts: 3, errorName: 'Error' });
+      expect(rows[0]?.metadata).toMatchObject({ attempts: 3, errorName: 'Error', reasonClass: 'Error' });
+    });
+
+    it('失败类别：注入一个带 `code` 的失败 ⇒ 审计行的 `reasonClass` 记下那个 code（原始消息仍不落档）', async () => {
+      /**
+       * 修复轮 1：上面那条用例只覆盖了「裸 `Error`」这一种失败，于是
+       * `reasonClass` 的三个分支里只有一个被走到——而**有界分类**这件事本身
+       * （「按理由分流」在数据层不会退化成一行一个值）正是加它的理由。
+       *
+       * 这里注入的 `EACCES` 是本地卷上「删不掉」的现实形态（权限/占用）。
+       * 同时断言**原始消息不在审计行里**：那条消息带的是卷的路径（C11）。
+       */
+      failing.failTimes = Number.POSITIVE_INFINITY;
+      failing.failureError = () => {
+        const error = new Error(`注入的删除失败：制品卷路径 D:\\vca\\${'x'.repeat(20)}`) as Error & { code?: string };
+        error.code = 'EACCES';
+        return error;
+      };
+
+      const res = await request(failingApp.getHttpServer())
+        .post('/assets/upload')
+        .set('Cookie', `${SESSION_COOKIE}=${failingSession}; ${CSRF_COOKIE}=${failingCsrf}`)
+        .set(CSRF_HEADER, failingCsrf)
+        .attach('file', sampleBytes('fake-mime.zip'), 'pkg.zip');
+
+      expect(res.status, `响应体=${res.text}`).toBe(500);
+      const key = failing.lastKey;
+      const rows = await prisma.auditLog.findMany({
+        where: { action: 'asset.artifact.cleanup_failed', resourceId: key },
+      });
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toMatchObject({
+        attempts: 3,
+        errorName: 'Error',
+        errorCode: 'EACCES',
+        reasonClass: 'EACCES',
+      });
+      // 原始消息（含路径）**不**在审计行里：C11 的那条边界
+      expect(JSON.stringify(rows[0]?.metadata)).not.toContain('制品卷路径');
     });
   });
 
@@ -763,11 +817,27 @@ class DeleteFailingStore implements ArtifactStore {
   /** 还会失败几次（每次 delete 先扣减）。`Infinity` = 一直失败。 */
   failTimes = 0;
   deleteCalls = 0;
+  /**
+   * 最近一次写入的存储键（修复轮 1）。用途：把审计行**按 `resourceId` 过滤**——
+   * 只按 `action` 过滤时，「有没有留下清理失败的行」这条断言的正确性依赖
+   * 「同组的其它用例没有留下同动作的行」，那是一个跨用例的假设。
+   * 端口刻意没有列举 API（C16），而键本来就由 `putStream` 返回，这里只是把它记下来。
+   */
+  lastKey = '';
+  /**
+   * 注入的失败形状（默认一个裸 `Error`）。
+   *
+   * 让用例能覆盖**有界的失败类别**：`errorCode` 只在错误带 `code` 时才有值，
+   * 而 `reasonClass` 的分类分支（fs 的 code / HTTP 状态码 / 兜底）各需要一种形状才能走到。
+   */
+  failureError: () => Error = () => new Error('注入的删除失败：卷不可写');
 
   constructor(private readonly inner: ArtifactStore) {}
 
-  putStream(source: Readable, opts: { maxBytes: number }): ReturnType<ArtifactStore['putStream']> {
-    return this.inner.putStream(source, opts);
+  async putStream(source: Readable, opts: { maxBytes: number }): Promise<{ key: string; bytes: number }> {
+    const stored = await this.inner.putStream(source, opts);
+    this.lastKey = stored.key;
+    return stored;
   }
 
   getRange(key: string, start: number, endInclusive: number): Promise<Buffer> {
@@ -782,7 +852,7 @@ class DeleteFailingStore implements ArtifactStore {
     this.deleteCalls += 1;
     if (this.failTimes > 0) {
       this.failTimes -= 1;
-      throw new Error('注入的删除失败：卷不可写');
+      throw this.failureError();
     }
     return this.inner.delete(key);
   }
