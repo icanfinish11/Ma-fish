@@ -263,3 +263,29 @@ brief 写「文件头（定长 **48** + keyId）」，但它同段列出的字�
 | 索引记录 | `offset(8) \| ciphertextLength(4) \| 自称序号(8) \| 保留(4)` = 24；自称序号**只比对**、不推导 | `offset(8) \| ciphertextLength(4) \| 保留(12)`（无序号字段） |
 | 「谁是末块」的事实来源 | 读取端按**读取顺序**判定（读尾部的 `chunkCount` 与索引条数的自洽性）；记录自称的序号只用来**比对** | 同（但那时没有可比对的字段） |
 
+---
+
+## 8. ⚠️ 更正：这些库**并没有**被安装（P1 Task 3 发现，控制器核实）
+
+**本文与 P1 计划此前都暗示 `yauzl` / `tar` / `file-type` 已可用。这是错的，是控制器自己的错误。**
+
+实测（HEAD `6af3ef7`）：
+- `pnpm-lock.yaml` 中 `yauzl` 匹配数 = **0**；`pnpm why -r yauzl` 为空。
+- `require.resolve('yauzl' | 'file-type' | 'tar' | 'busboy' | 'multer', { paths: ['apps/api/src'] })` **全部 MODULE_NOT_FOUND**。
+- `node_modules/.pnpm/` 下确实有 `yauzl@3.4.0`、`@types+yauzl@3.4.0`、`file-type@22.1.1`、`tar@7.5.22`、`tar-stream@3.2.2` 等目录，但它们是**本预检探针的残留**：探针装在 `.spike-p1/` 下，事后删了该目录并回滚了被污染的 lockfile，**`.pnpm` 存储目录却留了下来**。它们**未被链接**、不在 lockfile 中，`pnpm install --frozen-lockfile` 不会提供它们，也没有任何代码 import 得到。
+
+**教训（写给以后的预检）**：探针残留的 `.pnpm` 目录会让「依赖已安装」看起来为真。判断依赖可用性一律以 **`require.resolve`（从实际使用的包目录出发）** 为准，**不以 `node_modules/` 下存在同名目录为准**；pnpm 的隔离链接意味着**传递依赖不可从应用代码 import**。这正是 K6 类缺陷，而这次踩它的是控制器。
+
+**需要的直接依赖（尚未登记，由对应任务补）**：
+
+| 库 | 版本 | 登记到 | 用于 |
+|---|---|---|---|
+| `yauzl` | 3.4.0 | `apps/api` | zip 中央目录、`fromRandomAccessReader`（Task 3 → 4） |
+| `@types/yauzl` | 3.4.0 | `apps/api`（dev） | 同上。**注意其发布的类型缺少运行期必需的 `ref`/`unref`** |
+| `file-type` | 22.1.1 | `apps/api` | magic bytes 嗅探（Task 4） |
+| `tar` | 7.5.22 | `apps/api` | tar.gz 流式解析（Task 4）。**是 `tar`，不是 `tar-stream`** |
+
+`busboy` 与 `multer` **无需**直接登记：Task 1 经 `@nestjs/platform-express` 的 multer 自定义存储引擎已实现流式接入，并已通过测试。
+
+**控制器裁定（2026-10-05）**：Task 3 自行登记 `yauzl` + `@types/yauzl`，并使用**真实的类型**而非手抄的结构副本——手抄副本没有任何机制发现漂移，而本项目已经为「声明了但未强制」付过多次代价。Task 4 登记 `file-type` 与 `tar`。**Task 4 的 brief 必须包含一步 `pnpm install` 后的 `require.resolve` 校验**，以免同类问题再次静默通过。
+
