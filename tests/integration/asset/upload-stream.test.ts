@@ -322,7 +322,9 @@ describe('上传接入与制品存储（Task 1）', () => {
      * 「HTTP 层把整份 body 攒起来、最后才落盘」。加密即入库（Task 5）之后这个口径不再成立：
      * 生产块大小是 **8 MiB**，而这台测试的上传上限只有 4 MiB ⇒ 任何合法负载都落在**一块之内**，
      * 而加密器对末块要「押后」（末块标记只有流结束才知道，Task 2）⇒ 整段密文在源流结束前
-     * 根本不会出现在盘上，盘上先有的只有制品头（33 字节，也就是上面 `sawPartial` 看到的那个）。
+     * 根本不会出现在盘上，盘上先有的只有制品头（测量时 33 字节 = `31 + keyId(2)`；
+     * I3 之后同一份头是 **37** 字节 = `35 + 2`，见 `artifact-format.ts` 的 `HEADER_FIXED_BYTES`），
+     * 也就是上面 `sawPartial` 看到的那个）。
      * 于是这个量≈负载长度**恒成立**（实测峰值 2,097,355 = 负载 2,097,264 + multipart 框架字节），
      * 无论 HTTP 层有没有攒整份 body。
      *
@@ -339,7 +341,7 @@ describe('上传接入与制品存储（Task 1）', () => {
      * `0 < 已落盘 < 负载`（整份攒在内存里、最后一口气写下去**同样满足**），
      * 而 `maxFiles ≤ 1` 只排除临时副本。上面「本文件能证明的是另外两件事」这句话因此
      * 需要收窄：**它证明的其实是「请求还没结束时磁盘上已经有那个对象」，不是「边收边写」。**
-     * （实测：对象落盘的第一批字节就是**制品头**那 33 字节。）
+     * （实测：对象落盘的第一批字节就是**制品头**——测量时 33 字节，I3 之后 37 字节。）
      *
      * 判据 13（内存上界与文件大小无关，用未完成字节数而不是 RSS）的**端到端**见证因此
      * 放到了 `tests/integration/asset/ingest-memory.test.ts`：那里把上传上限按文件抬到 64 MiB
@@ -400,19 +402,37 @@ describe('上传接入与制品存储（Task 1）', () => {
   });
 
   it('字段过多：400（不靠 fileSize 兜底），且不落地任何字节', async () => {
-    // 这条钉住 `asset.module.ts` 的 `limits.fields`（修复轮 1 / Fix 4）。
-    // 失效形态是**静默**的：没有这一条时，请求只是多解析 16 个字段就成功——
-    // 「字段面有界」这件事在测试里没有任何痕迹。这里发到超过上限为止（`fields: 16` ⇒ 第 17 个触发）。
+    /**
+     * 这条钉住 `asset.module.ts` 的 `limits.fields`（修复轮 1 / Fix 4）。
+     *
+     * **据实记载（M1：上一版这条断言不可能失败）**：上一版发 **24 个字段且不带文件**，
+     * 于是「把 `fields: 16` 删掉」时 multer 的 `parts: 17`（第 18 个部分）照样给出 400——
+     * 断言只钉状态码，因此它对 `fields` 的存亡**完全无感**。一个不可能失败的见证
+     * 比没有见证更糟：它让「这条控制还有看守者」这句话变成假的。
+     *
+     * 现在的形状：发 **17 个字段 + 一个合法 zip**，并断言响应**点名了字段数上限**。
+     * `fields: 16` 在时，第 17 个字段（部分 17）触发 `LIMIT_FIELD_COUNT` ⇒ `Too many fields`；
+     * 把它删掉，同一份请求会继续读到后面那个文件（部分 18）而落到 `LIMIT_PART_COUNT`
+     * ⇒ `Too many parts`——**消息不同**，因此这条断言会红。
+     * （两者都是 400，所以只钉状态码是不够的：这正是本条用例的全部意义。）
+     */
     const big = request(app.getHttpServer())
       .post('/assets/upload')
       .set('Cookie', `${SESSION_COOKIE}=${sessionId}; ${CSRF_COOKIE}=${csrf}`)
       .set(CSRF_HEADER, csrf);
-    for (let i = 0; i < 24; i++) void big.field(`f${i}`, 'x'.repeat(32));
+    for (let i = 0; i < 17; i++) void big.field(`f${i}`, 'x'.repeat(32));
+    // 合法 zip：否则这个 400 可能有第三个来源（内容校验）。它排在字段之后 ⇒ 字段数上限先到。
+    void big.attach('file', buildZip([{ name: 'ok.txt', data: payload(1024, 29) }]), 'pkg.zip');
 
     const res = await big;
 
     // 400 而不是 413：`LIMIT_FIELD_COUNT` 是**请求形状**错误，413 只属于 `fileSize`。
     expect(res.status, `响应体=${res.body}`).toBe(400);
+    const raw = typeof res.text === 'string' && res.text !== '' ? res.text : JSON.stringify(res.body);
+    expect(
+      raw,
+      `这条 400 不是字段数上限给出的（去掉 limits.fields 就会变成 LIMIT_PART_COUNT）：${raw}`,
+    ).toContain('Too many fields');
     await expect(storedObjects()).resolves.toEqual([]);
   });
 
