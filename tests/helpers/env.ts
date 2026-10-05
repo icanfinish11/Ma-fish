@@ -75,8 +75,10 @@ export const testEnv = Object.freeze({
   NODE_ENV: 'test',
   DATABASE_URL: 'postgresql://app_user:test_pw@127.0.0.1:5432/vca_test',
   REDIS_URL: 'redis://127.0.0.1:6379',
-  SESSION_SECRET: 'test-only-session-secret-32-chars-min',
   MASTER_ENCRYPTION_KEY: 'ab'.repeat(32),
+  // `TRUST_PROXY` 有默认值（`loopback`），登记在这里是为了让「一份完整合法 env」这件事
+  // 在三处夹具里保持一致（见文件头 K9；生产引导读的也是同一个变量）。
+  TRUST_PROXY: 'loopback',
   GITHUB_CLIENT_ID: 'test-client-id',
   GITHUB_CLIENT_SECRET: 'test-client-secret',
   GITHUB_CALLBACK_URL: 'http://localhost:3000/auth/github/callback',

@@ -78,7 +78,8 @@ export function maskEmail(email: string): string {
  *
  * ## 分隔符集合
  *
- * `\s < > ( ) [ ] { } , ; : ' "` 都是**边界**，不是地址字符：
+ * `\s`（**Unicode 空白**，见 {@link isAddressDelimiter}）与
+ * `< > ( ) [ ] { } , ; : ' "` 都是**边界**，不是地址字符：
  * - `RCPT TO:<user@example.com>`、`a@x.com,b@y.com`、`"user@example.com"` 都能正确掩码；
  * - `mailto:victim@example.com` 只会掩掉 `victim@example.com`（`:` 是边界，前缀原样保留）。
  *   若把 `:` 当成地址字符，被掩码的会是 `mailto:victim@example.com`，输出
@@ -88,6 +89,12 @@ export function maskEmail(email: string): string {
  *   **原样返回、一个字符都没掩**（实测：`550 "quoted local"@example.com rejected` 的输出与输入
  *   逐字相同）——一个**完整**的地址穿过了 C11 那道过滤。而当时的注释把这件事写成
  *   「部分残留 / 地址被截断」，两条都不对（修复轮 2 的复审指出，实测如上）。
+ * - **Unicode 空白必须算边界**（最终评审的 Minor）：上一版把分隔符集合写成一份**ASCII 清单**，
+ *   并注明「与旧正则的字符类逐字对应」——但旧正则里是 `\s`，它是 Unicode 感知的。
+ *   于是 `请联系\u00A0support@example.com`（不间断空格 U+00A0）会被**过度掩码**：
+ *   `请联系` 与那个空格一起被当成 local-part 吃掉，输出 `请***@example.com`，
+ *   一段本该保留的日志文本静默消失。方向是 fail-closed（多掩了，没漏），
+ *   但「日志里丢了上下文」同样是缺陷——修法就是让空白判定回到 `\s` 的语义。
  *
  * **代价如实记录**：带端口的地址（`user@host:25`）会在 `:` 处截断；带字面量 IP 的地址
  * （`user@[192.168.0.1]`）因括号是边界、只会掩到 `user@` 之后。两者在本项目里都不存在
@@ -103,8 +110,28 @@ export function maskEmail(email: string): string {
  * 上列边界在 `tests/unit/logging/redact.test.ts` 里被钉住（改这段扫描就要同时改那里的期望）。
  */
 
-/** 分隔符（不是地址字符）。与旧正则的字符类逐字对应。 */
-const ADDRESS_DELIMITERS = new Set([' ', '\t', '\n', '\r', '\f', '\v', '<', '>', '(', ')', '[', ']', '{', '}', ',', ';', ':', "'", '"']);
+/** 分隔符（不是地址字符）。标点部分与旧正则的字符类逐字对应；**空白走 `\s`**，见下。 */
+const ADDRESS_DELIMITERS = new Set(['<', '>', '(', ')', '[', ']', '{', '}', ',', ';', ':', "'", '"']);
+
+/**
+ * Unicode 空白（`\s` 的语义）。
+ *
+ * 为什么不是把 `\s` 匹配到的那些码点**枚举**进 `ADDRESS_DELIMITERS`：那份清单会随运行时
+ * 的 Unicode 版本变化（`\s` 的集合在历史上加过 `\u180E` 之类），而枚举出来的副本**不会**
+ * 跟着变。用正则表达式本身就是「与 `\s` 同义」的唯一写法。
+ * 无 `g` 标志 ⇒ 无 `lastIndex` 状态，可在热路径上反复 `test`。
+ */
+const UNICODE_WHITESPACE = /\s/u;
+
+/**
+ * 是否是**地址字符**（不是地址字符就是分隔符）。
+ *
+ * 空白一律算分隔符，且判定与 `\s` 同义（Unicode 感知）——上一版只列了 ASCII 空白，
+ * 于是 U+00A0 这类空白会被吃进 local-part，造成**过度掩码**（见文件头「分隔符集合」）。
+ */
+function isAddressDelimiter(char: string): boolean {
+  return ADDRESS_DELIMITERS.has(char) || UNICODE_WHITESPACE.test(char);
+}
 
 /** ASCII 双引号（用码点而不是字面量：字面量极易被排版引号替换而看不出来）。 */
 const DOUBLE_QUOTE = 34;
@@ -112,7 +139,7 @@ const DOUBLE_QUOTE = 34;
 /** 从 `from` 起沿 `step` 方向吃掉连续的地址字符，返回**停下来的下标**（该处是边界或越界）。 */
 function scanAddressChars(text: string, from: number, step: 1 | -1): number {
   let i = from;
-  while (i >= 0 && i < text.length && !ADDRESS_DELIMITERS.has(text[i]!)) i += step;
+  while (i >= 0 && i < text.length && !isAddressDelimiter(text[i]!)) i += step;
   return i;
 }
 
@@ -304,8 +331,41 @@ function isOpaqueBuiltin(value: object): boolean {
  *    那条同一机制）。代价是那一个字段变成不可读的标记，而不是日志失败。本阶段不解决它：
  *    要解决就得放弃「不修改调用方对象」这条承诺（改为就地求值），而那条承诺更重要。
  */
+/**
+ * 单参数版脱敏：异常**原样**冒出去。
+ *
+ * ## 这里曾经是 `() => undefined`，也就是 `throw undefined`（最终评审的 Minor）
+ *
+ * 钩子的返回值会被 `readKey` **`throw` 出去**，因此那个箭头函数的语义是
+ * 「把读键时抛出的异常替换成 `undefined` 再抛」：调用方拿到的是一个没有 message、
+ * 没有 stack、连 `instanceof Error` 都不成立的值，`try { … } catch (e) { logger.error(e) }`
+ * 里什么都读不出来——正是本仓库反复抓到的「错误被吞掉」的形态（只是它伪装成「抛过了」）。
+ * 现在写成 `(err) => err`：钩子的契约是「返回要抛出的值」，返回原始错误就是恒等变换。
+ */
 export function redact<T>(value: T): T {
-  return redactWithContext(value, () => undefined) as T;
+  return redactWithContext(value, (err) => err) as T;
+}
+
+/**
+ * 把任意抛出值收敛成一句**不会再次抛出**的描述（最终评审 I-7）。
+ *
+ * 这段代码跑在 catch 块里，用来解释「脱敏为什么失败」。它面对的正是**不可信**的值：
+ * 一个 `Proxy` 的 `getPrototypeOf` 可以抛（于是 `instanceof` 抛），一个非 `Error` 的
+ * `toString` 可以抛（于是 `String(v)` 抛）。任何一个抛出都会让**报告本身**变成新的异常，
+ * 于是一次日志调用重新变成 500——那正是这一整条降级路径要消灭的形态。
+ * 因此这里只做两件安全的事：`typeof` 判断，以及包在 try 里的属性读取。
+ */
+function describeThrown(value: unknown): string {
+  if (value === null) return 'null';
+  const type = typeof value;
+  if (type !== 'object' && type !== 'function') return type; // 原始值：只报类型，别把值写进日志
+  try {
+    const message = (value as { message?: unknown }).message;
+    if (typeof message === 'string' && message) return message;
+  } catch {
+    // 读 message 本身抛了：退化成类型名，绝不再抛
+  }
+  return type;
 }
 
 /**
@@ -319,6 +379,11 @@ export function redact<T>(value: T): T {
  * 因此 `redactValue` / `redactObject` 里每一次属性访问都包在 try/catch 里，
  * 把原始异常挂在这上面（`cause`）并补上键名。**它仍然会抛**——reporter 的责任是记录，
  * 不是吞掉（吞掉就会在「不知道脱敏到哪一步」的情况下继续，那正是 fail-closed 要避免的）。
+ *
+ * **构造过程本身也不能抛**（最终评审 I-7）：`cause` 是任意抛出值，所以描述它走
+ * {@link describeThrown}（只做 `typeof` 与受保护的属性读取）。原先直接写
+ * `cause instanceof Error ? cause.message : String(cause)`，对一个 `toString` 会抛的
+ * 对象来说，构造这个「用来报告失败」的错误会**先炸**，把 catch 变成 re-throw。
  */
 export class RedactionError extends Error {
   constructor(
@@ -327,19 +392,30 @@ export class RedactionError extends Error {
     /** 键名不可知时（例如数组元素）传 `undefined`。 */
     override readonly cause: unknown,
   ) {
-    const reason = cause instanceof Error ? cause.message : String(cause);
-    super(`脱敏时读取键「${key}」失败：${reason}`, { cause });
+    super(`脱敏时读取键「${key}」失败：${describeThrown(cause)}`, { cause });
     this.name = 'RedactionError';
   }
 }
 
+/**
+ * 这个抛出值是不是已经带过键名的 {@link RedactionError}。
+ *
+ * `instanceof` 本身就可能抛（`err` 是一个 `getPrototypeOf` 陷阱会抛的 Proxy，最终评审 I-7），
+ * 而它跑在 catch 块里——抛出会让「已经捕获了一次失败」变成「又冒出一个新异常」。
+ * 因此这里对「问不出身份」的值一律回答 `false`：上层随后会用 `onKeyError` 把它包成一个
+ * 描述安全的 `RedactionError`，方向仍然是安全的那一侧。
+ */
 function isRedactionError(err: unknown): err is RedactionError {
-  return err instanceof RedactionError || (
-    typeof err === 'object' &&
-    err !== null &&
-    (err as { name?: unknown }).name === 'RedactionError' &&
-    typeof (err as { key?: unknown }).key === 'string'
-  );
+  try {
+    return err instanceof RedactionError || (
+      typeof err === 'object' &&
+      err !== null &&
+      (err as { name?: unknown }).name === 'RedactionError' &&
+      typeof (err as { key?: unknown }).key === 'string'
+    );
+  } catch {
+    return false;
+  }
 }
 
 /** 可选的「原始错误 → 脱敏错误」转换钩子（模块私有的扩展点，只有 logger 那一层用）。 */

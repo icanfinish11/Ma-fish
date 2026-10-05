@@ -79,7 +79,6 @@ describe('引导期 fail-fast 接线（app.module → ConfigModule → validate�
   const REQUIRED_KEYS = [
     'DATABASE_URL',
     'REDIS_URL',
-    'SESSION_SECRET',
     'MASTER_ENCRYPTION_KEY',
     'GITHUB_CLIENT_ID',
     'GITHUB_CLIENT_SECRET',
@@ -124,7 +123,7 @@ describe('引导期 fail-fast 接线（app.module → ConfigModule → validate�
     expect(reason).toBeInstanceOf(Error);
     const message = reason instanceof Error ? reason.message : String(reason);
     expect(message).toContain('环境变量校验失败，服务拒绝启动');
-    for (const key of ['SESSION_SECRET', 'MASTER_ENCRYPTION_KEY', 'GITHUB_CLIENT_SECRET']) {
+    for (const key of ['MASTER_ENCRYPTION_KEY', 'GITHUB_CLIENT_SECRET']) {
       expect(message).toContain(key);
     }
   });

@@ -256,6 +256,38 @@ describe('PolicyGuard 默认拒绝（威胁 #1）', () => {
     expect(errorSpy.mock.calls[0]?.[0]).toContain('neverRegistered');
   });
 
+  /**
+   * **匿名 + 条件未注册**这一格（最终评审的 Minor：此前整个矩阵里没有它）。
+   *
+   * 为什么缺这一格会让「判定顺序」变成散文：`canActivate` 里「条件未注册」排在
+   * 「要求身份」**之前**（理由见守卫的注释：接线错误不该被伪装成「你没登录」）。
+   * 而这个顺序只有在**匿名**请求上才看得出来——已认证的那条用例（上一条）无论谁先谁后
+   * 都会走到同一个 fail-closed 分支。因此这一条是顺序的**唯一**判别式：
+   * 反过来的实现（先查身份）会让匿名请求拿到『需要登录』而这里变红。
+   *
+   * ## 消息可区分这件事（据实记录，不改）
+   *
+   * 匿名调用方因此能看出「这条路由的条件注册过」与「没注册过」——前者回『需要登录』，
+   * 后者回『该资源未被授权访问』。这是**有意保留**的：后者是**接线错误**，
+   * 它需要被响亮地报出来（同时有 error 日志），而它对调用方不构成任何越权线索
+   * （两条路都是 403，泄露的只是「服务端配置有问题」）。因此这里只把事实钉住，
+   * 不为了让两者同形而牺牲那条告警的可定位性。
+   */
+  it('匿名请求 + 条件未注册：仍按「未注册」拒绝（顺序：未注册先于身份判定）', async () => {
+    errorSpy.mockClear();
+    const res = await request(app.getHttpServer()).get('/probe/unregistered');
+
+    expect(res.status).toBe(403);
+    expect(
+      res.body,
+      '匿名请求拿到了「需要登录」：说明守卫先查身份、后查条件是否注册——接线错误被伪装成了「你没登录」',
+    ).toMatchObject({ message: '该资源未被授权访问' });
+    // 判据不只是消息文本：那条 error 日志证明走的确实是「条件未注册」这个分支，
+    // 而不是别的恰好也回同一句话的路径（例如条件返回了 false）。
+    expect(errorSpy, '未注册条件这条接线错误没有留下 error 日志').toHaveBeenCalledTimes(1);
+    expect(errorSpy.mock.calls[0]?.[0]).toContain('neverRegistered');
+  });
+
   it('已注册的异步条件返回 false：拒绝（漏 await 会让 Promise 恒真 ⇒ 放行）', async () => {
     const res = await request(app.getHttpServer()).get('/probe/denied').set('x-test-user', 'user-1');
     expect(res.status).toBe(403);

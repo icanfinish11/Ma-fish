@@ -20,8 +20,9 @@ import { PrismaService } from '@vca/api/db/prisma.service.js';
  * ## 修复轮 1 新增的两组用例（Fix 1 / Fix 2）
  *
  * - **重试上限**：`attempts` 到顶后事件必须**离开待处理集合**（否则轮询循环会对外部 SMTP
- *   产生无界投递尝试），且「放弃」与「投递成功」在行上可区分。判定与自增必须在**同一事务**里，
- *   故有一条并发判别用例；
+ *   产生无界投递尝试），且「放弃」与「投递成功」在行上可区分。判定与自增在**同一事务**里；
+ *   并发那条用例是**放弃分支**的判别式，**不**判别 read-modify-write（该说法已撤回，
+ *   理由写在用例的注释里）；
  * - **`last_error` 脱敏**：SMTP 的拒绝消息常回显收件人，落库前必须过 scrubber。
  *
  * ## 与 brief 版本的差异（Ruling 2，三处缺陷已修）
@@ -42,8 +43,11 @@ import { PrismaService } from '@vca/api/db/prisma.service.js';
  * 两条用例会留下**未处理**事件（畸形负载 `k-bad-payload`、恒定失败的那几条毒事件），
  * 它们因此会占着后续批次的名额——所以：
  * - 每条用例的断言都只针对**自己**的幂等键，不依赖「谁先被选到」；
- * - **基线必须在 `drain()` 之后、发布之前取**，否则 `delivered.slice(base)` 恒为空数组，
- *   「非邮件 topic 不调用适配器」那类断言会变成同义反复（修复轮 2 的 Minor 改正了这处）。
+ * - **基线必须在 `drain()` **之前**取、且在本用例发布之前**（最终评审的 Minor 改正了
+ *   这处**写反了**的规则）：`delivered.slice(base)` 要覆盖的正是「排空这些非邮件 topic 的
+ *   全过程」。取在 `drain()` **之后**的话，那句 `toEqual([])` 比较的是一个**按构造为空**的
+ *   切片（排空之后、发布之前没有任何投递），于是它在任何实现上都绿——同义反复。
+ *   逐条用例里的写法与理由见下面「基线在 `drain()` **之前**取」那一段注释。
  *
  * 「畸形负载」用例此前刻意排在末尾（理由：它留下一个永远处理不掉的事件）。修复轮 1 的
  * Fix 1 **改掉了那个前提**：那条事件到达上限后会被放弃、离开待处理集合，因此它不再
@@ -362,12 +366,15 @@ describe('transactional outbox（§3.3 / C15）', () => {
   /**
    * 并发消费者下上限**仍然有效**。
    *
-   * 这一条是「按行上的 attempts 判定」这个实现的判别用例：如果失败路径先读行、再决定、
-   * 最后 `increment`（read-modify-write），两个并发消费者读到的是**同一个旧值**，
-   * 于是 `attempts` 会被**少算**——上限就成了摆设，外部 SMTP 依旧收到无界的尝试。
-   * 把「自增 + 读回 + 判定 + 标放弃」放进**一个事务**后，并发的丢失更新不再能绕过上限。
+   * ## 这条用例**不是** read-modify-write 的判别式（最终评审的 Minor 收窄了标题与说明）
+   *
+   * 它此前被标成「抓 RMW」，而那个说法已经在下面对并发度的那段注释里被**撤回**了
+   * （实测：真正的 RMW 变异在 3 路与 12 路下都不红）。因此这里的口径改成它**实际**证明的：
+   * 「`attempts` 到顶后事件离开待处理集合 + 落了 `abandoned_at`」，
+   * 把「放弃」分支关掉（探针 `fix1-abandon-disabled`）时必红。
+   * RMW 那条不变式由 `tests/unit/notify/outbox-attempts.test.ts` 的**确定性**用例承担。
    */
-  it('并发消费者不会绕过重试上限（判定必须与自增在同一事务里，不能 read-modify-write）', async () => {
+  it('并发消费者下事件仍会离开待处理集合并落放弃标记（放弃分支的判别式；不判别 RMW）', async () => {
     const cap = 3;
     const failures = {
       send: async (): Promise<void> => {
@@ -402,7 +409,8 @@ describe('transactional outbox（§3.3 / C15）', () => {
 
     expect(
       await prisma.outboxEvent.count({ where: { idempotencyKey: 'k-poison-parallel', processedAt: null } }),
-      '并发消费者下事件没有离开待处理集合：上限被 read-modify-write 的丢失更新绕过了',
+      '并发消费者下事件没有离开待处理集合（放弃分支没生效）——注意这条**不**判别 read-modify-write，' +
+        '见本用例上方与并发度那段注释',
     ).toBe(0);
     const row = await prisma.outboxEvent.findUnique({ where: { idempotencyKey: 'k-poison-parallel' } });
     expect(row?.abandonedAt, '并发下没有落放弃标记').not.toBeNull();

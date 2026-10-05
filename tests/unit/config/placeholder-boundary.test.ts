@@ -19,8 +19,8 @@ const VALID = {
   PORT: '3000',
   DATABASE_URL: 'postgresql://app_user:pw@127.0.0.1:5432/vca',
   REDIS_URL: 'redis://127.0.0.1:6379',
-  SESSION_SECRET: 'k7fq2m9v4z8n6r1t5w3y0b2d4h6j8l0p',
   MASTER_ENCRYPTION_KEY: '0123456789abcdef'.repeat(4),
+  TRUST_PROXY: 'loopback',
   GITHUB_CLIENT_ID: 'cid',
   GITHUB_CLIENT_SECRET: 'gho_realistic_oauth_secret_value',
   GITHUB_CALLBACK_URL: 'http://localhost:3000/auth/github/callback',
@@ -57,14 +57,17 @@ describe('nonPlaceholder 的使用边界（只作用于密钥字段）', () => {
   });
 
   it('密钥字段上仍然拒绝含占位词的「长」值（边界不得以放松密钥为代价）', () => {
+    // 被覆写的字段从 `SESSION_SECRET` 换成了 `GITHUB_CLIENT_SECRET`（最终评审 I-2 删掉了前者：
+    // 它必填却无人读取）。`min(1)` 的下游**拦不住**这个 86 字符的值，
+    // 因此这里仍然是「占位层自己在承重」的判别式。
     const result = envSchema.safeParse({
       ...VALID,
-      SESSION_SECRET: `${'x'.repeat(40)}-changeme-${'y'.repeat(40)}`,
+      GITHUB_CLIENT_SECRET: `${'x'.repeat(40)}-changeme-${'y'.repeat(40)}`,
     });
 
     expect(result.success).toBe(false);
     if (!result.success) {
-      expect(result.error.issues.map((i) => i.path.join('.'))).toContain('SESSION_SECRET');
+      expect(result.error.issues.map((i) => i.path.join('.'))).toContain('GITHUB_CLIENT_SECRET');
     }
   });
 });

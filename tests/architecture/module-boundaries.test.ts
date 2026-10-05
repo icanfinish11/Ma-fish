@@ -162,6 +162,16 @@ function cruise(): DepcruiseRun {
   return cached;
 }
 
+/**
+ * 必须**阻塞**（`severity: 'error'`）的三条规则——它们各自承担一条设计约束，见配置里的注释：
+ * 跨模块内部依赖 / shared 反向依赖 apps / 循环依赖。这三条一旦被改成 `warn`，
+ * 约束就只剩文档（理由与实测见下面用例里的 C-1 段落）。
+ */
+const BLOCKING_RULES = ['no-cross-module-internals', 'no-shared-to-apps', 'no-circular'] as const;
+
+/** 唯一被允许是 `warn` 的规则（它故意不阻塞，理由写在 `.dependency-cruiser.cjs` 里那一条上）。 */
+const NON_BLOCKING_RULE = 'no-orphans';
+
 describe('架构守护（C5 / 验收 13.4）', () => {
   it('dependency-cruiser 规则全部通过（禁跨模块内部 import）', () => {
     const { exitCode, summary, raw } = cruise();
@@ -186,11 +196,36 @@ describe('架构守护（C5 / 验收 13.4）', () => {
     // 不许依赖别人的内部实现）的四个方向，而拆成四条规则会让「谁覆盖了谁」变成要读
     // 四遍 `from.path` 才知道的事。
     const declared = summary.ruleSetUsed?.forbidden ?? [];
-    for (const rule of ['no-cross-module-internals', 'no-shared-to-apps', 'no-circular']) {
+    for (const rule of BLOCKING_RULES) {
       expect(
         declared.map((r) => r.name),
         `规则集里没有 ${rule}：${CONFIG_FILE} 的 forbidden 被改过？`,
       ).toContain(rule);
+    }
+
+    // ── 规则的**严重级别**必须被断言（最终评审 C-1）────────────────────────────
+    //
+    // 只断言规则名不够的第二个方向：把配置里那三行的 `'error'` 改成 `'warn'`，
+    // **其余一切都还是绿的**——
+    //   * `pnpm arch` 退出 0（depcruise 的退出码只统计 error，配置里 `no-orphans` 那条
+    //     注释写着这件事）；
+    //   * 违规从 `summary.error` 挪到 `summary.warn`，本文件下面的 `expect(summary.error).toBe(0)`
+    //     照样通过；
+    //   * `assert-tests-ran.mjs` 的 floor 只看**执行条数**，一条都不会少。
+    // 于是「§3.3 第 2 条」与两处依赖反转收口（修复轮 1）的唯一机器执行者，
+    // 会被一个词的改动关掉而 CI 看不见——本仓库反复抓到的「声明了但没在执行」的第七例。
+    //
+    // 判据写成**每个规则各自的期望值**而不是只钉三条名字：将来有人新增一条规则并顺手写成
+    // warn 时，这里同样会红。`no-orphans` 是唯一被允许非阻塞的（理由见配置里那一段：
+    // 「哪些文件是入口」是本仓库的约定而不是依赖事实，把它设成 error 会逼着下一个人放宽规则）。
+    for (const rule of declared) {
+      const expected = rule.name === NON_BLOCKING_RULE ? 'warn' : 'error';
+      expect(
+        rule.severity,
+        `规则 ${rule.name} 的 severity 是「${rule.severity}」，应为「${expected}」：` +
+          `depcruise 的退出码只统计 error，warn 违规不会让 \`pnpm arch\` 变红——` +
+          `架构约束会在 CI 全绿的情况下失效（${CONFIG_FILE} 被改过？）`,
+      ).toBe(expected);
     }
 
     // ── 规则的**范围**也要被断言（修复轮 2）────────────────────────────────

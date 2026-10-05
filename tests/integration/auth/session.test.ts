@@ -35,6 +35,63 @@ describe('会话（§4.2 / C13）', () => {
     await expect(svc.verify(sessionId)).resolves.toBeNull();
   });
 
+  /**
+   * `MULTI/EXEC` 的**逐条**结果必须被检查（最终评审 I-5）。
+   *
+   * ## 前提（这一条用**真 Redis**证明，不是我说的）
+   *
+   * ioredis 对事务里逐条命令的执行期错误（WRONGTYPE / OOM / READONLY）是 **resolve**
+   * 而不是 reject——错误躺在 `[err, res][]` 里。因此「`await` 了就当写成功」的实现会留下
+   * 一个**没有 TTL 的会话哈希**：C13 的空闲 7 天过期在这条记录上变成永不过期，
+   * 而外部表现完全正常（会话一直有效、没有报错）。
+   *
+   * 这里先把这个前提钉住（用 WRONGTYPE 造一条真实的逐条错误），再对 `create()` 断言
+   * 「任一条命令失败 ⇒ 抛错」。少了前提那半条，「异常被抛出来」也可能只是因为
+   * 那条命令在**排队期**就失败了——那是另一个机制，与本缺陷无关。
+   */
+  it('create()：任一条命令失败时必须报错，绝不留下没有 TTL 的会话哈希', async () => {
+    // ── 前提：真 Redis 上，逐条错误是 resolve 出来的 ──────────────────────────
+    await redis.set('probe:wrongtype', 'string');
+    const replies = await redis.multi().incr('probe:wrongtype').exec();
+    expect(replies, 'ioredis 对 MULTI 的逐条错误直接 reject 了：下面的前提不成立').not.toBeNull();
+    expect(
+      replies?.[0]?.[0],
+      'ioredis 没有把逐条错误放进结果数组（前提变了：本用例要防的静默失效形态也随之改变）',
+    ).toBeInstanceOf(Error);
+
+    // ── 行为：三种失败形状都必须变成抛出 ──────────────────────────────────────
+    const failure = new Error('OOM command not allowed when used memory > maxmemory.');
+    const cases: Array<{ label: string; exec: () => Promise<[Error | null, unknown][] | null> }> = [
+      // HSET 失败（例如 OOM）：哈希没写进去，但 EXPIRE 可能写在一个不存在的键上（返回 0）。
+      { label: 'HSET 失败', exec: async () => [[failure, null], [null, 0]] },
+      // EXPIRE 失败：**本缺陷的要害形态**——哈希写进去了、TTL 没设上 ⇒ 永不过期。
+      { label: 'EXPIRE 失败（写了一半：有哈希、没有 TTL）', exec: async () => [[null, 1], [failure, 0]] },
+      // 事务被中止（排队期就失败）：`exec()` 回 null，同样不能算成功。
+      { label: 'EXEC 被中止（null）', exec: async () => null },
+    ];
+
+    for (const { label, exec } of cases) {
+      const pipeline = {
+        hset: () => pipeline,
+        expire: () => pipeline,
+        exec,
+      };
+      const broken = new SessionService({ multi: () => pipeline } as unknown as Redis);
+
+      let thrown: unknown;
+      try {
+        await broken.create('user-broken', { ip: '127.0.0.1', userAgent: 'vitest' });
+      } catch (err: unknown) {
+        thrown = err;
+      }
+      expect(thrown, `${label}：失败被吞掉了——会话会被当成创建成功，而它可能永不过期`).toBeInstanceOf(
+        Error,
+      );
+      // 错误消息里**不得**出现会话 id：它是完整的 bearer 凭证，而这个异常多半会被记进日志。
+      expect(String((thrown as Error).message)).not.toMatch(/[A-Za-z0-9_-]{43}/);
+    }
+  });
+
   it('空闲 7 天后过期（TTL 已设置）', async () => {
     const { sessionId } = await svc.create('user-3', { ip: '127.0.0.1', userAgent: 'vitest' });
     const ttl = await redis.ttl(`vca:sess:${sessionId}`);

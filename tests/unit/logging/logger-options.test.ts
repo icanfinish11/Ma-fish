@@ -201,6 +201,112 @@ describe('formatters.log 上的脱敏（C11 / Task 8 接线）', () => {
   });
 
   /**
+   * **报告路径自己也不能炸**（最终评审 I-7）。
+   *
+   * 上面几条用的都是「正常的」抛出值（`Error`、带 getter 的对象），因此它们证明不了
+   * 降级路径在**恶意形状**下的行为。而 `failureReason` 里每一句都在读那个抛出值：
+   * `instanceof Error` 会触发 `getPrototypeOf`、`String(err)` 会调 `toString`、
+   * `err instanceof RedactionError` 又会再来一次原型查找。任一处抛出，
+   * 「报告失败」就变成新的失败：`logger.info(...)` 的调用点收到异常（请求里就是 500），
+   * 而收到的诊断是零——比上面那条「丢掉负载」严重一档。
+   *
+   * 三种形态各一条：
+   * 1. `getPrototypeOf` 陷阱抛出的**代理**（`instanceof` 与原型读取都会中招）；
+   * 2. `toString` 会抛的**非 Error**（`String(err)` 中招）——这是评审点名的形态；
+   * 3. 构造 `RedactionError` 时那个 `cause` 是敌意值（`new RedactionError(...)` 自己不能炸，
+   *    否则 `readKey` 的 catch 会变成 re-throw）。
+   *
+   * 判据是「这一行没有抛」+「redactFailed 仍然写出来了」：只有前者时，
+   * 一个「把 redactFailed 也一起丢掉」的实现会照样通过。
+   */
+  it('抛出值是敌意代理（getPrototypeOf 陷阱会抛）时，日志调用不抛且降级标记仍写出', () => {
+    const { logger, lines } = capture({ NODE_ENV: 'development' });
+    // 陷阱抛出的**本身又是一个敌意值**：于是连 `instanceof`（它要读原型）都会抛，
+    // 报告路径读不到 name/message，只能退化成类型名——但那仍然是「没有抛」。
+    const hostileThrown = new Proxy(
+      {},
+      {
+        getPrototypeOf(): never {
+          throw new Error('不该被调用的原型陷阱');
+        },
+        get(): never {
+          throw new Error('不该被调用的属性陷阱');
+        },
+      },
+    );
+    const hostile = new Proxy(
+      { id: 'n1' },
+      {
+        getPrototypeOf(): never {
+          throw hostileThrown;
+        },
+      },
+    );
+
+    expect(() => {
+      runInContext({ traceId: 'trace-redact-hostile-proxy' }, () => {
+        logger.info({ hostile }, 'hostile proxy probe');
+      });
+    }, '报告脱敏失败的那段代码自己抛了：一次日志调用变成一次请求失败').not.toThrow();
+
+    const record = onlyRecord(lines);
+    expect(record.traceId).toBe('trace-redact-hostile-proxy');
+    expect(record.redactFailed, '降级标记没有写出来（负载已经丢了，连线索也丢了）').toBeTruthy();
+  });
+
+  it('抛出值的 toString 会抛（非 Error）时，日志调用同样不抛', () => {
+    const { logger, lines } = capture({ NODE_ENV: 'development' });
+    const throwingToString = {
+      toString(): never {
+        throw new Error('toString 陷阱');
+      },
+    };
+    const hostile = new Proxy(
+      { id: 'n2' },
+      {
+        getPrototypeOf(): never {
+          throw throwingToString;
+        },
+      },
+    );
+
+    expect(() => {
+      runInContext({ traceId: 'trace-redact-hostile-tostring' }, () => {
+        logger.info({ hostile }, 'hostile toString probe');
+      });
+    }, '`String(err)` 的抛出没有被兜住：报告路径自己变成了新的异常').not.toThrow();
+
+    const record = onlyRecord(lines);
+    expect(record.redactFailed).toBeTruthy();
+    expect(record.password ?? 'absent', '降级路径把未脱敏的负载写了出来').toBe('absent');
+  });
+
+  it('RedactionError 的 cause 是敌意值时，构造它不抛且键名仍然保留', () => {
+    const { logger, lines } = capture({ NODE_ENV: 'development' });
+    const hostileCause = {
+      toString(): never {
+        throw new Error('cause 的 toString 陷阱');
+      },
+    };
+    // 这条走的是「readKey 捕获 → 钩子构造 RedactionError」那条真实路径：
+    // `new RedactionError(key, cause)` 若去 `String(cause)` 就会在 catch 里再抛一次。
+    const payload = {
+      get boom(): string {
+        throw hostileCause;
+      },
+    };
+
+    expect(() => {
+      logger.info({ payload }, 'hostile cause probe');
+    }, 'RedactionError 的构造函数抛了：readKey 的 catch 变成了 re-throw').not.toThrow();
+
+    const record = onlyRecord(lines);
+    const marker = record.redactFailed as string;
+    expect(marker, '键名丢了：运维无法定位是哪个字段坏了').toContain('@boom');
+    expect(marker, 'cause 的描述崩了，标记里应当退化成类型名').toContain('RedactionError');
+  });
+
+  /**
    * 修复轮 2 的 Minor：降级标记必须**可据以行动**。
    *
    * 此前 `redactFailed` 只放错误的类名，而对一个普通 `Error` 那就是字面量 `"Error"`——

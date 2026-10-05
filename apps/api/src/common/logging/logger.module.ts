@@ -51,14 +51,44 @@ const FAILURE_MESSAGE_LIMIT = 120;
  * 键名从哪里来：`redact` 必须**读**每个属性，而读就可能抛；`redactWithContext` 的钩子
  * 把那次异常换成 `RedactionError`（带着键名），因此这里能取到它。取不到（异常发生在
  * 递归之外，例如 `Object.getPrototypeOf` 抛）时退化成不带键名的形态——仍然比只有类名有用。
+ *
+ * ## 这个函数**自己绝不能抛**（最终评审 I-7）
+ *
+ * 它跑在 `formatters.log` 的 catch 里，而它面对的正是**不可信**的抛出值：
+ * - `err instanceof Error` 会触发 `getPrototypeOf`——一个 `Proxy` 让这个陷阱抛，`instanceof` 就抛；
+ * - `String(err)` 会调用 `toString`——一个「`toString` 会抛」的对象就让这一步抛。
+ *
+ * 任一情况都会让**报告失败的代码**变成失败本身：`logger.info(...)` 的调用点收到异常，
+ * 在请求里就是一次 500，而排查线索是零。这正是 `redact.ts` 写明的原则
+ * （「脱敏是日志路径上的最后一道工序，它自己炸掉等于把一条本该记下来的日志变成一次请求失败」）
+ * 在**降级路径**上的同一个要求。因此整个函数体包在一个兜底 try 里，
+ * 连兜底自己都再兜一层（返回一个常量字符串）。
+ *
+ * `key` 曾经是一个从未被传入的参数（`failureReason(err, key?)` 只有一个调用点传了 `err`），
+ * 最终评审的 Minor 把它删掉了：键名只从 `RedactionError` 上取，参数是死代码。
  */
-function failureReason(err: unknown, key?: string): string {
-  const name = err instanceof Error ? err.name : typeof err;
-  const message = err instanceof Error ? err.message : String(err);
-  const detail = scrubEmails(message).replace(/\s+/g, ' ').trim().slice(0, FAILURE_MESSAGE_LIMIT);
-  const reportedKey = key ?? (err instanceof RedactionError ? err.key : undefined);
-  const at = reportedKey === undefined ? '' : ` @${reportedKey}`;
-  return `${name.slice(0, 60)}: ${detail}${at}`;
+function failureReason(err: unknown): string {
+  // 每一步都单独兜住：只让**那一步**退化成常量，其余信息仍然写进标记。
+  // 若整体共用一个 try，「读 message 抛了」会把已经拿到的键名一起丢掉。
+  const isError = attempt(() => err instanceof Error, false);
+  const name = attempt(() => (isError ? (err as Error).name : typeof err), 'unknown');
+  const message = attempt(() => (isError ? (err as Error).message : String(err)), '');
+  const key = attempt(() => (err instanceof RedactionError ? err.key : undefined), undefined);
+  const detail = attempt(
+    () => scrubEmails(message).replace(/\s+/g, ' ').trim().slice(0, FAILURE_MESSAGE_LIMIT),
+    '',
+  );
+  const at = typeof key === 'string' && key ? ` @${key}` : '';
+  return attempt(() => `${String(name).slice(0, 60)}: ${detail}${at}`, '[unavailable]');
+}
+
+/** 求值一段「可能抛」的报告逻辑；抛出时返回兜底值（见 `failureReason` 的说明）。 */
+function attempt<T>(compute: () => T, fallback: T): T {
+  try {
+    return compute();
+  } catch {
+    return fallback;
+  }
 }
 
 function contextFields(obj: Record<string, unknown>): Record<string, unknown> {

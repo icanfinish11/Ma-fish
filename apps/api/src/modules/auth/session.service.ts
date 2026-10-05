@@ -21,6 +21,47 @@ export interface SessionData {
 }
 
 /**
+ * 检查 `MULTI/EXEC` 的**逐条**结果（最终评审 I-5）。
+ *
+ * ## 为什么这件事必须做，而且必须在这里做
+ *
+ * `multi().hset(...).expire(...).exec()` 的两条命令要么都生效、要么都不生效——这句话只对
+ * 「排队期」成立。**执行期**的失败（OOM、READONLY 副本、WRONGTYPE）是**逐条**返回的：
+ * ioredis 把每一条的结果放进 `[err, res][]`，并且**整体 resolve**（不 reject）。
+ * 于是「`await` 了就以为写成功了」的实现会把一个**没有 TTL 的会话哈希**留在 Redis 里：
+ * C13 的「空闲 7 天过期」在这条记录上变成**永不过期**，而外部表现完全正常
+ * （会话一直有效、没有任何报错）——正是本仓库反复抓到的那种静默失效。
+ *
+ * 因此判据是「**每一条**都没有错误」，而不是「`exec()` 没有 reject」。
+ * `exec()` 返回 `null` 表示事务被**中止**（排队期就失败了，例如 EXECABORT），
+ * 同样不能当成成功。
+ *
+ * ## 为什么错误消息里**不含** `sessionId`
+ *
+ * 它就是完整的 bearer 凭证（见类注释），而这个异常会一路冒到调用方、多半会被记进日志。
+ * 没有 id 也完全能排查：这条路径失败的原因在 Redis 那一侧（OOM/ROLE/类型），
+ * 与是哪个会话无关。
+ */
+function assertSessionWriteApplied(results: [Error | null, unknown][] | null): void {
+  if (results === null) {
+    throw new Error(
+      '会话写入未生效：MULTI/EXEC 被中止（事务里至少有一条命令在排队期就失败了）。' +
+        '按失败处理，避免留下没有 TTL 的会话记录。',
+    );
+  }
+  const failedAt = results.findIndex(([err]) => err !== null && err !== undefined);
+  if (failedAt >= 0) {
+    const err = results[failedAt]?.[0];
+    const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    throw new Error(
+      `会话写入未生效：MULTI 里第 ${failedAt + 1} 条命令执行失败（${detail}）。` +
+        '这条记录可能只写了一半（例如哈希写进去了、TTL 没设上），因此按失败处理——' +
+        '一个没有过期的会话永远不会被 C13 的空闲 7 天回收。',
+    );
+  }
+}
+
+/**
  * 服务端会话（C13 / §4.2）。
  *
  * ## 为什么是服务端会话而不是自包含令牌
@@ -57,7 +98,12 @@ export class SessionService {
     // 它**永不过期**，于是 C13 的「空闲 7 天」在这条记录上静默失效，
     // 而外部表现（会话一直有效）看起来完全正常，不会有任何报错。
     // `multi().exec()` 把两者包进一个 MULTI/EXEC 事务：要么都生效，要么都不生效。
-    await this.redis
+    //
+    // **但执行期的失败是逐条返回的**（修复轮 4 / I-5）：ioredis 对 `[err, res][]` 里的错误
+    // 是 **resolve** 而不是 reject，因此结果必须被逐条检查，否则 OOM/READONLY/WRONGTYPE
+    // 会留下一个**没有 TTL 的会话哈希**（永不过期，且没有任何报错）。判据见
+    // `assertSessionWriteApplied`。
+    const applied = await this.redis
       .multi()
       .hset(KEY(sessionId), {
         userId,
@@ -67,6 +113,7 @@ export class SessionService {
       })
       .expire(KEY(sessionId), IDLE_TTL_SECONDS)
       .exec();
+    assertSessionWriteApplied(applied);
     return { sessionId };
   }
 

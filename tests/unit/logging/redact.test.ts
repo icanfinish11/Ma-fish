@@ -222,6 +222,36 @@ describe('日志脱敏（C11 / 威胁 #15）', () => {
   });
 
   /**
+   * 读键抛出的异常必须**原样**冒出去（最终评审的 Minor）。
+   *
+   * 上一版的 `redact` 把钩子写成 `() => undefined`，而钩子的返回值会被 `readKey`
+   * **`throw` 出去**——也就是说它抛的是 `undefined`：调用方拿到一个没有 message、
+   * 没有 stack、连 `instanceof Error` 都不成立的值，`catch (e) { logger.error(e) }`
+   * 里什么都读不出来。「抛过了」只是把「吞掉错误」换了个包装。
+   *
+   * 断的是**同一个引用**而不是「有没有抛」：`toThrow()` 对 `throw undefined` 的行为
+   * 取决于断言库的实现（Vitest 会把它当成「什么都没抛」以外的情形），
+   * 而 `toBe(boom)` 是逐字的要求。
+   */
+  it('读键时抛出的异常原样冒出去（不是 throw undefined）', () => {
+    const boom = new Error('getter 爆炸');
+    const hostile = {
+      get boom(): string {
+        throw boom;
+      },
+    };
+
+    let caught: unknown;
+    try {
+      redact({ hostile });
+    } catch (err: unknown) {
+      caught = err;
+    }
+
+    expect(caught, 'redact 抛出的不是原始错误对象（`() => undefined` 钩子会抛 undefined）').toBe(boom);
+  });
+
+  /**
    * `scrubEmails`：C11 的**字符串**那一层（修复轮 1 / Fix 2 把它搬到本模块）。
    *
    * 为什么它必须在这里有直接的用例：它此前是 `apps/worker/src/worker.ts` 的私有函数，
@@ -294,6 +324,28 @@ describe('日志脱敏（C11 / 威胁 #15）', () => {
         'victim@example.com',
       );
       expect(scrubEmails('MAILTO:Victim@Example.com')).toBe('MAILTO:V***@Example.com');
+    });
+
+    /**
+     * **Unicode 空白也是边界**（最终评审的 Minor）。
+     *
+     * 分隔符集合曾经是一份 ASCII 清单，注释还写着「与旧正则的字符类逐字对应」——
+     * 但旧正则里是 `\s`，它是 Unicode 感知的。于是 `\u00A0`（不间断空格，中文排版里很常见）
+     * 被当成了地址字符：向左扫描一路吃掉前缀，输出变成 `请***@example.com`，
+     * `联系` 与那个空格一起静默消失。方向是 fail-closed（多掩了、没漏），
+     * 但日志丢了上下文同样是缺陷。
+     */
+    it('Unicode 空白算边界：前缀不会被吃进 local-part（不过度掩码）', () => {
+      const NBSP = '\u00A0'; // U+00A0 不间断空格
+      const IDEOGRAPHIC = '\u3000'; // U+3000 全角空格
+
+      expect(
+        scrubEmails(`请联系${NBSP}support@example.com`),
+        '不间断空格被当成了地址字符：前缀被一起掩掉（日志文本丢失）',
+      ).toBe(`请联系${NBSP}s***@example.com`);
+      expect(scrubEmails(`甲${IDEOGRAPHIC}user@example.com`)).toBe(`甲${IDEOGRAPHIC}u***@example.com`);
+      // 反向：ASCII 空白的行为不变（回归）
+      expect(scrubEmails('contact support@example.com')).toBe('contact s***@example.com');
     });
   });
 });

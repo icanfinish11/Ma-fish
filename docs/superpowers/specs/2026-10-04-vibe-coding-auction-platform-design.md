@@ -496,7 +496,7 @@ vibe-coding-auction-web/
 | Prisma / Client | **7.10.0（两侧同版本）** | ⚠️ `prisma@latest` 目前指向**预发布** `8.0.0-rc.19`，而 `@prisma/client@latest` 是 `7.10.0`。必须硬锁，禁止使用 RC |
 | PostgreSQL / Redis | 16 / 7 | |
 | Vitest | 5.0.3 | 原生支持 `emitDecoratorMetadata`，**无需 `unplugin-swc`** |
-| Testcontainers | 12.2.0 | |
+| Testcontainers | **12.0.4**（`@testcontainers/postgresql`/`-redis` 12.0.4）| ⚠️ 经 `pnpm-workspace.yaml` 的 `overrides` 强制。传递依赖会解析到 12.2.0，而 12.2.0 声明 `engines.node >= 22.22`，高于本仓 22.19.0 的下限；若将来升到 12.1+，必须同时抬高 `engines.node` |
 | ioredis | 6.0.0 | ⚠️ 是 CJS，必须用具名导入 `import { Redis } from 'ioredis'` |
 | `@node-rs/argon2` | 2.2.1 | 预编译，无需构建工具链 |
 
@@ -563,6 +563,7 @@ vibe-coding-auction-web/
 | 是否引入 Gitea / git push 协作 | P5 之后（首次创作者访谈完成后） | 创作者访谈结果 |
 | 高级检索（独立搜索引擎） | 视数据量 | 全文检索性能瓶颈是否出现 |
 | 自动截图沙箱 | P9 之后（需独立立项） | 是否必须自动化，且能否满足隔离要求 |
+| **GitHub OAuth 完整授权流** | **P1（与「发布」同批）** | P0 只交付了 `GithubOauthService`（授权 URL、PKCE、state 生成、令牌交换）及其单元测试。**尚缺**：`/auth/github` 与 `/auth/github/callback` 两条路由、`state` 与 PKCE verifier 的短期 Redis 存储、以及 `Identity` 表的写入方（`auth.identities` 至今无任何写入者）。因此 §4.2 的「校验 `state` 与 `nonce`」与 D4「发布者必须绑定 GitHub OAuth」在 P0 结束时**尚未在实质上满足**。延后理由：P0 没有发布功能，这道门暂时无物可守，为无消费者的流程建路由属于 §2.2 禁止的空抽象。**必须在 P1 落地，届时 D4 的门槛才成立。** |
 
 ---
 

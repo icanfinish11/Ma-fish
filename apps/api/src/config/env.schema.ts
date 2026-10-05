@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { DEFAULT_TRUST_PROXY } from '../common/security/trust-proxy.js';
 
 /**
  * 一律拒绝的占位值（威胁 #15）。两层判定：
@@ -10,8 +11,8 @@ import { z } from 'zod';
  *    只收「一旦出现就绝无可能属于真实密钥」的占位家族词。
  *
  * **两层的分工（判据是「结果」而非「先后」）**：`nonPlaceholder` 是 `.pipe` 的**左侧**，
- * 因此它先执行，一旦命中就短路掉下游，报错文案也由它给出。但对 `SESSION_SECRET`
- * （下游 ≥ 32）与 `MASTER_ENCRYPTION_KEY`（下游 64 位 hex）而言，逐字相等层命中的每个词
+ * 因此它先执行，一旦命中就短路掉下游，报错文案也由它给出。但对
+ * `MASTER_ENCRYPTION_KEY`（下游 64 位 hex）而言，逐字相等层命中的每个词
  * 都**同时**被下游拒绝，所以第 1 层**不改变接受/拒绝的结果，只改变报错文案**。
  * 第 1 层真正承担结果的是 `GITHUB_CLIENT_SECRET`（下游只有 `min(1)`）：`test`、`secret`、
  * `password`、`xxx` 这类词**只**被逐字相等层拦住。
@@ -20,6 +21,17 @@ import { z } from 'zod';
  * 归一化后是 `change_me`——它在 `PLACEHOLDER_SUBSTRINGS` 里，却**不在** `PLACEHOLDERS` 里
  * （那里只有 `changeme` 与 `change-me`）。拦住模板自身这个值的是**子串层**：
  * 删掉子串层就会重新放行它，切勿因为「有逐字相等层」而删。
+ *
+ * ## `SESSION_SECRET` 曾经在这里，现已删除（最终评审 I-2）
+ *
+ * 它曾是本层的第三个字段（`min(32)`），但**全仓没有任何读取方**：会话是
+ * 「服务端随机 id + Redis 状态」的形态（`modules/auth/session.service.ts` 说明了为什么
+ * 刻意不自包含签名令牌），CSRF 是**不签名**的双提交令牌——两者都不需要服务器密钥。
+ * 一个「必填、且什么都不保护」的密钥是**双重**错误：它是 C16 说的空抽象，
+ * 同时给运维一个错误的保证（设了它以为保护了什么）。因此删除而不是给它找一个用途
+ * （唯一的「用途」会把上面两条设计改成签名方案——那是另一个决定，不是一次修复）。
+ * 上面清单里那些通用占位词仍然有活的看守者：`GITHUB_CLIENT_SECRET` 只有 `min(1)`，
+ * 逐字相等层与子串层都在它身上承重（回归见 `placeholder-rejection.test.ts`）。
  *
  * 刻意**不**把 `secret` / `password` / `test` 这类通用标识词放进 PLACEHOLDER_SUBSTRINGS：
  * 它们会命中 `GITHUB_CLIENT_SECRET`、`X_TEST_TOKEN` 等合法密钥，造成误拒。
@@ -44,7 +56,7 @@ const PLACEHOLDER_SUBSTRINGS = [
 /**
  * 占位值拒绝层。**使用边界（硬性约定，不可扩大）：只允许用于「密钥」字段。**
  *
- * 当前恰好用在三个字段上：`SESSION_SECRET`、`MASTER_ENCRYPTION_KEY`、`GITHUB_CLIENT_SECRET`。
+ * 当前恰好用在两个字段上：`MASTER_ENCRYPTION_KEY`、`GITHUB_CLIENT_SECRET`。
  *
  * 为什么不能用于非密钥字段：上面的清单含 `example`、`todo` 这类**通用词**，
  * 而合法配置里出现它们完全正常，例如 `MAIL_FROM=no-reply@example.com`、
@@ -73,7 +85,16 @@ export const envSchema = z.object({
   DATABASE_URL: z.string().url(),
   REDIS_URL: z.string().url(),
 
-  SESSION_SECRET: nonPlaceholder('SESSION_SECRET').pipe(z.string().min(32)),
+  /**
+   * express 的 `trust proxy`（最终评审 I-6）。
+   *
+   * 默认值来自 `common/security/trust-proxy.ts` 的 {@link DEFAULT_TRUST_PROXY}——
+   * **单一来源**：解析函数与 schema 默认值用的是同一个常量（有常驻断言钉住二者一致，
+   * 见 `tests/security/trust-proxy.test.ts`）。校验**不**在这里做（这里只声明「它是个字符串」），
+   * 因为可接受取值的清单与解析逻辑同属一处：`parseTrustProxy()`，它在启动期抛错。
+   */
+  TRUST_PROXY: z.string().default(DEFAULT_TRUST_PROXY),
+
   /** AES-256-GCM 主密钥：32 字节 = 64 位 hex。绝不入库不入 git（C10）。 */
   MASTER_ENCRYPTION_KEY: nonPlaceholder('MASTER_ENCRYPTION_KEY').pipe(
     z.string().regex(/^[0-9a-fA-F]{64}$/, 'MASTER_ENCRYPTION_KEY 必须是 64 位十六进制（32 字节）'),

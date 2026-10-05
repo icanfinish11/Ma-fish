@@ -14,7 +14,7 @@ import { buildSmtpTransportOptions } from '@vca/api/modules/notify/smtp-mailer.j
  *
  * ## 为什么需要一个专门的用例（而不是只在集成用例里测行为）
  *
- * 真正的生产数字是分钟级（连接 15 秒 / socket 空闲 20 秒 / 事务 2 分钟），用例不可能真等
+ * 真正的生产数字是分钟级（连接 15 秒 / 问候 15 秒 / socket 空闲 20 秒 / 事务 200 秒），用例不可能真等
  * 那么久，因此集成用例用**同比例缩小**的数字测「慢投递不产生重复」（见
  * `tests/integration/notify/outbox.test.ts` 的「慢投递」两条）。缩小的代价是：
  * 那两条用例证明的是**机制**，不是**参数**。
@@ -36,9 +36,19 @@ describe('超时预算（Fix 2：事务超时必须大于邮件最坏耗时）',
       '事务超时没有大于邮件最坏耗时：一次成功的慢投递会被回滚并重发（重复邮件）',
     ).toBeGreaterThan(MAILER_WORST_CASE_MS);
 
-    // 余量：不只是「大一点点」。真实数字是 6 倍（120s / 20s+15s+15s ⇒ 120s/50s），
-    // 这里按 ≥ 2 倍断言，给将来调参留出空间但不允许把关系调成贴边。
-    expect(TRANSACTION_TIMEOUT_MS).toBeGreaterThanOrEqual(2 * MAILER_WORST_CASE_MS);
+    // 余量：不只是「大一点点」。当前取值下它恰好是 **4 倍**，数字与推导见
+    // `common/timeouts.ts` 里 `TRANSACTION_TIMEOUT_MS` 的注释：
+    // `max(4 × MAILER_WORST_CASE_MS, 60_000)` = `max(200_000, 60_000)` = **200_000**。
+    //
+    // 这里按 ≥ 2 倍断言，给将来调参留出空间但不允许把关系调成贴边。**据实记录这条断言的
+    // 边界**（最终评审 I-4）：它**发现不了**「注释里的倍数写错」这类漂移——上一版注释写的是
+    // 「120_000 / 2.4 倍」，而 200_000 照样满足 ≥2 倍，于是错了一个版本都没人发现。
+    // 因此下面把**实际倍率**放进断言消息里：数字一旦变化，运行输出里就能看见真值。
+    expect(
+      TRANSACTION_TIMEOUT_MS,
+      `事务超时与邮件最坏耗时的实际余量只有 ${(TRANSACTION_TIMEOUT_MS / MAILER_WORST_CASE_MS).toFixed(2)} 倍` +
+        `（${TRANSACTION_TIMEOUT_MS}ms / ${MAILER_WORST_CASE_MS}ms）：贴边的关系会在真实 SMTP 变慢时发作`,
+    ).toBeGreaterThanOrEqual(2 * MAILER_WORST_CASE_MS);
   });
 
   it('邮件最坏耗时就是三个显式超时之和（不是随便写的常量）', () => {

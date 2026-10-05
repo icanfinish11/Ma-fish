@@ -6,6 +6,9 @@ import pino from 'pino';
 import { AppModule } from './app.module.js';
 import { buildLoggerOptions } from './common/logging/logger.module.js';
 import { applySecurityMiddleware } from './common/security/security-stack.js';
+import { parseTrustProxy, type TrustProxyValue } from './common/security/trust-proxy.js';
+import { PrismaService } from './db/prisma.service.js';
+import { assertRuntimeDbRole } from './db/runtime-role.js';
 
 /**
  * 引导层（**不在 brief 的 Step 5 里，是 Ruling 3 要求的补齐**）。
@@ -134,22 +137,34 @@ export interface RunBootstrapOptions {
  *    行为不变（仍在 `listen()` 之前），改的只是解释。
  * 2. **`applySecurityMiddleware`** —— 与测试**同一个函数**（Ruling 4），
  *    因此「安全头/CSRF 只读 cookie」这件事在两边不可能漂移。
- * 3. **`trust proxy = 1`** —— Nginx 反代后 `req.ip` 才是真实客户端 IP。
- *    不设它时 express 把 Nginx 的地址当客户端，于是**所有用户共用一个限流桶**：
- *    登录层（5 次/15 分钟）会变成全站共享配额，属自伤级故障（详见报告 §trust proxy）。
- *    代价（如实记录）：`X-Forwarded-For` 变成**可伪造**的——只有当应用**只**能从
- *    受信反代进来时 `1`（信任一跳）才是正确取值；直连暴露的部署必须把它调成
- *    `false`/具体网段，否则攻击者可以用 XFF 伪造 IP 绕过 IP 维度的限流。
+ * 3. **`trust proxy`（最终评审 I-6：从无条件改成配置驱动）** —— 取值来自
+ *    `TRUST_PROXY`（默认 `loopback`，解析与理由见 `common/security/trust-proxy.ts`）。
+ *    Nginx 反代后 `req.ip` 才是真实客户端 IP；而不设它时 express 把 Nginx 的地址当客户端，
+ *    于是**所有用户共用一个限流桶**：登录层（5 次/15 分钟）会变成全站共享配额，
+ *    属自伤级故障（详见报告 §trust proxy）。
+ *
+ *    这里**不再**无条件写 `1`：`1`（信任一跳 XFF）只有在「应用只能从受信反代进来」时才对，
+ *    而那条前提在本仓库里没有任何东西在检查（`infra/nginx/nginx.conf` 并不存在）。
+ *    默认值 `loopback` 保留同机反代场景的可用性，同时让**远端直连**的客户端伪造不了
+ *    `X-Forwarded-For`（它的 socket 对端不是回环地址）——IP 维度的限流因此不再取决于
+ *    一句口头承诺。反代在别的网段时必须显式配 `TRUST_PROXY`，代价（桶被合并）写在解析函数里。
  * 4. **`enableShutdownHooks`** —— SIGTERM 时关连接（Redis/Prisma）再退出。
+ *
+ * `configureApp` **之后**、`listen()` **之前**还有一步（C-2）：**运行期数据库角色检查**
+ * （`assertRuntimeDbRole`，见 `db/runtime-role.ts`）。它必须在 `listen()` 之前——
+ * 失误的部署（`DATABASE_URL` 指向迁移属主）要在能服务任何请求**之前**就退出。
  */
-export function configureApp(app: INestApplication, options: { isProduction: boolean }): void {
+export function configureApp(
+  app: INestApplication,
+  options: { isProduction: boolean; trustProxy: TrustProxyValue },
+): void {
   app.useLogger(app.get(PinoLogger));
   applySecurityMiddleware(app, options);
   // `set()` 只存在于 `NestExpressApplication` 的类型面上（Nest 12 的 `INestApplication`
   // 没有它，只有 use/enableCors/useSecurityHeaders/enableCsrfProtection/…）。
   // 运行期对象一定是 express 应用：`NestFactory.create` 与 `createNestApplication`
   // 在 Express 适配器下产出的就是它。这一处类型逃逸是**刻意**的，且只有一处。
-  (app as NestExpressApplication).set('trust proxy', 1);
+  (app as NestExpressApplication).set('trust proxy', options.trustProxy);
   app.enableShutdownHooks();
 }
 
@@ -183,7 +198,20 @@ export async function bootstrap(
   // 「`listen()` 失败时拿不到句柄」是同一个形状，只是触发点更早）。
   // 代价为零：`close()` 在 `configureApp` 失败时本来就该跑（连接已经建了）。
   onReady?.(app);
-  configureApp(app, { isProduction: process.env.NODE_ENV === 'production' });
+  configureApp(app, {
+    isProduction: process.env.NODE_ENV === 'production',
+    // 与 `PORT` / `NODE_ENV` 一样在引导期直读 `process.env`：`ConfigModule` 的校验发生在
+    // 模块求值期（`app.module.ts`），这里读到的已经是被校验/加载过的那份环境
+    // （`.env` 在 forRoot 时被 dotenv 写入 process.env）。取值本身在 `parseTrustProxy`
+    // 里校验，坏取值在这里**启动期**抛错，而不是每个请求上抛。
+    trustProxy: parseTrustProxy(process.env.TRUST_PROXY),
+  });
+  // **运行期数据库角色检查**（C-2）：连上的角色若能改动审计表（属主/超级用户/被误授
+  // UPDATE、DELETE），append-only 的撤权就是空操作，这里直接拒绝启动。
+  // 「连不上」不拒绝（见 `db/runtime-role.ts` 的边界说明），只经应用 logger 记一行。
+  await assertRuntimeDbRole(app.get(PrismaService), {
+    onUnverifiable: (fields, message) => app.get(PinoLogger).warn(fields, message),
+  });
   await app.listen(Number(process.env.PORT ?? 3000));
   return app;
 }

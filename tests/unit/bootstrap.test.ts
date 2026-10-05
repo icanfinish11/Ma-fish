@@ -6,6 +6,8 @@ import request from 'supertest';
 import { Logger as NestLogger } from '@nestjs/common';
 import { Logger as PinoLogger } from 'nestjs-pino';
 import { bootstrap, runBootstrap, type BootstrapLogger } from '@vca/api/bootstrap.js';
+import { PrismaService } from '@vca/api/db/prisma.service.js';
+import { RuntimeDbRoleError } from '@vca/api/db/runtime-role.js';
 
 /**
  * 引导期的三件事（Ruling 3；第三条是**修复轮 2** 补的）。
@@ -66,8 +68,24 @@ const APP_DIR = path.dirname(ENTRY);
  */
 const CHILD_EXIT_TIMEOUT_MS = 30_000;
 
+/**
+ * 一条**合格**的运行期角色行（C-2）。多个假应用都要用它：
+ * 引导期现在会先跑角色检查，返回不合格的行会让引导在那里就断掉，
+ * 于是那些「本该走到 listen 再失败」的用例会以另一种理由变红。
+ */
+const HEALTHY_ROLE_ROW = {
+  role: 'app_user',
+  role_is_superuser: false,
+  role_bypasses_rls: false,
+  audit_table_missing: false,
+  can_update_audit: false,
+  can_delete_audit: false,
+  audit_table_owner: 'vca_owner',
+} as const;
+
 describe('引导期（Ruling 3）', () => {
   const savedPort = process.env.PORT;
+  const savedTrustProxy = process.env.TRUST_PROXY;
   const savedExitCode = process.exitCode;
 
   afterEach(() => {
@@ -76,6 +94,10 @@ describe('引导期（Ruling 3）', () => {
     // 仍可能碰它，污染整个 vitest 进程的退出码。）
     if (savedPort === undefined) delete process.env.PORT;
     else process.env.PORT = savedPort;
+    // `TRUST_PROXY` 同理：它是**引导期直读**的变量，用例改过就必须还原，
+    // 否则同一个 worker 里后续的真实引导会拿到别的取值。
+    if (savedTrustProxy === undefined) delete process.env.TRUST_PROXY;
+    else process.env.TRUST_PROXY = savedTrustProxy;
     process.exitCode = savedExitCode;
     vi.restoreAllMocks();
   });
@@ -106,7 +128,12 @@ describe('引导期（Ruling 3）', () => {
       // `enableShutdownHooks`。这里全部记账，这样「接线在 listen 之前」这件事也被钉住
       // （反了的话 `useLogger` 就来不及接住 `init()` 冲出来的缓冲日志，
       // 见 `configureApp` 里更正后的那条说明）。
-      get: () => ({ log: () => undefined }),
+      //
+      // **`get(PrismaService)` 必须回一个健康的角色行**（C-2 起）：引导期会先跑运行期
+      // 角色检查，回一个不合格的行会让引导**在这里**就断掉——那时本用例测的就不再是
+      // 「listen 失败」这条路径了（实测踩到过：`listen` 一次都没被调用，断言直接红）。
+      get: (token: unknown) =>
+        token === PrismaService ? { $queryRaw: async () => [HEALTHY_ROLE_ROW] } : { log: () => undefined },
       useLogger: () => order.push('useLogger'),
       use: () => order.push('use'),
       set: () => order.push('set'),
@@ -175,7 +202,9 @@ describe('引导期（Ruling 3）', () => {
     };
     const exit = vi.fn();
     const neverClosing = {
-      get: () => ({ assigned: true }),
+      // 同前：角色检查要拿到一条合格的行，否则引导会在到达 `listen()` 之前就结束。
+      get: (token: unknown) =>
+        token === PrismaService ? { $queryRaw: async () => [HEALTHY_ROLE_ROW] } : { assigned: true },
       useLogger: () => undefined,
       use: () => undefined,
       set: () => undefined,
@@ -250,6 +279,172 @@ describe('引导期（Ruling 3）', () => {
     expect(exit, '接线抛错后必须请求以码 1 退出').toHaveBeenCalledWith(1);
   });
 
+  it('真实的接线失败（无法解析的 TRUST_PROXY）拒绝启动：不 listen、以码 1 退出', async () => {
+    // I-6：可接受取值的校验发生在**启动期**。交给 express 的话，
+    // `proxyaddr.compile(['prox'])` 在**每个请求**上抛 ⇒ 全站 500 而不是一次起不来。
+    // 这里用假应用（不真监听端口），因为要观察的正是「还没走到 listen」。
+    process.env.TRUST_PROXY = 'prox';
+    const order: string[] = [];
+    const app = {
+      get: () => ({ log: () => undefined }),
+      useLogger: () => order.push('useLogger'),
+      use: () => order.push('use'),
+      set: () => order.push('set'),
+      enableShutdownHooks: () => order.push('enableShutdownHooks'),
+      listen: () => {
+        order.push('listen');
+        return Promise.resolve();
+      },
+      close: () => Promise.resolve(),
+    };
+    const logged: Array<{ obj: unknown; msg: unknown }> = [];
+    const logger: BootstrapLogger = {
+      error: (obj: unknown, msg?: string) => {
+        logged.push({ obj, msg });
+      },
+      flush: () => undefined,
+    };
+    const exit = vi.fn((code: number) => {
+      order.push(`exit:${code}`);
+    });
+
+    await runBootstrap({
+      createApp: () => Promise.resolve(app as never),
+      logger,
+      exit,
+    });
+
+    expect(order, 'listen 被调用了：坏配置应当在监听之前就把引导打断').not.toContain('listen');
+    expect(order, '连 set 都不该跑到：取值解析在 configureApp 之前').not.toContain('set');
+    expect(exit, '坏配置没有让进程以非零码退出：编排会把它当成一次成功的启动').toHaveBeenCalledWith(1);
+    const err = (logged[0]?.obj as { err?: Error } | undefined)?.err;
+    expect(String(err?.message), '失败原因里没有点名 TRUST_PROXY').toContain('TRUST_PROXY');
+  });
+
+  it('TRUST_PROXY=false 时真实引导把「谁都不信」应用到 express（配置是活的，不是装饰）', async () => {
+    // 与上一条同一个真实引导路径，只改一个环境变量。判据落在**编译后的判据函数**上：
+    // 直连部署要求任何来源的 XFF 都不影响 `req.ip`（包括回环——那种部署里没有反代）。
+    process.env.PORT = '0';
+    process.env.TRUST_PROXY = 'false';
+    const app = await bootstrap();
+    try {
+      const express = app.getHttpAdapter().getInstance() as { get(setting: string): unknown };
+      expect(express.get('trust proxy')).toBe(false);
+      const trustFn = express.get('trust proxy fn') as (addr: string, i: number) => boolean;
+      expect(trustFn('127.0.0.1', 0), 'false 之下仍信任了某个来源：配置没有生效').toBe(false);
+      expect(trustFn('203.0.113.7', 0), 'false 之下仍信任了远端来源').toBe(false);
+    } finally {
+      await app.close();
+    }
+  });
+
+  /**
+   * **运行期数据库角色检查的接线**（最终评审 C-2）。
+   *
+   * 检查逻辑本身在真库上取证（`tests/integration/db/runtime-role.test.ts`：app_user 通过、
+   * vca_owner 被拒）。这里要证明的是**另一件事**：`bootstrap()` 真的会调用它，
+   * 而且失败时**不会走到 `listen()`**——否则那个检查就是一段没人执行的代码
+   * （「声明了但没在执行」正是本仓库反复抓到的形态）。
+   *
+   * 替身返回的是**违规行**而不是抛一个现成的错：这样跑的仍是真实的判定逻辑
+   * （`role_is_superuser` / `can_update_audit` 那两条判据）。
+   */
+  it('运行期角色不合格（DATABASE_URL 指向属主）时拒绝启动：不 listen、关掉应用、以码 1 退出', async () => {
+    const order: string[] = [];
+    const app = {
+      get: (token: unknown) =>
+        token === PrismaService
+          ? {
+              $queryRaw: async (): Promise<unknown[]> => [
+                {
+                  role: 'vca_owner',
+                  role_is_superuser: true,
+                  role_bypasses_rls: false,
+                  audit_table_missing: false,
+                  can_update_audit: true,
+                  can_delete_audit: true,
+                  audit_table_owner: 'vca_owner',
+                },
+              ],
+            }
+          : { log: () => undefined, warn: () => undefined },
+      useLogger: () => order.push('useLogger'),
+      use: () => order.push('use'),
+      set: () => order.push('set'),
+      enableShutdownHooks: () => order.push('enableShutdownHooks'),
+      listen: () => {
+        order.push('listen');
+        return Promise.resolve();
+      },
+      close: () => {
+        order.push('close');
+        return Promise.resolve();
+      },
+    };
+    const logged: Array<{ obj: unknown; msg: unknown }> = [];
+    const logger: BootstrapLogger = {
+      error: (obj: unknown, msg?: string) => logged.push({ obj, msg }),
+      flush: () => undefined,
+    };
+    const exit = vi.fn((code: number) => order.push(`exit:${code}`));
+
+    await runBootstrap({ createApp: () => Promise.resolve(app as never), logger, exit });
+
+    expect(order, '角色检查不过关却仍然监听了端口：失误的部署会正常服务请求').not.toContain('listen');
+    expect(order, '应用已经建好（连接池已创建），却被晾在那里').toContain('close');
+    expect(order.indexOf('close'), 'close 必须在 exit 之前').toBeLessThan(order.indexOf('exit:1'));
+    expect(exit, '角色检查不过关后没有以非零码退出').toHaveBeenCalledWith(1);
+
+    const err = (logged[0]?.obj as { err?: unknown } | undefined)?.err;
+    expect(err, '抛出的不是 RuntimeDbRoleError：调用方无法把「配置错误」与「连接故障」区分开').toBeInstanceOf(
+      RuntimeDbRoleError,
+    );
+    expect(String((err as Error).message), '失败信息里没有点名 DATABASE_URL').toContain('DATABASE_URL');
+  });
+
+  /**
+   * 边界的**正向**一面：**连不上库时不拒绝启动**（最终评审 C-2 的裁定，写进用例防止被「顺手改成 fail-closed」）。
+   *
+   * 理由（见 `db/runtime-role.ts` 文件头）：本应用按设计允许「先起来、库稍后可用」，
+   * 而引导期的既有用例（端口被占的子进程用例、真实引导用例）都跑在**没有数据库**的环境里。
+   * 把「连不上」变成拒绝启动会改掉那条语义，也会让那些用例红。
+   * 方向仍然是安全的：库连不上时应用什么也做不了；**一旦连上就一定会被检查**。
+   */
+  it('角色检查无法完成（连不上库）时不拒绝启动，但要留下一条 warn', async () => {
+    const order: string[] = [];
+    const warned: Array<{ fields: unknown; message: string }> = [];
+    const app = {
+      get: (token: unknown) =>
+        token === PrismaService
+          ? {
+              $queryRaw: async (): Promise<unknown[]> => {
+                throw new Error('connect ECONNREFUSED 127.0.0.1:5432');
+              },
+            }
+          : {
+              log: () => undefined,
+              warn: (fields: unknown, message: string) => warned.push({ fields, message }),
+            },
+      useLogger: () => undefined,
+      use: () => undefined,
+      set: () => undefined,
+      enableShutdownHooks: () => undefined,
+      listen: () => {
+        order.push('listen');
+        return Promise.resolve();
+      },
+      close: () => Promise.resolve(),
+    };
+    const logger: BootstrapLogger = { error: () => undefined, flush: () => undefined };
+
+    await runBootstrap({ createApp: () => Promise.resolve(app as never), logger, exit: vi.fn() });
+
+    expect(order, '连不上库时拒绝启动了：这条边界是刻意选的，见用例说明').toContain('listen');
+    expect(warned, '「检查没能完成」这件事没有留下任何记录：降级是静默的').toHaveLength(1);
+    expect(warned[0]?.message).toContain('未能完成');
+    expect(warned[0]?.message).toContain('ECONNREFUSED');
+  });
+
   it('真实引导路径：安全头到位、trust proxy 就位、Nest 框架 logger 接进 pino', async () => {
     process.env.PORT = '0'; // 随机端口：不占用固定端口，也不与开发者本机的服务抢
     const app = await bootstrap();
@@ -261,11 +456,24 @@ describe('引导期（Ruling 3）', () => {
       expect(res.headers['content-security-policy']).toContain("'nonce-");
       expect(res.headers['x-content-type-options']).toBe('nosniff');
 
-      // `trust proxy = 1`：Nginx 反代后 `req.ip` 才是**真实客户端 IP**。
-      // 不设它时 express 会把 Nginx 的地址当客户端——所有用户共用一个限流桶
-      // （登录 5 次/15 分钟会变成全站共享，属自伤级故障），因此这里直接断言接线。
+      // `trust proxy`：**配置驱动**（I-6），不再是硬编码的 `1`。
+      // 夹具里 `TRUST_PROXY=loopback`（最窄的一档：只信任同机反代），因此这里断言的就是
+      // 它被真的应用到了 express 上——「默认值最窄」这件事只有在引导路径上验证过才算数。
+      // 各档取值的解析由 `tests/security/trust-proxy.test.ts` 覆盖；相邻那条
+      // 「TRUST_PROXY=false」的用例会在**同一条真实引导路径**上再跑一遍，证明它是活的配置。
       const express = app.getHttpAdapter().getInstance() as { get(setting: string): unknown };
-      expect(express.get('trust proxy')).toBe(1);
+      expect(express.get('trust proxy')).toEqual(['loopback']);
+
+      // `trust proxy fn` 是 express 在 `set('trust proxy', v)` 时**编译出来的那个函数**，
+      // 即 `req.ip` 真正的判据（`application.js` 的 setter 里 `compileTrust(val)`）。
+      // 断言它而不是只断言设置值：设置对了但没被编译/生效的情况在这里会红。
+      const trustFn = express.get('trust proxy fn') as (addr: string, i: number) => boolean;
+      expect(typeof trustFn, 'express 没有把 trust proxy 编译成判据函数').toBe('function');
+      expect(trustFn('127.0.0.1', 0), '同机反代（回环）没有被信任：XFF 会被忽略，限流桶被合并').toBe(true);
+      expect(
+        trustFn('203.0.113.7', 0),
+        '远端客户端被信任了：它可以用 X-Forwarded-For 换一个限流桶（I-6 要消灭的形态）',
+      ).toBe(false);
 
       // Nest 的**静态** logger（框架自己用的那条路径）必须把消息交给 nestjs-pino 的 Logger。
       // 少了 `app.useLogger` 时，消息会走 ConsoleLogger 直接写 stdout——下面的 spy 就不会被调用，

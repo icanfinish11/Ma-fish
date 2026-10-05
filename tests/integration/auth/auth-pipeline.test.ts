@@ -17,6 +17,7 @@ import type { User } from '@vca/api/generated/prisma/client.js';
 import { createTestApp } from '../../helpers/app.js';
 import { csrfHeaders, fetchCsrfToken } from '../../helpers/csrf.js';
 import { disableRateLimit } from '../../helpers/rate-limit.js';
+import { startPostgres, type TestPg } from '../../helpers/db.js';
 
 /**
  * 认证管线的**端到端接线**验证（本任务 Step 0 的交付物，不在 brief 里）。
@@ -884,5 +885,98 @@ describe('AuditService（Ruling 1：本任务交付的最小实现）', () => {
     } finally {
       await teardown(app, container);
     }
+  }, 180_000);
+});
+
+/**
+ * **认证管线 × 真 Postgres**（最终评审 I-1）。
+ *
+ * ## 为什么必须补这一条
+ *
+ * 上面那套用例把 `PrismaService` 整个换成了内存假实现——那让「审计写了什么」变得可断言，
+ * 代价是**没有一条认证路径**碰过真库：唯一约束是假实现自己抛的 `P2002`，
+ * 审计行的 INSERT 是数组 `push`。于是两件真库才有的事实从来没被这条链路验证过：
+ *
+ * 1. **`app_user` 的 INSERT 授权真的够用**（`apply-grants.sql` 只给了 `SELECT, INSERT`）；
+ * 2. **真实的唯一约束**会把并发/重复注册变成 `P2002`（假实现是手搓的同一个 code）。
+ *
+ * 本 describe 因此把 `PrismaService` 换成指向 testcontainer 的 **`app_user`** 连接
+ * （`startPostgres()` 已经跑完「建角色 → 迁移 → 授权」三步），其余全部是真的：
+ * 真的 HTTP 管线、真的 Argon2id、真 Redis 会话、真的审计写入。
+ *
+ * ## 边界（不重复上面那套）
+ *
+ * 它**不**重测假实现覆盖的那些编排细节（会话 cookie 标志、计时侧信道、400/403 措辞…），
+ * 只补「真库」这一维：注册落库 + 审计行真的写进了 `audit.audit_logs`、重复注册由
+ * PostgreSQL 的唯一约束拒绝、以及**同一条连接改不动那行审计**（append-only 的另一半）。
+ */
+describe('认证管线 × 真 Postgres（I-1：真实唯一约束与 append-only 授权）', () => {
+  let pg: TestPg;
+  let container: StartedRedisContainer;
+  let redisClient: Redis;
+  let app: INestApplication;
+  let prisma: PrismaService;
+  let csrf: string;
+
+  beforeAll(async () => {
+    pg = await startPostgres();
+    container = await new RedisContainer('redis:7-alpine').start();
+    redisClient = newTestRedis(container.getConnectionUrl());
+    // **运行期角色的连接串**（app_user，最小权限）——不是属主。
+    prisma = new PrismaService(pg.appUri);
+
+    app = await createTestApp({
+      overrides: [
+        // 注册限流是 3 次/小时按 IP，本 describe 注册的次数会超过它；关掉的只是本套件的计数
+        // （理由与取舍见 helpers/rate-limit.ts，限流本身由 tests/security/rate-limit.test.ts 守）。
+        disableRateLimit,
+        (b) => b.overrideProvider(PrismaService).useValue(prisma),
+        (b) => b.overrideProvider(REDIS).useValue(redisClient),
+      ],
+    });
+    csrf = await fetchCsrfToken(app);
+  }, 180_000);
+
+  afterAll(async () => {
+    await teardown(app, container);
+    await prisma?.$disconnect().catch(() => undefined);
+    await pg?.stop();
+  });
+
+  it('注册走真库：用户落表、审计行由 app_user 写进 audit.audit_logs，且那行改不动', async () => {
+    const email = 'real-db@example.com';
+    const reg = await request(app.getHttpServer())
+      .post('/auth/register')
+      .set(csrfHeaders(csrf))
+      .set('x-trace-id', 'trace-real-db-register')
+      .send({ email, password: 'a-strong-passphrase' });
+    expect(reg.status, `注册在真库上失败了：${JSON.stringify(reg.body)}`).toBe(201);
+
+    // 用**同一条** app_user 连接把用户读回来：走的是真实的 `auth.users` 表与 GRANT。
+    const user = await prisma.user.findUnique({ where: { email } });
+    expect(user?.email).toBe(email);
+
+    // 审计行真的落在 `audit.audit_logs` 里——这正是「app_user 的 INSERT 授权够用」的判据
+    // （假实现里这一步只是一个数组 push，永远为真）。
+    const audits = await prisma.auditLog.findMany({ where: { action: 'auth.register' } });
+    expect(audits, '真库上没有落审计行：app_user 的 INSERT 授权或写入路径有问题').toHaveLength(1);
+    expect(audits[0]?.traceId).toBe('trace-real-db-register');
+    expect(audits[0]?.resourceId).toBe(user?.id);
+
+    // append-only 的**另一半**，在同一条连接上验证：这条连接写进去的行，它自己也改不动。
+    // （完整的 UPDATE/DELETE 矩阵由 tests/integration/db/append-only.test.ts 守；
+    //   这里只钉「管线用的那条连接确实是被撤权的那个角色」。）
+    await expect(
+      prisma.auditLog.update({ where: { id: audits[0]!.id }, data: { action: 'tampered' } }),
+      '运行期连接改动了审计行：append-only 在这条连接上是空操作',
+    ).rejects.toThrow(/permission denied|P2010/i);
+  }, 180_000);
+
+  it('重复邮箱由**真实的**唯一约束拒绝（409，P2002 来自 PostgreSQL 而不是假实现）', async () => {
+    const body = { email: 'real-db@example.com', password: 'another-strong-passphrase' };
+    const dup = await request(app.getHttpServer()).post('/auth/register').set(csrfHeaders(csrf)).send(body);
+
+    expect(dup.status, `重复注册在真库上没有映射成 409：${JSON.stringify(dup.body)}`).toBe(409);
+    expect(await prisma.user.count({ where: { email: body.email } })).toBe(1);
   }, 180_000);
 });

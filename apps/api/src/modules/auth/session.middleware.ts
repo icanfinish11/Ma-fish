@@ -122,16 +122,32 @@ export class SessionMiddleware implements NestMiddleware {
    * 1. **不记录 `sessionId`。** 它就是完整的 bearer 凭证（见 `session.service.ts`），
    *    日志是「谁都能看」的存储。排查不靠它：`req` 序列化器已经带上 `method` + `url`，
    *    同一请求的其余日志由 pino `mixin` 带上 `traceId`/`userId`，足够定位到具体请求，
-   *    不需要把凭证抄进日志。（本行走的是 Nest `Logger`，不经 pino `mixin`，
-   *    因此**不**自带 `traceId`——这是 `redact.ts` 的取值边界之内可以接受的代价，
-   *    换来的是「日志里绝不出现凭证」。）
+   *    不需要把凭证抄进日志。
+   *
+   *    **这条日志是否带 `traceId`（最终评审的 Minor 更正）**：带。上一版注释写的是
+   *    「本行走的是 Nest `Logger`，不经 pino `mixin`，因此**不**自带 traceId」——那句话在
+   *    Task 7 之前是对的（当时全仓没有 `app.useLogger`），接线之后**已经过时**：
+   *    `configureApp` 第一条就是 `app.useLogger(app.get(PinoLogger))`（`bootstrap.ts`），
+   *    而本中间件跑在 `TraceMiddleware` 建立的 ALS 作用域内（顺序由 `AppModule.configure` 定，
+   *    见约束 3），因此 pino 的 `mixin` 在写入这一刻读得到上下文，
+   *    这一行与业务日志一样带 `traceId`/`userId`。
+   *    代价如实记录：`logger.warn` 只收到一个**已经拼好的字符串**，不带结构化字段，
+   *    所以键名是 `msg` 而不是自定义字段——可读性上仍是「点名的一行」。
    * 2. **只记 `name` + `message`（截断）+ 错误码**，并且 `describeVerificationFailure`
    *    对任何异常形状都安全（属性 getter 抛错也只回 `[unavailable]`）：日志路径上的
    *    代码自己炸掉，会把一次「可观测的降级」变成一次 500。
    * 3. **测试环境下不发日志**（`NODE_ENV === 'test'`）：套件里「Redis 挂了会降级」
    *    这条路径是被**故意**触发的（容器停掉之后仍在收尾），把它打成告警会让真正的
-   *    失败淹在预期噪音里。与 pino 在测试下静音（`logger.module.ts`）是同一个理由，
-   *    但这里不能靠 pino——`Logger` 用的是 Nest 自己的输出通道。
+   *    失败淹在预期噪音里。与 pino 在测试下静音（`logger.module.ts`）是同一个理由、
+   *    两个不同的落点。
+   *
+   *    **为什么不能只靠 pino 静音**（最终评审的 Minor 更正）：pino 的静音只作用于
+   *    **那个 pino 实例**，而本行走的是 Nest 的 `Logger`——生产里它确实接到了 pino 上
+   *    （`configureApp` 的 `app.useLogger`，Task 7 接线），但测试的引导路径
+   *    （`tests/helpers/app.ts` 的 `createTestApp`）**不调** `configureApp`，
+   *    因此那时 Nest 用的是自己的输出通道（`@nestjs/testing` 的 `TestingLogger` 恰好把
+   *    warn 置空，但那是**偶然**，见 `policy-default-deny.test.ts` 的实测记载）。
+   *    这里显式判断 `NODE_ENV`，输出的有无就不依赖这些偶然。
    */
   private logVerificationFailure(err: unknown): void {
     if (process.env.NODE_ENV === 'test') return;

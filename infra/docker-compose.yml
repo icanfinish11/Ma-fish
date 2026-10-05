@@ -8,6 +8,14 @@
 #
 #     pnpm db:setup      # = db:up → prisma migrate deploy → 从容器里跑 apply-grants.sql
 #
+# `prisma migrate deploy` 需要 `MIGRATE_DATABASE_URL`，且它**不再**默默回落到本机兜底值
+# （最终评审的 Minor：兜底会让「忘了配置」与「故意本地迁移」无法区分）。本地有两条路：
+#
+#     ① 在本机 `.env` 里把 MIGRATE_DATABASE_URL 写成 compose 的值（口令是 owner_pw，
+#        注意 `.env.example` 里那个是 CHANGE_ME 占位符，照抄跑不通）；
+#     ② 在 `.env` 里写 `MIGRATE_ALLOW_LOCAL_FALLBACK=1`，用 `apps/api/prisma.config.ts`
+#        里那个与 compose 对齐的兜底连接串。
+#
 # 顺序是硬性的：建角色 → 迁移 → **授权**。授权必须在迁移之后（`GRANT` 只作用于执行那一刻
 # 已存在的对象），而 compose 侧没有它的入口，所以由根脚本 `pnpm db:grants` 在迁移后执行。
 #
