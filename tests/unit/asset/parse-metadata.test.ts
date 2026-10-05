@@ -403,6 +403,62 @@ describe('Task 6 · 元数据解析', () => {
     });
   });
 
+  describe('Step 3b：链接条目不算文件（D6 的承诺在本模块**自己也**成立）', () => {
+    /**
+     * 这一节的存在理由是一条**耦合**：D6 在写入侧（Task 4 的校验）就拒链接条目，因此到达
+     * `parseMetadata` 的归档里本来不该有链接。但那样一来，本模块的输出就依赖「Task 4 的守卫
+     * 还在不在」——把那条守卫删掉，一份带 `escape -> ../../etc/passwd` 的归档会在这里多出
+     * 一行 `{ path, bytes }`、把 `fileCount` 抬高一格、并把链接目标的**路径字符串**当成
+     * 「代码」读进来数行数，而**没有一条用例会变红**。
+     * 本节的判据落在**消费侧**：链接条目与目录条目一样，不进树、不计数、不读内容。
+     */
+    const nineFiles = Array.from({ length: 9 }, (_unused, index) => ({
+      name: `f${index}.txt`,
+      data: Buffer.from('x'),
+    }));
+
+    it('zip：符号链接目录条目不算文件（文件数因此是 9 而不是 10）', async () => {
+      const bytes = buildZip([
+        ...nineFiles,
+        // 外部属性的 Unix mode = 0o120777（符号链接）；内容就是链接目标路径。
+        { name: 'escape', unixMode: 0o120777, data: Buffer.from('../../../../etc/passwd') },
+      ]);
+      const metadata = await parseOf(bytes, 'zip', { weights: weightsOnly('fileCount') });
+      expect(metadata.fileTree.map((file) => file.path)).toEqual(nineFiles.map((file) => file.name));
+      expect(metadata.completeness).toBe(0); // 9 个文件 ⇒ 落在 §6.2 的下端之外
+
+      // 反面：同一个条目换成**普通文件**的 mode ⇒ 它照旧算一个文件
+      //（没有这一半，上面那条可以被一个「怎么都跳过」的实现骗过去）。
+      const regular = buildZip([
+        ...nineFiles,
+        { name: 'escape', unixMode: 0o100644, data: Buffer.from('../../../../etc/passwd') },
+      ]);
+      expect((await parseOf(regular, 'zip', { weights: weightsOnly('fileCount') })).completeness).toBe(100);
+    });
+
+    it('zip：一个叫 `index.js` 的符号链接不算文件、也不算代码（链接目标不会被当代码读）', async () => {
+      const bytes = buildZip([
+        { name: 'index.js', unixMode: 0o120777, data: Buffer.from('../../etc/hosts') },
+        { name: 'src/util.ts', data: Buffer.from('const x = 1;\n') },
+      ]);
+      const metadata = await parseOf(bytes, 'zip', { weights: weightsOnly('codeLines') });
+      expect(metadata.fileTree.map((file) => file.path)).toEqual(['src/util.ts']);
+      expect(metadata.languages).toEqual([{ name: 'TypeScript', bytes: 13, ratio: 1 }]);
+      expect(metadata.completeness).toBe(0); // 链接里的那 14 个字节没有被当代码数进去
+    });
+
+    it('tar.gz：符号链接（typeflag "2"）与硬链接（"1"）同样不算文件', async () => {
+      const bytes = buildTarGz([
+        { name: 'escape', typeflag: '2', linkName: '../../../../etc/passwd' },
+        { name: 'hard', typeflag: '1', linkName: 'src/index.ts' },
+        ...nineFiles,
+      ]);
+      const metadata = await parseOf(bytes, 'tar.gz', { weights: weightsOnly('fileCount') });
+      expect(metadata.fileTree.map((file) => file.path)).toEqual(nineFiles.map((file) => file.name));
+      expect(metadata.completeness).toBe(0); // 9 个文件
+    });
+  });
+
   describe('Step 4：语言分布（按扩展名归类、按字节占比）', () => {
     const bytesOf = (size: number): Buffer => Buffer.alloc(size, 0x61);
 
@@ -1073,6 +1129,12 @@ describe('Task 6 · 元数据解析', () => {
        * 那几个小文件（README / package.json / src/index.ts 各 1 块，可能并块）
        * + yauzl 逐个 `openReadStream` 时的本地头，再留一倍余量 ⇒ 16 块。
        * 制品本身是 `24 MiB / 64 KiB = 384` 块 ⇒ 这条上界比「全读一遍」低两个数量级。
+       *
+       * **口径（修复轮 1 收紧的措辞）**：`bytesRequested()` 数的是**密文**字节——它是
+       * `MemoryStore` 真正取回的区间之和，而读取器每次取的是**整条块记录**：
+       * `64 KiB 明文 + 16 字节 AEAD tag`（`TAG_BYTES`）。因此这里写 `CHUNK_BYTES + 16` 才是
+       * 「一块」的密文口径。若把这个量念成「明文块数」，这条上界只会**更紧**
+       * （多算 16/65536 ≈ 0.024%，方向是更严而不是更松），结论不变。
        */
       const TOUCHED_BLOCKS_BOUND = 16;
       expect(store.bytesRequested()).toBeLessThan(TOUCHED_BLOCKS_BOUND * (CHUNK_BYTES + 16));

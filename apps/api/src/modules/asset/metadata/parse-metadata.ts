@@ -2,6 +2,7 @@ import { createGunzip } from 'node:zlib';
 import type { Readable } from 'node:stream';
 import { Parser, type ReadEntry } from 'tar';
 import { fromRandomAccessReader, type Entry, type RandomAccessReader, type ZipFile } from 'yauzl';
+import { checkTarLink, checkZipLink } from '../archive/limits.js';
 import type { EncryptedArtifactReader } from '../store/random-access-reader.js';
 import {
   scoreCompleteness,
@@ -18,6 +19,9 @@ import {
  * 读中央目录 / 读 tar 头部、读**限长**的条目内容、按扩展名与名字做纯字符串判断。
  * 这里**没有**任何执行面：不 eval、不 require 条目、不跑 `npm install`、
  * 不跟随链接、不解析需要执行的格式（`.pyc` / 二进制一律只看扩展名）。
+ * 「不跟随链接」不只是「不去打开它」：**链接条目在 walker 里就被排除**（与目录条目同等对待），
+ * 判据与 Task 4 的校验共用 `limits.ts` 里那一份实现——否则本模块的输出会隐式依赖
+ * 「Task 4 的守卫还在不在」（见 `scanZip` 的 `checkZipLink` 调用点）。
  * 「不执行」由 `tests/unit/asset/parse-metadata.test.ts` 的 Step 1 用**副作用探针**证明
  * （哨兵文件 + `node_modules` + 两条子进程打点），而不是靠这句话。
  *
@@ -726,6 +730,11 @@ function hasEntryOrBuildSignal(record: Record<string, unknown>): boolean {
  * 版本符原样保留。选项行（`-r` / `-e` / `--index-url`）**由正则天然排除**：正则要求第一个
  * 字符是字母或数字，因此 `-` 开头的行一律不匹配。这里**没有**再写一条 `startsWith('-')`
  * ——探针实测那两行改与不改行为完全一致，是一行证明不了的死代码（C16）。
+ *
+ * **这一条与下面正则的首字符类绑在一起**：`^([A-Za-z0-9]…)` 里的 `[A-Za-z0-9]` 就是
+ * 「选项行被排除」的**唯一**依据。谁把它放宽（例如为了顺便收下 `-e <vcs url>` 后面的包名），
+ * `-r base.txt` 与 `--index-url …` 立刻会变成「依赖」——那时必须把显式的选项行排除**加回来**，
+ * 并补一条用例；不要以为删掉的那行死代码可以不管。
  * **不处理**：行继续符（末尾 `\`）、`--hash`、`-e <vcs url>` 里的包名——
  * 这几类在产物里都落到「跳过」或「版本为空」，不会让解析失败（据实记载）。
  */
@@ -798,8 +807,19 @@ function scanZip(reader: RandomAccessReader, totalSize: number, scanner: Metadat
       }
       zipfile = opened;
       opened.on('entry', (entry: Entry) => {
-        // 目录条目（名字以 `/` 结尾）不是文件：不进文件树、不参与语言分布与文件数。
-        if (entry.fileName.endsWith('/')) {
+        /**
+         * 目录条目（名字以 `/` 结尾）与**链接**条目都不是文件：不进文件树、不参与语言分布与
+         * 文件数、也不会有任何内容被读。
+         *
+         * 链接这一条是**刻意加在这里**的（修复轮 1）。D6 在写入侧（Task 4 的校验）就拒链接，
+         * 因此到达本函数的归档里本来不该有链接——但那样一来「本模块的输出」就依赖 Task 4 的
+         * 守卫还在不在：把那条守卫删掉，一份带 `escape -> ../../etc/passwd` 的归档会在这里
+         * 多出 `{ path, bytes }` 一行、把 `fileCount` 抬高一格，并把链接目标的**路径字符串**
+         * 当成「代码」读进来数行数，而**没有一条用例会变红**。
+         * 判据与 Task 4 **共用同一份实现**（不是在这里再抄一遍位运算）：两边对「什么是链接」
+         * 只有一个定义。
+         */
+        if (entry.fileName.endsWith('/') || checkZipLink(entry.externalFileAttributes) !== null) {
           advance(opened);
           return;
         }
@@ -882,9 +902,13 @@ function scanTarGz(reader: RandomAccessReader, archiveBytes: number, scanner: Me
     };
 
     parser.on('entry', (entry: ReadEntry) => {
-      const isDirectory = entry.header.typeKey === '5' || entry.path.endsWith('/');
-      // 不 resume 解析器就不前进（D8 的背压形态）；目录也要 drain 掉。
-      if (isDirectory) {
+      const typeKey = entry.header.typeKey;
+      const isDirectory = typeKey === '5' || entry.path.endsWith('/');
+      // 链接条目（符号链接 `'2'` / 硬链接 `'1'`）与目录一样不是文件：理由与 zip 那一侧的
+      // 同一条判据逐字相同（判据本身也共用 `limits.ts` 里那一份）。
+      const isLink = checkTarLink(typeKey) !== null;
+      // 不 resume 解析器就不前进（D8 的背压形态）；目录与链接也要 drain 掉。
+      if (isDirectory || isLink) {
         entry.resume();
         return;
       }
