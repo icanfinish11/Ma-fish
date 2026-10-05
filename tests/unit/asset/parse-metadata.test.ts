@@ -96,6 +96,25 @@ async function parseOf(
   return await parseMetadata(reader, kind, options);
 }
 
+/**
+ * 只给某一项 100 分、其余 0 的权重：这样解析出来的分数就是「**这一项**算出来了没有」的
+ * 0/100 信号，与其余六项无关。
+ *
+ * 放在模块作用域（而不是某一个 `describe` 里）：Step 5b / 6b / 7 三节都要用它做隔离断言，
+ * 而三份各写一遍正是判据漂移的入口。
+ */
+function weightsOnly(key: keyof CompletenessWeights): CompletenessWeights {
+  return {
+    readme: key === 'readme' ? 100 : 0,
+    license: key === 'license' ? 100 : 0,
+    dependencyManifest: key === 'dependencyManifest' ? 100 : 0,
+    entryOrBuildScript: key === 'entryOrBuildScript' ? 100 : 0,
+    fileCount: key === 'fileCount' ? 100 : 0,
+    media: key === 'media' ? 100 : 0,
+    codeLines: key === 'codeLines' ? 100 : 0,
+  };
+}
+
 // ── Step 1：绝不执行（C2 / 判据 12）的样本 ─────────────────────────────────
 
 /** 归档里 `package.json` 的 postinstall 命令。 */
@@ -672,15 +691,7 @@ describe('Task 6 · 元数据解析', () => {
     const text = (value: string): Buffer => Buffer.from(value, 'utf8');
 
     /** 只给「代码行数」100 分、其余 0：分数就是「数到的代码行数 > 200」的 0/100 信号。 */
-    const codeLinesOnly: CompletenessWeights = {
-      readme: 0,
-      license: 0,
-      dependencyManifest: 0,
-      entryOrBuildScript: 0,
-      fileCount: 0,
-      media: 0,
-      codeLines: 100,
-    };
+    const codeLinesOnly = weightsOnly('codeLines');
 
     it('依赖的 README 抢不走槽位；项目自己没有 README ⇒ null（不是「把依赖的顶上来」）', async () => {
       const stolen = buildZip([
@@ -865,19 +876,6 @@ describe('Task 6 · 元数据解析', () => {
   });
 
   describe('Step 6b：完整度评分接在真实解析上（每一项都真的被算出来，权重可配）', () => {
-    /** 只给某一项 100 分、其余 0：这样解析出来的分数就是「这一项算出来了没有」的 0/100 信号。 */
-    function weightsOnly(key: keyof CompletenessWeights): CompletenessWeights {
-      return {
-        readme: key === 'readme' ? 100 : 0,
-        license: key === 'license' ? 100 : 0,
-        dependencyManifest: key === 'dependencyManifest' ? 100 : 0,
-        entryOrBuildScript: key === 'entryOrBuildScript' ? 100 : 0,
-        fileCount: key === 'fileCount' ? 100 : 0,
-        media: key === 'media' ? 100 : 0,
-        codeLines: key === 'codeLines' ? 100 : 0,
-      };
-    }
-
     const scoreFor = async (bytes: Buffer, key: keyof CompletenessWeights): Promise<number> =>
       (await parseOf(bytes, 'zip', { weights: weightsOnly(key) })).completeness;
 
@@ -1080,6 +1078,102 @@ describe('Task 6 · 元数据解析', () => {
       expect(store.bytesRequested()).toBeLessThan(TOUCHED_BLOCKS_BOUND * (CHUNK_BYTES + 16));
       // 同一件事的相对口径：读回的字节不到归档的 1/16。
       expect(store.bytesRequested() * 16).toBeLessThan(reader.plaintextLength);
+    });
+
+    /**
+     * **稠密归档**：判据 13 在元数据侧的另一半见证（修复轮 1 补）。
+     *
+     * 上一条用例的归档只有 4 个条目，它能证明「那 24 MiB 没被读」，但证明不了**条目数**受
+     * 选路规则约束：一个「把每个条目的前 64 KiB 都读一遍」的实现在那种形状下只多读一块，
+     * 照样绿。这里因此造一份候选数**超过结构上界**的稠密归档——
+     * 50 个内容候选（README 1 + 清单 9 + 代码 40），被 400 个**非候选**条目
+     * （每个 60 KiB，`.bin` ⇒ `other` ⇒ 既不是代码也不是清单）隔开：
+     * 候选的两簇各自很小（读它们花不了几块），而「每个条目都读一点」的代价随**条目数**增长。
+     *
+     * 结构性事实（不是照抄实测）：`need()` 至多放行 1 个 README + 8 个清单 + 32 个代码文件
+     * ⇒ **至多 41 个条目**的内容会被读，而这份归档里 400 个非候选条目一个都不该被读。
+     */
+    it('zip：**稠密**归档（450 条、50 个内容候选）里读回量仍然有界——「只读需要的」不是靠「归档里只有一条大文件」', async () => {
+      const CODE_FILES = 40; // 代码候选：扫描上限 32 ⇒ 后 8 个（`c32`…）刻意读不到
+      const FILLER_FILES = 400; // 非候选条目：每个 60 KiB ⇒ 各自跨 64 KiB 的块边界
+      const FILLER_BYTES = 60 * 1024;
+      const CODE_LINES_PER_FILE = 10;
+
+      const codeEntry = (index: number, dir: string): { name: string; data: Buffer } => ({
+        name: `${dir}/c${String(index).padStart(2, '0')}.ts`,
+        data: Buffer.from(`// c${index}\n${'const x = 1;\n'.repeat(CODE_LINES_PER_FILE - 1)}`),
+      });
+      const fillerEntry = (index: number): { name: string; data: Buffer } => ({
+        name: `assets/blob-${String(index).padStart(3, '0')}.bin`,
+        data: Buffer.alloc(FILLER_BYTES, index % 251),
+      });
+      const manifestEntry = (dir: string, dependency: string): { name: string; data: Buffer } => ({
+        name: `${dir}package.json`,
+        data: Buffer.from(JSON.stringify({ dependencies: { [dependency]: '1.0.0' } })),
+      });
+
+      // 两簇候选（像 monorepo 的 `src/` 与 `packages/app/`），簇外与簇间是那 400 个条目。
+      const entries = [
+        { name: 'README.md', data: Buffer.from(`# 稠密样本\n${'r'.repeat(300)}\n`) },
+        manifestEntry('', 'mine'),
+        ...Array.from({ length: CODE_FILES / 2 }, (_unused, index) => codeEntry(index, 'src')),
+        ...Array.from({ length: FILLER_FILES / 2 }, (_unused, index) => fillerEntry(index)),
+        ...Array.from({ length: 8 }, (_unused, index) => manifestEntry(`packages/app/pkg${index}/`, `pkg${index}`)),
+        ...Array.from({ length: CODE_FILES / 2 }, (_unused, index) => codeEntry(index + CODE_FILES / 2, 'packages/app/src')),
+        ...Array.from({ length: FILLER_FILES / 2 }, (_unused, index) => fillerEntry(index + FILLER_FILES / 2)),
+      ];
+
+      // 样本自检（从**名字**数，不经过被测代码）：候选数必须超过结构上界，否则这条用例退化。
+      const candidatePaths = entries
+        .map((entry) => entry.name)
+        .filter((name) => name === 'README.md' || name.endsWith('package.json') || name.endsWith('.ts'));
+      expect(entries).toHaveLength(1 + 1 + CODE_FILES + FILLER_FILES + 8);
+      expect(candidatePaths).toHaveLength(1 + 9 + CODE_FILES);
+      expect(candidatePaths.length).toBeGreaterThan(41); // 1 README + 8 清单 + 32 代码 = 结构上界
+
+      const { store, reader } = await openReader(buildZip(entries));
+      const metadata = await parseMetadata(reader, 'zip', { weights: weightsOnly('codeLines') });
+
+      // 解析确实读到了**内容**（否则下面的上界是恒真的）：README、前 8 个清单、32 个代码文件。
+      expect(metadata.readmeExcerpt).toContain('# 稠密样本');
+      expect(metadata.dependencies).toEqual(
+        ['mine', 'pkg0', 'pkg1', 'pkg2', 'pkg3', 'pkg4', 'pkg5', 'pkg6'].map((name) => ({
+          ecosystem: 'npm',
+          name,
+          version: '1.0.0',
+        })),
+      );
+      expect(metadata.completeness).toBe(100); // 32 个候选 × 10 行 = 320 行 > 门槛 200
+      expect(metadata.fileTree).toHaveLength(entries.length); // 450 条全部进树（500 的上限没到）
+      expect(metadata.fileTreeTruncated).toBe(false);
+
+      /**
+       * 上界**从制品几何与结构上界推出来**，不是照抄实测值（与上一条用例同一条纪律）：
+       * - 内容读至多 `MAX_CONTENT_READS = 1 + 8 + 32 = 41` 次（README / 清单 / 代码三条选路
+       *   各自的上限之和）；
+       * - 每次内容读至多碰 2 块（条目的本地头与数据可能落在不同的块里）；
+       * - **每一次内容读都会让「最近一块」的 memo 失效**：yauzl 是逐条目扫中央目录的，
+       *   两次中央目录读之间插进一次内容读 ⇒ 下一次中央目录读要重新取回它那一块。因此每次
+       *   内容读再记 1 块（这条是本轮实测到的形状：84 次请求 / **只有 4 个不同的块**）。
+       * ⇒ `3 × (41 + 2) = 129` 块。制品本身 376 块。
+       * 与上一条用例（4 个条目的稀疏归档）的 16 块上界**不是同一个数**：那种形状里中央目录
+       * 只被扫 4 次，memo 几乎不失效。两条上界各自从**自己那份 fixture 的几何**推出来。
+       */
+      const MAX_CONTENT_READS = 1 + 8 + 32;
+      expect(store.bytesRequested()).toBeLessThan(3 * (MAX_CONTENT_READS + 2) * (CHUNK_BYTES + 16));
+
+      // 同一件事的**形状无关**口径：真正被解密进内存的**不同**块数（memo 的重取不算新块）。
+      // 几何：两簇候选（各 ≤ 6 KiB，各至多跨 2 块）+ 中央目录区（约 30 KB，至多 2 块）
+      // + 尾部 EOCD（与中央目录同一范围内）⇒ 至多 6 块，取 8 留一倍余量（实测 4 块）。
+      const blocksTouched = new Set(store.requests.map((request) => request.start)).size;
+      expect(blocksTouched).toBeLessThanOrEqual(8);
+
+      // 这条上界不是空的（纯几何，不含任何实测值）：只算**非候选**条目，这份归档也有 400 块
+      // 的内容需要读——「把每个条目的内容都读一点」的实现必然越过上面的上界，而它一块都不该读。
+      expect(FILLER_FILES).toBeGreaterThan(3 * (MAX_CONTENT_READS + 2));
+      // 归档确实是大归档（比那 400 个条目的内容还大），而它们一块都没被读。
+      expect(reader.plaintextLength).toBeGreaterThan(FILLER_FILES * FILLER_BYTES);
+      expect(FILLER_FILES * FILLER_BYTES).toBeGreaterThan(3 * (MAX_CONTENT_READS + 2) * (CHUNK_BYTES + 16));
     });
 
     it('zip：结果本身的规模有界（摘录 ≤ 2000 字符、文件树 ≤ 500 条），与归档大小无关', async () => {
