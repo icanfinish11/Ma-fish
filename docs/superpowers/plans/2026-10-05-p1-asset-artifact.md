@@ -521,7 +521,7 @@ TTL **≤ 300 秒**（威胁 #3）。`nonce` 首次使用即消费；重复使�
 | 5 | 全量测试 | `pnpm test` |
 | 6 | 八样本判定（六拒两收） | `pnpm vitest run --project unit -t 归档` |
 | 7 | 块序号契约（调换记录必须被拒） | `pnpm vitest run --project unit -t 序号契约` |
-| 8 | 恶意样本零落盘零残留 | `pnpm vitest run --project integration -t 零落盘` |
+| 8 | 恶意样本零落盘零残留 | `pnpm vitest run --project integration -t 恶意样本` |
 | 9 | append-only 覆盖 `OwnershipHistory` | `pnpm vitest run --project integration -t append-only` |
 | 10 | 越权矩阵 | `pnpm vitest run --project security -t 越权` |
 | 11 | 签名 URL 超时/篡改/重放 | `pnpm vitest run --project integration -t 签名下载` |
