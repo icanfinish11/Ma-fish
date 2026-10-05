@@ -46,9 +46,12 @@ import {
 
 /** 元数据解析的结果（brief 的契约 + 一个截断标记，见下）。 */
 export interface ParsedMetadata {
-  /** README 的截断摘录；没有 README 时为 `null`。 */
+  /** README 的截断摘录；没有 README 时为 `null`。vendored 目录（`node_modules` 等）里的
+   * README **不算**（那是依赖的 README，见 `VENDORED_DIRECTORY_NAMES`）。 */
   readmeExcerpt: string | null;
-  /** 文件树摘要（**只有文件**，目录条目不计）：路径 + 未压缩字节数。深度与条目数都受限。 */
+  /** 文件树摘要（**只有文件**，目录条目不计）：路径 + 未压缩字节数。深度与条目数都受限。
+   * 这里**含** vendored 目录里的文件（树、文件数与语言分布都按全量统计，见
+   * `VENDORED_DIRECTORY_NAMES` 的范围说明）。 */
   fileTree: { path: string; bytes: number }[];
   /**
    * 语言分布：按扩展名归类、按字节降序。
@@ -60,7 +63,8 @@ export interface ParsedMetadata {
    */
 
   languages: { name: string; bytes: number; ratio: number }[];
-  /** 依赖清单（纯文本解析）：`package.json` / `requirements.txt` / `go.mod`。 */
+  /** 依赖清单（纯文本解析）：`package.json` / `requirements.txt` / `go.mod`。
+   * vendored 目录里的清单**不算**——否则依赖的清单会占掉那 8 个名额。 */
   dependencies: { ecosystem: string; name: string; version: string }[];
   /** 完整度评分 0–100（设计 §6.2）。 */
   completeness: number;
@@ -334,6 +338,55 @@ const NON_CODE_LANGUAGES: ReadonlySet<string> = new Set([
 const CODE_LINE_SCAN_MAX_FILES = 32;
 const CODE_READ_BYTES_PER_FILE = 64 * 1024;
 
+/**
+ * 被排除的 **vendored 目录名**（修复轮 1 的裁定；这是一个**决定**，不是顺手加的过滤器）。
+ *
+ * ## 为什么必须排除（两条都是**错误输出**，不是效率问题）
+ *
+ * 1. `node_modules/<dep>/readme.md` 会赢走 README 槽位 ⇒ **依赖的 README 被当成项目自己的**
+ *    呈现出来；
+ * 2. 一个把 `node_modules` 打进包的项目，其自身的 `package.json` 会被挤出那 8 个清单名额
+ *    ⇒ 依赖清单静默地读的是**依赖的**清单（读出来的每一条都是错的，而且看起来很正常）。
+ *
+ * 同一个出口还有第三个：`node_modules/<dep>/index.js`、`LICENSE`、`shot.png` 只按**名字**
+ * 就能替项目拿到 §6.2 的「入口 / 构建脚本」「LICENSE」「有截图」三项分值。
+ *
+ * ## 判据的形状：**路径段**，而不是前缀
+ *
+ * vendored 目录也会出现在嵌套位置（`packages/app/node_modules/…`），只判前缀会漏掉它们。
+ * 大小写不敏感：归档里的目录名可以是任意大小写，而大小写不敏感的文件系统（Windows / macOS）
+ * 落盘时正是 `Node_Modules/` 这种形态。排除只影响「**选谁**」，不参与任何安全判定，
+ * 因此大小写不敏感在这里没有代价。
+ *
+ * ## 排除的**范围**是刻意的（边界写在这里，免得被当成「整个归档都跳过」）
+ *
+ * 只在四处生效：`need()` 的三条选路（README / 清单 / 代码行数扫描）与 `addFile()` 里
+ * **只看名字**的三项质量信号。**文件树、文件总数与语言分布仍按全量统计**——它们描述的是
+ * 「这个归档里有什么」，而不是「这个项目自己有什么」；把 vendored 树算进文件总数正是它的
+ * 真实代价（§6.2 的 10–5000 区间会把「把 node_modules 打进包」判成 0 分，这是**要**的行为）。
+ *
+ * ## 为什么只有这几个名字（C16：没有第二个调用方要更多）
+ *
+ * 列进来的每一个都对应一种**已知会把依赖铺进项目目录**的包管理器布局：
+ * `node_modules`（npm / pnpm / yarn）、`bower_components`（同类的前端 vendored 树，布局相同）、
+ * `vendor`（Go / PHP）、`venv` / `.venv` / `site-packages`（Python 虚拟环境：整份解释器
+ * 加上每个依赖自己的 README）。**不**排除 `dist` / `build` / `out`：那是项目**自己的**产物，
+ * 不是别人的东西。
+ */
+const VENDORED_DIRECTORY_NAMES: ReadonlySet<string> = new Set([
+  'node_modules',
+  'bower_components',
+  'vendor',
+  'venv',
+  '.venv',
+  'site-packages',
+]);
+
+/** 路径里有没有 vendored 目录段（任意一段命中即排除，大小写不敏感）。 */
+function isVendoredPath(path: string): boolean {
+  return path.split('/').some((segment) => VENDORED_DIRECTORY_NAMES.has(segment.toLowerCase()));
+}
+
 /** 一个条目需要读内容时给出的请求（`cap` 是允许读进内存的字节数）。 */
 type ContentRequest =
   /** README：第一个匹配。 */
@@ -382,9 +435,14 @@ class MetadataScanner {
     this.fileCount += 1;
     const base = baseNameOf(path);
     // 三项只按名字判定（不读内容）：LICENSE / 截图录屏 / 入口构建文件。
-    if (LICENSE_BASE_NAME.test(base)) this.hasLicense = true;
-    if (MEDIA_EXTENSIONS.has(extensionOf(base))) this.hasMedia = true;
-    if (ENTRY_OR_BUILD_FILE_NAMES.has(base)) this.hasConventionalEntryFile = true;
+    // 但它们问的是「**这个项目**有没有」，因此 vendored 目录（`node_modules` 等）里的同名
+    // 文件不算——否则 `node_modules/<dep>/index.js` 会替项目拿到「入口 / 构建脚本」那 15 分，
+    // 依赖的 `LICENSE` / `shot.png` 同理（见 `VENDORED_DIRECTORY_NAMES`）。
+    if (!isVendoredPath(path)) {
+      if (LICENSE_BASE_NAME.test(base)) this.hasLicense = true;
+      if (MEDIA_EXTENSIONS.has(extensionOf(base))) this.hasMedia = true;
+      if (ENTRY_OR_BUILD_FILE_NAMES.has(base)) this.hasConventionalEntryFile = true;
+    }
     // 语言分布按**全量**累计（不受树的两条上限影响：它是聚合量，不是列表）。
     //
     // `bytes > 0` 这一个条件同时定了两件事，而它们其实是**同一件事**：
@@ -413,6 +471,10 @@ class MetadataScanner {
    * 因此这里的判断与 `take` 之间不会插进别的条目。
    */
   need(path: string, bytes: number): ContentRequest | null {
+    // vendored 目录（`node_modules` 等）里的东西**一个字节都不读**：这一条同时管住
+    // README / 清单 / 代码扫描三条选路，因此「依赖的 README 抢走槽位」与「项目自己的清单
+    // 落在 8 个名额之外」在**结构上**不可能发生（理由与范围见 VENDORED_DIRECTORY_NAMES）。
+    if (isVendoredPath(path)) return null;
     // 「第一个匹配」按**归档顺序**：先到先得，后面的 README 一律不再读。
     if (this.readme === null && isReadmePath(path)) return { kind: 'readme', cap: README_READ_BYTES };
     if (bytes > 0 && this.manifestFiles < MAX_MANIFEST_FILES) {

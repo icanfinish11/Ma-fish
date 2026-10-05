@@ -659,6 +659,117 @@ describe('Task 6 · 元数据解析', () => {
     });
   });
 
+  describe('Step 5b：vendored 目录（`node_modules` 等）不参与 README / 清单 / 代码扫描', () => {
+    /**
+     * 控制器的裁定（修复轮 1）：排除 `node_modules/` 及其同类。这不是「顺手加的过滤器」，
+     * 而是两处**错误输出**的修法：
+     * ⓐ `node_modules/**\/readme.md` 会赢走 README 槽位 ⇒ 依赖的 README 被当成项目自己的；
+     * ⓑ 一个把 `node_modules` 打进包的项目，其自身清单会被挤出那 8 个名额 ⇒ 依赖清单静默地
+     *    读的是依赖的清单。
+     * 本节把这两个后果写成「不可能」，并把排除的**范围**也钉住（文件树 / 文件数 / 语言分布
+     * 仍按全量统计——那是「归档里有什么」，不是「项目自己有什么」）。
+     */
+    const text = (value: string): Buffer => Buffer.from(value, 'utf8');
+
+    /** 只给「代码行数」100 分、其余 0：分数就是「数到的代码行数 > 200」的 0/100 信号。 */
+    const codeLinesOnly: CompletenessWeights = {
+      readme: 0,
+      license: 0,
+      dependencyManifest: 0,
+      entryOrBuildScript: 0,
+      fileCount: 0,
+      media: 0,
+      codeLines: 100,
+    };
+
+    it('依赖的 README 抢不走槽位；项目自己没有 README ⇒ null（不是「把依赖的顶上来」）', async () => {
+      const stolen = buildZip([
+        { name: 'node_modules/left-pad/readme.md', data: text('# 依赖的 README（不该赢）\n') },
+        { name: 'node_modules/left-pad/docs/README.md', data: text('# 同上的第二个形状\n') },
+        { name: 'README.md', data: text('# 项目自己的 README\n') },
+      ]);
+      expect((await parseOf(stolen, 'zip')).readmeExcerpt).toBe('# 项目自己的 README\n');
+
+      // 项目自己没有 README：依赖那一份**不能**顶上来
+      // （「没有 README」与「依赖的 README」不是同一件事）。
+      const onlyDependency = buildZip([
+        { name: 'node_modules/left-pad/readme.md', data: text('# 依赖的 README\n') },
+        { name: 'src/index.ts', data: text('export const x = 1;\n') },
+      ]);
+      expect((await parseOf(onlyDependency, 'zip')).readmeExcerpt).toBeNull();
+    });
+
+    it('依赖的 package.json 不占那 8 个清单名额 ⇒ 项目自己的清单照样被读', async () => {
+      const bytes = buildZip([
+        // 12 个 vendored 清单排在包内**最前面**：不排除的话，项目自己那一份落在第 13 位
+        // ⇒ 那 8 个名额全被吃掉，项目自己的依赖一条都读不到。
+        ...Array.from({ length: 12 }, (_unused, index) => ({
+          name: `node_modules/dep${index}/package.json`,
+          data: text(JSON.stringify({ dependencies: { [`dep${index}`]: '1.0.0' } })),
+        })),
+        { name: 'package.json', data: text(JSON.stringify({ dependencies: { mine: '9.9.9' } })) },
+      ]);
+      expect((await parseOf(bytes, 'zip')).dependencies).toEqual([
+        { ecosystem: 'npm', name: 'mine', version: '9.9.9' },
+      ]);
+    });
+
+    it('依赖的代码不数行数（32 个扫描名额也不被 vendored 目录吃掉）', async () => {
+      const bytes = buildZip([
+        // 40 个 vendored 代码文件、每个 400 行：不排除的话前 32 个就把名额与 12800 行用光。
+        ...Array.from({ length: 40 }, (_unused, index) => ({
+          name: `node_modules/dep${index}/index.js`,
+          data: text('const x = 1;\n'.repeat(400)),
+        })),
+        { name: 'src/util.ts', data: text('const x = 1;\n') },
+      ]);
+      const metadata = await parseOf(bytes, 'zip', { weights: codeLinesOnly });
+      expect(metadata.completeness).toBe(0); // 项目自己只有 1 行代码
+    });
+
+    it('等效的 vendored 目录同样排除，且目录名大小写不敏感', async () => {
+      const vendoredReadmes = [
+        'bower_components/jq/readme.md',
+        'vendor/github.com/x/readme.md',
+        '.venv/lib/site-packages/dep/readme.md',
+        'app/site-packages/dep/readme.md',
+        'NODE_MODULES/dep/readme.md', // 大小写不敏感的文件系统上就是这个形状
+      ];
+      for (const path of vendoredReadmes) {
+        const bytes = buildZip([
+          { name: path, data: text('# 依赖的 README\n') },
+          { name: 'README.md', data: text('# 项目自己的 README\n') },
+        ]);
+        expect((await parseOf(bytes, 'zip')).readmeExcerpt, path).toBe('# 项目自己的 README\n');
+      }
+    });
+
+    it('排除的**范围**只在选路那几处：文件树 / 文件总数 / 语言分布仍按全量统计', async () => {
+      const bytes = buildZip([
+        { name: 'node_modules/dep/big.js', data: Buffer.from('x'.repeat(100)) },
+        { name: 'src/a.ts', data: Buffer.from('y'.repeat(300)) },
+      ]);
+      const metadata = await parseOf(bytes, 'zip');
+      expect(metadata.fileTree.map((file) => file.path)).toEqual(['node_modules/dep/big.js', 'src/a.ts']);
+      expect(metadata.languages).toEqual([
+        { name: 'TypeScript', bytes: 300, ratio: 0.75 },
+        { name: 'JavaScript', bytes: 100, ratio: 0.25 },
+      ]);
+    });
+
+    it('tar.gz 侧同一判据（两个 walker 共用同一条排除）', async () => {
+      const bytes = buildTarGz([
+        { name: 'node_modules/dep/readme.md', data: text('# 依赖的 README\n') },
+        { name: 'node_modules/dep/package.json', data: text(JSON.stringify({ dependencies: { dep: '1.0.0' } })) },
+        { name: 'README.md', data: text('# 项目自己的 README\n') },
+        { name: 'package.json', data: text(JSON.stringify({ dependencies: { mine: '1.0.0' } })) },
+      ]);
+      const metadata = await parseOf(bytes, 'tar.gz');
+      expect(metadata.readmeExcerpt).toBe('# 项目自己的 README\n');
+      expect(metadata.dependencies).toEqual([{ ecosystem: 'npm', name: 'mine', version: '1.0.0' }]);
+    });
+  });
+
   describe('Step 6：完整度评分（设计 §6.2 的七项默认权重，可配）', () => {
     /** 七项全部命中的事实。 */
     const FULL: CompletenessFacts = {
@@ -829,6 +940,31 @@ describe('Task 6 · 元数据解析', () => {
       const text = buildZip([{ name: 'docs/notes.txt', data: Buffer.from('x') }]);
       expect(await scoreFor(shot, 'media')).toBe(100);
       expect(await scoreFor(text, 'media')).toBe(0);
+    });
+
+    it('vendored 目录里的 LICENSE / 截图 / `index.js` 不给项目加分（那是依赖的东西）', async () => {
+      // 这三项只按**名字**判定，因此它们是同一类错误的第三个出口：
+      // 依赖的 LICENSE / 截图 / index.js 会让项目看起来有许可证、有截图、有入口。
+      const vendored = buildZip([
+        { name: 'node_modules/dep/LICENSE', data: Buffer.from('MIT\n') },
+        { name: 'node_modules/dep/docs/shot.png', data: Buffer.from('png') },
+        { name: 'node_modules/dep/index.js', data: Buffer.from('module.exports = 1;\n') },
+        { name: 'src/util.ts', data: Buffer.from('const x = 1;\n') },
+      ]);
+      expect(await scoreFor(vendored, 'license')).toBe(0);
+      expect(await scoreFor(vendored, 'media')).toBe(0);
+      expect(await scoreFor(vendored, 'entryOrBuildScript')).toBe(0);
+
+      // 反面对照：同样三个文件放在**项目自己**的位置上 ⇒ 三项照旧成立
+      // （没有这一半，上面三条「0 分」可以被一个「这三项怎么都算不出来」的实现骗过去）。
+      const own = buildZip([
+        { name: 'LICENSE', data: Buffer.from('MIT\n') },
+        { name: 'docs/shot.png', data: Buffer.from('png') },
+        { name: 'src/index.js', data: Buffer.from('module.exports = 1;\n') },
+      ]);
+      expect(await scoreFor(own, 'license')).toBe(100);
+      expect(await scoreFor(own, 'media')).toBe(100);
+      expect(await scoreFor(own, 'entryOrBuildScript')).toBe(100);
     });
 
     it('代码行数：200 行 ⇒ 0 分；201 行 ⇒ 100 分（只有代码扩展名被数）', async () => {
