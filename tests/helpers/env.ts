@@ -82,6 +82,45 @@
 import { tmpdir } from 'node:os';
 import * as nodePath from 'node:path';
 
+/**
+ * 制品卷的**根目录**（修复轮 1 / Fix 5）。
+ *
+ * 这里只登记**根**；**每个制品套件必须在引导应用之前把它覆写成自己的子目录**，
+ * 做法是 `process.env.ARTIFACT_STORE_DIR = artifactStoreDirFor(process.env.VITEST_POOL_ID ?? process.pid)`
+ * ——`tests/integration/asset/upload-stream.test.ts` 的 `beforeAll` 就是这么做的。
+ *
+ * 理由：那个目录曾经是所有文件共用的一个固定路径，而该文件在 `beforeAll`/`beforeEach` 里
+ * `rm -rf` 它——单个消费者时看不出问题，**第二个**并发的集成文件一上来就会把第一个正在用的
+ * 对象全删掉，表现为「上传成功后读回是空」这类看不出原因的失败。
+ *
+ * 为什么**必须**覆写 `process.env`（实测两次才定位到，不是风格选择）：
+ *
+ * 1. `test.env` 是 **Vitest 主进程**求值后**序列化**分发给各 worker 的——worker 里重新
+ *    import 本文件算出的值与应用读到的那一份**可能不同**（`VITEST_POOL_ID` 只在 worker 里存在）。
+ *    实测：worker 里 `process.env.ARTIFACT_STORE_DIR` = `…vca-test-artifacts-15712`、
+ *    重新 import 本夹具 = `…vca-test-artifacts-1`（`evidence/t1-fix1-probe-store-dir.txt`）。
+ * 2. 应用侧（`LocalArtifactStore` 的工厂）只读**它启动时**的 `process.env`：
+ *    在 `beforeAll` 里 import 应用**之后**再改夹具值是没用的——实测「应用写根目录、
+ *    测试读子目录」，三条用例当场变红（`evidence/t1-fix1-diag.txt`）。
+ *    唯独「**引导之前**改 `process.env`，且**应用与测试读同一个值**」这一种形状两边一致
+ *    （`createTestApp()` 内部才 import `AppModule`，因此那次求值晚于本覆写）。
+ *
+ * 残留的已知边界（据实记载）：根目录是共享的，因此**两次同时在同机跑的**
+ * `pnpm test` 会共用它。子目录按套件隔离，所以两次运行之间仍不会互相删对象；
+ * 代价只是崩溃后的残留目录可能被另一次运行的清理顺手收掉——这不影响断言。
+ */
+const artifactRoot = nodePath.join(tmpdir(), 'vca-test-artifacts');
+
+/**
+ * 某个标识下面的制品套件目录：`<根>/<tag>`。
+ *
+ * `tag` 由调用方给出（在 worker 里取 `process.env.VITEST_POOL_ID`，
+ * 没有它时用 `process.pid`：同一个进程内仍然自洽）。
+ */
+export function artifactStoreDirFor(tag: string | number): string {
+  return nodePath.join(artifactRoot, String(tag));
+}
+
 // `as const` 只给**编译期**只读类型，运行期照样可写；`Object.freeze` 才把它真正钉死，
 // 免得某个测试顺手改写这份「唯一登记处」而污染同进程的其他用例（vitest 的 `env` 是共享的）。
 export const testEnv = Object.freeze({
@@ -101,9 +140,12 @@ export const testEnv = Object.freeze({
   // 制品卷放在系统临时目录下：测试进程对仓库目录没有写权限的机器上也能跑，
   // 且 `pnpm test` 不会在仓库里留下制品（`storage/` 虽已 gitignore，但测试不该依赖它）。
   //
+  // 这里登记的是**根**：真正的套件目录由各套件自己用 `artifactStoreDirFor(tag)` 取
+  // （**必须**如此，见上面的实测说明——应用读的是 `process.env` 里那一份，一个进程只有一份）。
+  //
   // 上限取 **4 MiB** 而不是生产默认的 1 GiB：任务 1 的验收里有一条「超限上传中止后无残留」，
   // 它必须**真的**触发 `limits.fileSize`，而用 1 GiB 触发意味着每个用例都要传 >1 GiB。
   // 这是刻意的测试期取值，不是把生产上限改小（生产的 `.env.example` 是 1 GiB）。
-  ARTIFACT_STORE_DIR: nodePath.join(tmpdir(), 'vca-test-artifacts'),
+  ARTIFACT_STORE_DIR: artifactRoot,
   ARTIFACT_MAX_UPLOAD_BYTES: '4194304',
 } as const satisfies Partial<NodeJS.ProcessEnv>);

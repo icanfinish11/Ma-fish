@@ -76,7 +76,48 @@ export class AssetStoreModule {}
           // `ArtifactStore` 在**结构上**就满足 `UploadSink`（putStream + delete），
           // 因此不需要任何适配器——这正是把 sink 声明成本地接口的收益。
           storage: createStreamingStorage(store, { maxBytes }),
-          limits: { fileSize: maxBytes },
+          /**
+           * 两类上限：`fileSize` 管**文件本身**，另外四条管**请求形状**。
+           *
+           * `fileSize` 取 `maxBytes` —— 它是 413 的**唯一**来源（见类注释）。
+           *
+           * 另外四条是**防御纵深**，不是主要控制：按设计 §3.1 的部署图，请求形状的
+           * 第一层限制在 Nginx（`client_max_body_size` / 请求头与连接数限制）。这里仍然
+           * 必须自己成立，因为「Nginx 配好了」不是本进程能验证的性质；而**只有 `fileSize`
+           * 时，字段面是无界的**：multer 会把每个文本字段追加进 `req.body`，因此
+           * 「很多个小字段」是一条不吃文件上限的内存路径（实测 busboy 的默认值是
+           * `fields: Infinity` / `parts: Infinity`——`lib/types/multipart.js` 第 255–264 行；
+           * 连 `fieldSize` 也只是默认 1 MiB，见下）。
+           *
+           * 取值理由（本路由只接受**一个** zip 附件，不接受任何业务字段）：
+           * - `fields: 16`：给将来可能出现的少量元数据（如 `note`）留量，但把「字段数」这条
+           *   无界路径封住。**这是本节里唯一能被客户端观察到的上限**（实测：24 个 32 字节的
+           *   小字段 ⇒ `LIMIT_FIELD_COUNT` ⇒ 400，而字段总量远在 `fieldSize` 与 `fileSize` 之下）；
+           * - `fieldSize: 64 KiB`：单个字段值的上限（busboy 默认 1 MiB 对「一个注释」而言太宽）。
+           *   实测 96 KiB 的字段 ⇒ `LIMIT_FIELD_VALUE` ⇒ 400。与 `fields` 是**两条不同**的路径
+           *   （单个太大 vs 个数太多），因此都要写；
+           * - `parts: 17` = `fields + files`：总数上限（实测第 18 个部分 ⇒ `LIMIT_PART_COUNT` ⇒ 400）。
+           *   它是前两条的兜底：将来把 `fields`/`files` 调大而忘了这一条时，它仍然封住总量。
+           *   `parts` 是**总数**（文件 + 字段），因此写成 `fields + files`——两个数字不该各写一份；
+           * - `files: 1`：多给一个文件是错的，早失败比晚失败好。**据实记载：这一条在今天的
+           *   客户端行为上与「没有它」无法区分**——实测带它时 busboy 报 `LIMIT_FILE_COUNT`，
+           *   不带时 multer 的 `.single()` 报 `LIMIT_UNEXPECTED_FILE`，两者都是 400、都清掉第一个
+           *   文件（`evidence/t1-fix1-probe-multer-limits.txt`）。留着它的理由是**接线会变**：
+           *   若将来某条路由改用 `.array()`/多字段形式，`.single()` 那道拦截就没了，而这条上限
+           *   仍然在（那时它才有判别力）。它不是可以顺手删掉的装饰。
+           *
+           * 超限的表现是 multer 的 `LIMIT_PART_COUNT` / `LIMIT_FIELD_COUNT` / `LIMIT_FIELD_VALUE` /
+           * `LIMIT_FILE_COUNT` / `LIMIT_UNEXPECTED_FILE`，Nest 的 `FileInterceptor` 把它们一律翻成
+           * **400**（处理器不会被调用），因此这里**不会**把「字段/形状太多」变成 413——
+           * 413 只属于 `fileSize`。
+           */
+          limits: {
+            fileSize: maxBytes,
+            files: 1,
+            fields: 16,
+            fieldSize: 64 * 1024,
+            parts: 17,
+          },
         };
       },
     }),

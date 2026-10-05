@@ -99,11 +99,20 @@ export class LocalArtifactStore implements ArtifactStore {
     const handle = await open(target, 'r');
     try {
       const buffer = Buffer.alloc(length);
-      const { bytesRead } = await handle.read(buffer, 0, length, start);
-      if (bytesRead !== length) {
-        // 短读 = 密文被截断（或键指向了别的东西）。此处**必须**响亮：
+      // **循环读满**：常规文件上的 `read()` 允许返回短读（它只保证「至少 1 字节，除非 EOF」，
+      // 不保证读满请求的长度）。把一次短读当成截断，会让一次合法读取报出「密文被截断」——
+      // 假阳性比漏报更贵：Task 3 的读取器按块长度算区间，它会去查一个根本不存在的损坏。
+      // 因此这里读**到 EOF 为止**，只有 EOF 提前到来（`bytesRead === 0`）才是真截断。
+      let offset = 0;
+      for (;;) {
+        const { bytesRead } = await handle.read(buffer, offset, length - offset, start + offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+      }
+      if (offset !== length) {
+        // 真截断（或键指向了别的东西）。此处**必须**响亮：
         // Task 3 的读取器按块长度算区间，静默回短缓冲会把截断读成合法数据。
-        throw new Error(`制品读取不足：区间 [${start}, ${endInclusive}] 期望 ${length} 字节，实际 ${bytesRead}`);
+        throw new Error(`制品读取不足：区间 [${start}, ${endInclusive}] 期望 ${length} 字节，实际 ${offset}`);
       }
       return buffer;
     } finally {

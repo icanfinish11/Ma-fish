@@ -41,6 +41,16 @@ const withTestEnv = { env: testEnv };
  */
 const globalSetup = ['./vitest.setup.ts'];
 
+/**
+ * 每个 worker 一个制品卷目录（修复轮 1 / Fix 5）。
+ *
+ * 必须写成 `setupFiles` 而不是在夹具或模块里推导：应用的配置在**模块求值期**解析，
+ * 而测试文件里的 import 提升会让「文件内任何语句」都晚于那次求值（实测两次，
+ * 见 `tests/setup/artifact-store.ts` 与 `evidence/t1-fix1-diag2.txt` / `t1-fix1-diag3.txt`）。
+ * `setupFiles` 是唯一早于测试文件的钩子。
+ */
+const setupFiles = ['./tests/setup/artifact-store.ts'];
+
 export default defineConfig({
   resolve: { alias },
   test: {
@@ -54,8 +64,8 @@ export default defineConfig({
       // （`scripts/assert-tests-ran.mjs`：读 json reporter 的**实际执行条数**并要求不低于
       // 登记的下限），这两处是同一个要求在不同入口上的落点。
       { resolve: { alias }, test: { name: 'unit', ...withTestEnv, include: ['tests/unit/**/*.test.ts'] } },
-      { resolve: { alias }, test: { name: 'integration', ...withTestEnv, include: ['tests/integration/**/*.test.ts'], testTimeout: 120_000, hookTimeout: 180_000 } },
-      { resolve: { alias }, test: { name: 'security', ...withTestEnv, include: ['tests/security/**/*.test.ts'], testTimeout: 120_000, hookTimeout: 180_000 } },
+      { resolve: { alias }, test: { name: 'integration', ...withTestEnv, setupFiles, include: ['tests/integration/**/*.test.ts'], testTimeout: 120_000, hookTimeout: 180_000 } },
+      { resolve: { alias }, test: { name: 'security', ...withTestEnv, setupFiles, include: ['tests/security/**/*.test.ts'], testTimeout: 120_000, hookTimeout: 180_000 } },
       { resolve: { alias }, test: { name: 'property', ...withTestEnv, include: ['tests/property/**/*.test.ts'], testTimeout: 300_000 } },
       // 架构守护 project 需要显式的超时：`tests/architecture/module-boundaries.test.ts`
       // 会**起一个子进程**跑 depcruise（整棵 apps/ + packages/ 的静态分析）。单独跑约 1 秒，

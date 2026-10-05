@@ -45,6 +45,47 @@ export interface TestRedis {
   stop(): Promise<void>;
 }
 
+/**
+ * 收尾竞态会产生的错误（**接住它们正是上面第 2 条的理由**）。
+ *
+ * 这一行是「一个**完整的**清单」而不是随手几个码：漏掉一个的失效形态正是本文件要消灭的东西
+ * ——`[test-redis] write ECONNABORTED` 曾经从 `t1-final-test.txt` 漏进 stderr，
+ * 因为当时的清单只有 `EPIPE|ECONNRESET|Connection is closed`（修复轮 1 / Fix 2）。
+ *
+ * 分类依据（**只收「对端已消失」类**）：
+ *
+ * - `EPIPE`：socket 已关，写入撞上已关闭的管道（容器先停、或对端已关）；
+ * - `ECONNRESET`：对端发了 RST（testcontainers 停容器时会这样）；
+ * - `ECONNABORTED`：本机在连接被中断后**仍在写**（容器已消失，写操作被中止）——
+ *   即实测漏出来的那一个；
+ * - `ESHUTDOWN`：socket 在写入期间被优雅关闭（`end()` 之后 socket 已停）；
+ * - `ERR_STREAM_DESTROYED` / `Stream isn't writeable`：ioredis 在 `disconnect()` 之后
+ *   到达的命令撞上已销毁的流（与 `Connection is closed.` 同一类，见 `redis.module.ts`）。
+ *
+ * **刻意不收**：`ECONNREFUSED` / `ETIMEDOUT` / `ENOTFOUND`。那些是「连不上容器」，
+ * 属于真实故障——若被静音，失效形态会变成「会话/限流断言以一堆 403/500 失败」，
+ * 而 stderr 里一句解释都没有。清单之外的错误照旧打到 stderr，这个监听器不是静音开关。
+ */
+const TEARDOWN_ERRORS =
+  /EPIPE|ECONNRESET|ECONNABORTED|ESHUTDOWN|ERR_STREAM_DESTROYED|Stream isn't writeable|Connection is closed/;
+
+/**
+ * 这个错误是不是「容器收尾」的噪音（**导出是为了让它可被直接测**）。
+ *
+ * `tests/integration/asset/upload-rules.test.ts` 对「哪些码被吞、哪些码照旧上报」
+ * 逐条断言：清单过窄会让噪音漏出（本轮的缺陷），过宽会把**真实故障**静音——
+ * 后者更贵，而且没有任何别的东西会红。把判据抽成一个纯函数，才能在不造 socket 故障的前提下
+ * 把这两侧都钉住。
+ *
+ * 同时看 `err.code`：socket 错误的稳定判据是那个码，而消息文本随 Node 版本漂移
+ * （`write ECONNABORTED` 里的 `write ` 前缀就是 Node 自己加的）。两者都过一遍是为了不漏，
+ * 不是为了多放行。
+ */
+export function isTeardownError(err: Error): boolean {
+  const code = (err as { code?: unknown }).code;
+  return TEARDOWN_ERRORS.test(err.message) || (typeof code === 'string' && TEARDOWN_ERRORS.test(code));
+}
+
 /** 起一个一次性 Redis 容器（`redis:7-alpine`，与 `infra/docker-compose.yml` 同版本）。 */
 export async function startTestRedis(): Promise<TestRedis> {
   const container: StartedRedisContainer = await new RedisContainer('redis:7-alpine').start();
@@ -54,7 +95,7 @@ export async function startTestRedis(): Promise<TestRedis> {
     newClient: () => {
       const client = new Redis(url, { retryStrategy: () => null, maxRetriesPerRequest: 1 });
       client.on('error', (err: Error) => {
-        if (!/EPIPE|ECONNRESET|Connection is closed/.test(err.message)) {
+        if (!isTeardownError(err)) {
           process.stderr.write(`[test-redis] ${err.message}\n`);
         }
       });

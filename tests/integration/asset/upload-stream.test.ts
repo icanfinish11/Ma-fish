@@ -33,7 +33,19 @@ import type { ArtifactStore } from '@vca/api/modules/asset/store/artifact-store.
  * - **上限**：超限 ⇒ 413，且制品库里**一个残留都没有**（验收判据）；
  * - **身份**：未认证 ⇒ 403 且一个字节都没写（这条钉住「上传不是 @Public()」）。
  */
-const STORE_DIR = testEnv.ARTIFACT_STORE_DIR as string;
+/**
+ * 本套件的制品目录：由 `tests/setup/artifact-store.ts`（Vitest 的 `setupFiles`）按 worker 定下。
+ *
+ * 读 `process.env` 而不是自己拼一个路径：应用读的也是这个变量，两者必须是**同一个值**
+ * （一个进程只有一份）。为什么它不能在本文件里推导、也不能写在夹具里：
+ * 应用的配置在**模块求值期**解析，而本文件的 import 提升会让文件内任何语句都晚于那次求值
+ * ——实测两轮（`evidence/t1-fix1-diag2.txt`、`t1-fix1-diag3.txt`），三条用例都变红。
+ *
+ * 每个 worker 一个目录的理由：本文件在 `beforeAll`/`beforeEach` 里 `rm -rf` 这个目录，
+ * 固定的共享路径会让两个并发文件互相删掉对方正在用的对象，失败形态是
+ * 「上传成功但读回是空」——看不出原因。
+ */
+const STORE_DIR = process.env.ARTIFACT_STORE_DIR as string;
 const MAX_UPLOAD_BYTES = Number(testEnv.ARTIFACT_MAX_UPLOAD_BYTES);
 const BOUNDARY = 'vca-test-boundary-2f9c';
 
@@ -159,6 +171,8 @@ describe('上传接入与制品存储（Task 1）', () => {
   let port: number;
   let sessionId: string;
   let csrf: string;
+  /** 会话用户名的序号：见 `beforeEach` 里「每个用例一个用户」的理由。 */
+  let userSeq = 0;
 
   beforeAll(async () => {
     await rm(STORE_DIR, { recursive: true, force: true });
@@ -170,21 +184,32 @@ describe('上传接入与制品存储（Task 1）', () => {
     await new Promise<void>((resolve) => server.listen(0, resolve));
     port = (server.address() as { port: number }).port;
 
-    // 真会话（走 SessionService 本身，不是伪造的上下文）：上传路由的策略声明要求登录。
-    sessionId = (await app.get(SessionService).create('user-uploader', { ip: '127.0.0.1', userAgent: 'vitest' }))
-      .sessionId;
     csrf = await fetchCsrfToken(app);
   }, 180_000);
 
   afterAll(async () => {
     await app?.close();
     await redis?.stop();
+    // 只删**本 worker 自己的**目录（每 worker 一个，见文件头）。不再动 `process.env`：
+    // 那个值由 `tests/setup/artifact-store.ts` 定下，本进程内所有用例共用同一个目录，
+    // 因此这里没有「改了全局输入要还原」的账——它本来就是这个 worker 的配置。
     await rm(STORE_DIR, { recursive: true, force: true });
   });
 
   beforeEach(async () => {
     // 每个用例从空库开始：「无残留」这类断言需要一个已知的起点。
     await rm(STORE_DIR, { recursive: true, force: true });
+
+    // **每个用例一个用户**，而不是共用 `beforeAll` 里那一个（修复轮 1 / Fix 6）。
+    //
+    // `upload` 层是 **10 次 / 24 小时 / 用户**（`RATE_LIMITS.upload`，按当事人分桶），
+    // 而本文件光已认证请求就有 8 次（本用例 1 + 流式 1 + 超限 1 + 重试 2 + 缺字段 1…）。
+    // 共用一个用户时余量只剩 2 次：**下一个上传用例会以 429 红**，而那个失败看起来像产品缺陷
+    // （状态码断言直接指向限流，没人会想到是夹具的账已透支）。
+    // 每用例一个用户让「本用例用掉了几次配额」变成局部可算的量——余量永远是 10 减去本用例的次数。
+    userSeq += 1;
+    sessionId = (await app.get(SessionService).create(`user-uploader-${userSeq}`, { ip: '127.0.0.1', userAgent: 'vitest' }))
+      .sessionId;
   });
 
   it('上传成功：字节原样入库，返回键与字节数', async () => {
@@ -258,6 +283,23 @@ describe('上传接入与制品存储（Task 1）', () => {
       .field('note', '没有附件');
 
     expect(res.status).toBe(400);
+    await expect(storedObjects()).resolves.toEqual([]);
+  });
+
+  it('字段过多：400（不靠 fileSize 兜底），且不落地任何字节', async () => {
+    // 这条钉住 `asset.module.ts` 的 `limits.fields`（修复轮 1 / Fix 4）。
+    // 失效形态是**静默**的：没有这一条时，请求只是多解析 16 个字段就成功——
+    // 「字段面有界」这件事在测试里没有任何痕迹。这里发到超过上限为止（`fields: 16` ⇒ 第 17 个触发）。
+    const big = request(app.getHttpServer())
+      .post('/assets/upload')
+      .set('Cookie', `${SESSION_COOKIE}=${sessionId}; ${CSRF_COOKIE}=${csrf}`)
+      .set(CSRF_HEADER, csrf);
+    for (let i = 0; i < 24; i++) void big.field(`f${i}`, 'x'.repeat(32));
+
+    const res = await big;
+
+    // 400 而不是 413：`LIMIT_FIELD_COUNT` 是**请求形状**错误，413 只属于 `fileSize`。
+    expect(res.status, `响应体=${res.body}`).toBe(400);
     await expect(storedObjects()).resolves.toEqual([]);
   });
 
