@@ -124,6 +124,22 @@ describe('每个路由都必须有明确的限流归属（修复轮 1 / C-4）',
       });
       // 登录/注册之外的写路由（P0 只有 logout）也必须显式表态，而不是靠「忘了写」。
       expect(registry.find('AuthController', 'logout')).toMatchObject({ rateLimit: null, rateLimitSkipped: true });
+
+      /**
+       * **Task 8 新增的三条路由**：都归属 `search` 那一层（60 次/分钟，按 IP）。
+       *
+       * 为什么是 `search` 而不是新加一档 `download`：`RATE_LIMITS` 是设计文档 §4.1
+       * 威胁 #13 那张表的投影，**新增一个安全参数是一次设计裁定**（阈值多少、按什么分桶），
+       * 不是实现者可以顺手做的；而 `search` 是表里唯一「按 IP、短窗口」的档。
+       * 代价（名字叫 search 而挂的是下载与元数据）与改法都写在 `asset.controller.ts`
+       * 的类注释里。这里的断言是「归属**确实**被声明了」——漏一个就会红。
+       */
+      for (const handler of ['issueDownloadUrl', 'download', 'readMetadata'] as const) {
+        expect(registry.find('AssetController', handler), `AssetController.${handler} 没有限流归属`).toMatchObject({
+          rateLimit: 'search',
+          rateLimitSkipped: false,
+        });
+      }
     });
   });
 

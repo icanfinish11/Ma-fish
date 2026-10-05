@@ -8,11 +8,11 @@ import { SESSION_COOKIE } from '@vca/api/common/http/cookie.js';
 import { PrismaService } from '@vca/api/db/prisma.service.js';
 import { REDIS } from '@vca/api/db/redis.module.js';
 import { SessionService } from '@vca/api/modules/auth/session.service.js';
-import { AuditService } from '@vca/api/modules/audit/index.js';
 import { AssetService } from '@vca/api/modules/asset/asset.service.js';
 import { AssetVersionService } from '@vca/api/modules/asset/asset-version.service.js';
 import { OwnershipService } from '@vca/api/modules/asset/ownership.service.js';
 import { createKeyRing, type KeyRing } from '@vca/api/modules/asset/crypto/key-ring.js';
+import { FOOTER_BYTES, decodeFooter } from '@vca/api/modules/asset/crypto/artifact-format.js';
 import { parseMetadata } from '@vca/api/modules/asset/metadata/parse-metadata.js';
 import { ARTIFACT_STORE, type ArtifactStore } from '@vca/api/modules/asset/store/artifact-store.port.js';
 import { LocalArtifactStore } from '@vca/api/modules/asset/store/local-artifact.store.js';
@@ -115,10 +115,24 @@ class SwappingStore implements ArtifactStore {
   }
 }
 
+/**
+ * 响应体的**原始字节**（两种取法都要支持）。
+ *
+ * 有的请求用默认解析（JSON 进了 `res.body`、原文进 `res.text`），有的用自定义解析
+ * （`res.body` 就是 Buffer）。判据落在字节上时不能靠 `res.text`——它在自定义解析下
+ * 是 `undefined`，而 `undefined ?? ''` 会让「零字节」这条断言**恒真**
+ * （一条在两种取法之间摇摆的判据比没有判据更糟，因此这里显式分开）。
+ */
+function responseBytes(res: request.Response): Buffer {
+  const body: unknown = res.body;
+  if (Buffer.isBuffer(body)) return body;
+  return Buffer.from(typeof res.text === 'string' ? res.text : '', 'utf8');
+}
+
 /** 判据：响应体里**一个制品的字节都没有**（被拒时不许流出半个文件）。 */
 function expectNoArtifactBytes(res: request.Response, plaintext: Buffer): void {
   expect(res.headers['content-type'] ?? '', `被拒的响应不是 JSON：${res.headers['content-type']}`).toContain('json');
-  const body = Buffer.from(res.text ?? '', 'utf8');
+  const body = responseBytes(res);
   // 制品的最小可能形态也远大于 1 KiB 的错误体；这条是「没有把文件当错误体发出去」
   // 的第一道信号，第二条是内容判据（连前 16 字节都不许出现）。
   expect(body.length, `错误响应体里带了 ${body.length} 字节`).toBeLessThan(1024);
@@ -213,6 +227,24 @@ describe('签名下载（D10）：授权、单次使用、超时、篡改、审�
   function redeem(path: string, forwardedFor?: string): request.Test {
     const req = request(app.getHttpServer()).get(path);
     return forwardedFor === undefined ? req : req.set('X-Forwarded-For', forwardedFor);
+  }
+
+  /**
+   * 兑换并把响应体**原样**收成 Buffer。
+   *
+   * 收原始字节而不是让 supertest 按 `Content-Type` 解析：成功时响应体是制品（二进制），
+   * 「被拒时零字节」这条判据也只有在**原始字节**上才有意义（一个被解析过的对象
+   * 证明不了「发的不是文件」）。
+   */
+  function redeemBytes(path: string): request.Test {
+    return request(app.getHttpServer())
+      .get(path)
+      .buffer(true)
+      .parse((res, callback) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => callback(null, Buffer.concat(chunks)));
+      });
   }
 
   /** 这个版本身上的全部审计行（按时间）。 */
@@ -319,11 +351,7 @@ describe('签名下载（D10）：授权、单次使用、超时、篡改、审�
     const { cookie } = await login(owner);
 
     const issued = await issue(versionId, cookie);
-    const res = await redeem((issued.body as { url: string }).url).buffer(true).parse((r, cb) => {
-      const chunks: Buffer[] = [];
-      r.on('data', (chunk: Buffer) => chunks.push(chunk));
-      r.on('end', () => cb(null, Buffer.concat(chunks)));
-    });
+    const res = await redeemBytes((issued.body as { url: string }).url);
 
     expect(res.status, `响应体=${res.text}`).toBe(200);
     const served = res.body as Buffer;
@@ -369,14 +397,19 @@ describe('签名下载（D10）：授权、单次使用、超时、篡改、审�
     const url = (await issue(versionId, cookie)).body as { url: string };
 
     // 两个**同时**发出的请求：先 GET 再 SET 的实现会让两个都过（各自都看到「键不存在」）。
-    const [a, b] = await Promise.all([redeem(url.url).buffer(true), redeem(url.url).buffer(true)]);
+    // 用同步的 `Promise.all` 而不是 `await` 两次——后者在时间上根本不会重叠。
+    const [a, b] = await Promise.all([redeemBytes(url.url), redeemBytes(url.url)]);
     const statuses = [a.status, b.status].sort((x, y) => x - y);
 
     expect(statuses, `两个并发请求的状态码：${a.status} / ${b.status}`).toEqual([200, 403]);
     const winner = a.status === 200 ? a : b;
     expect((winner.body as Buffer).equals(plaintext), '赢的那个请求拿到的字节不对').toBe(true);
     const loser = a.status === 200 ? b : a;
-    expect((loser.body as { code?: string }).code).toBe('ASSET_DOWNLOAD_TICKET_REPLAYED');
+    // 输的那个必须**一个字节都没有**（它是被拒的响应，不是半份文件）
+    expectNoArtifactBytes(loser, plaintext);
+    expect((JSON.parse((loser.body as Buffer).toString('utf8')) as { code?: string }).code).toBe(
+      'ASSET_DOWNLOAD_TICKET_REPLAYED',
+    );
   });
 
   it('超时：手工签一张已过期的票 ⇒ 403（EXPIRED）+ 审计行（当事人来自票据，因此可信）', async () => {
@@ -418,6 +451,10 @@ describe('签名下载（D10）：授权、单次使用、超时、篡改、审�
     const { cookie } = await login(owner);
     const issued = (await issue(versionId, cookie)).body as { url: string };
     const query = Object.fromEntries(new URLSearchParams(issued.url.split('?')[1] as string));
+    // 签发本身写了一行（那是**真的**发生过的授权）。要断言的是：伪造的那些尝试
+    // **一行都不加**——因此先记下此刻的行数，再比。
+    const afterIssuance = await auditRows(versionId);
+    expect(afterIssuance.map((row) => row.action)).toEqual(['asset.download_url_issued']);
 
     const tampered: Array<[string, Record<string, unknown>]> = [
       ['把 userId 换成别人', { ...query, userId: stranger }],
@@ -432,13 +469,13 @@ describe('签名下载（D10）：授权、单次使用、超时、篡改、审�
 
     for (const [label, q] of tampered) {
       const path = `/assets/download?${new URLSearchParams(q as Record<string, string>).toString()}`;
-      const res = await redeem(path);
+      const res = await redeemBytes(path);
       expect(res.status, `${label} ⇒ ${res.status}（响应体=${res.text}）`).toBe(403);
       expectNoArtifactBytes(res, sampleBytes('ok.zip'));
     }
 
-    // 一次都不许写审计：那条 `userId` 是攻击者填的，写进去就是一条他编的内容
-    expect(await auditRows(versionId)).toEqual([]);
+    // 一次都不许写审计：那些 `userId` 是攻击者填的，写进去就是一条他编的内容
+    expect(await auditRows(versionId)).toEqual(afterIssuance);
   });
 
   it('转让之后：前手手里那张票失效（兑换时**再判一次** checkAccess），新属主可以重新签发', async () => {
@@ -578,12 +615,31 @@ describe('签名下载：制品被换成更短的自洽制品时，带外长度�
     return (res.body as { url: string }).url;
   }
 
+  /**
+   * 兑换并保留**原始字节**（与上一节的 `redeemBytes` 同款）。
+   *
+   * 本节既有 200（响应体是制品）又有 422（响应体是 JSON），因此统一收字节、
+   * 在需要时**显式** `JSON.parse` —— 「零字节」这条判据只能在原始字节上做。
+   */
   function download(path: string): request.Test {
-    return request(app.getHttpServer()).get(path).buffer(true).parse((r, cb) => {
-      const chunks: Buffer[] = [];
-      r.on('data', (chunk: Buffer) => chunks.push(chunk));
-      r.on('end', () => cb(null, Buffer.concat(chunks)));
-    });
+    return request(app.getHttpServer())
+      .get(path)
+      .buffer(true)
+      .parse((res, callback) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => callback(null, Buffer.concat(chunks)));
+      });
+  }
+
+  /** 从一个「被拒」的响应里取出 JSON 错误体（解析失败时把原文带进断言消息）。 */
+  function errorBody(res: request.Response): { code?: string; kind?: string; reason?: string } {
+    const raw = responseBytes(res);
+    try {
+      return JSON.parse(raw.toString('utf8')) as { code?: string; kind?: string; reason?: string };
+    } catch {
+      throw new Error(`被拒的响应不是 JSON（${raw.length} 字节）：${raw.subarray(0, 64).toString('latin1')}`);
+    }
   }
 
   it('被换成更短的制品（长度仍记为原值）⇒ 422 + **零字节**：核对发生在写出第一个字节之前', async () => {
@@ -598,7 +654,7 @@ describe('签名下载：制品被换成更短的自洽制品时，带外长度�
       const res = await download(await issue(versionId, cookie));
 
       expect(res.status, `响应体=${res.text}`).toBe(422);
-      const body = res.body as { code?: string; kind?: string; reason?: string };
+      const body = errorBody(res);
       expect(body.code).toBe('ASSET_ARCHIVE_REJECTED');
       // 长度不符是在**读任何字节之前**判定的 ⇒ 类型还不该被声称为已知（没走到嗅探）
       expect(body.kind).toBe('unknown');
@@ -646,11 +702,12 @@ describe('签名下载：制品被换成更短的自洽制品时，带外长度�
 
   it('尾块被改一位（长度自洽）⇒ 422 + 零字节：末块认证在任何结论之前', async () => {
     const { versionId, storageKey, original, cookie } = await setupVersion();
-    const artifact = await app.get<ArtifactStore>(ARTIFACT_STORE).getRange(storageKey, 0, (await app.get<ArtifactStore>(ARTIFACT_STORE).stat(storageKey)).bytes - 1);
+    const storePort = app.get<ArtifactStore>(ARTIFACT_STORE);
+    const size = (await storePort.stat(storageKey)).bytes;
+    const artifact = await storePort.getRange(storageKey, 0, size - 1);
     const forged = Buffer.from(artifact);
     // 末块的最后一个字节（tag 的末字节）：结构、长度、条数全部不变
-    const { decodeFooter } = await import('@vca/api/modules/asset/crypto/artifact-format.js');
-    const indexOffset = Number(decodeFooter(forged.subarray(forged.length - 24)).indexOffset);
+    const indexOffset = Number(decodeFooter(forged.subarray(forged.length - FOOTER_BYTES)).indexOffset);
     forged[indexOffset - 1] = forged[indexOffset - 1]! ^ 0xff;
 
     store.substitute = { key: storageKey, bytes: forged };
@@ -658,8 +715,9 @@ describe('签名下载：制品被换成更短的自洽制品时，带外长度�
       const res = await download(await issue(versionId, cookie));
 
       expect(res.status, `响应体=${res.text}`).toBe(422);
-      expect((res.body as { kind?: string }).kind).toBe('unknown');
-      expect(String((res.body as { reason?: string }).reason)).toContain('末块认证失败');
+      const body = errorBody(res);
+      expect(body.kind).toBe('unknown');
+      expect(String(body.reason)).toContain('末块认证失败');
       expectNoArtifactBytes(res, original);
     } finally {
       store.substitute = null;
@@ -708,8 +766,6 @@ describe('资产模块的新路由归属 P0 的限流层（打到上限即 429�
   let store: SwappingStore;
   let assets: AssetService;
   let versions: AssetVersionService;
-  let sessions: SessionService;
-  let csrf: string;
 
   beforeAll(async () => {
     redis = await startTestRedis();
@@ -726,8 +782,8 @@ describe('资产模块的新路由归属 P0 的限流层（打到上限即 429�
     });
     assets = app.get(AssetService);
     versions = app.get(AssetVersionService);
-    sessions = app.get(SessionService);
-    csrf = await fetchCsrfToken(app);
+    // 这一节打的是**公开**的元数据端点（不需要会话），CSRF 令牌也不必带：
+    // GET 是安全方法，`CsrfGuard` 对它不做校验（C13 只覆盖写操作）。
   }, 240_000);
 
   afterAll(async () => {

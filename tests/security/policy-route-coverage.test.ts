@@ -94,6 +94,39 @@ describe('每个路由都必须有策略声明（§9 / 验收 13.2）', () => {
         isPublic: true,
         decl: null,
       });
+
+      /**
+       * **Task 8 新增的三条路由**（Step 6：让这道门包含它们）。
+       *
+       * 这道门本身是**通用**的：它枚举真实 `AppModule` 的全部路由，因此新路由一注册就
+       * 自动进它的视野——**「漏声明必须让测试失败」这条性质不需要为新路由改代码**
+       * （变异探针实测：把 `@Policy` 从下载路由上删掉，第一条用例立刻红并点名那条路径）。
+       *
+       * 那这里为什么还要逐条断言？因为「门会红」与「门**看得见**这三条新路由」是两件事：
+       * 若新路由因为模块没被 `imports` 进 `AppModule`（或路径写成了别的东西）而**根本没被
+       * 注册**，第一条用例照样全绿（`undeclared` 是空数组），而那三条路由在运行期
+       * 会是 404——一个「门看不见」的盲区，正是 `HealthController` 那一条存在的理由。
+       */
+      expect(registry.find('AssetController', 'issueDownloadUrl'), '新路由没被注册表发现').toMatchObject({
+        path: '/assets/versions/:versionId/download-url',
+        isPublic: false,
+        decl: { resource: 'Asset', action: 'download' },
+      });
+      expect(registry.find('AssetController', 'download'), '公开的下载路由必须**显式**标 @Public').toMatchObject({
+        path: '/assets/download',
+        isPublic: true,
+        decl: null,
+      });
+      expect(registry.find('AssetController', 'readMetadata')).toMatchObject({
+        path: '/assets/versions/:versionId/metadata',
+        // §9 矩阵里「Asset 元数据 read = 所有人」那一行由 @Public() 独占表达
+        isPublic: true,
+        decl: null,
+      });
+      expect(registry.find('AssetController', 'upload')).toMatchObject({
+        path: '/assets/upload',
+        decl: { resource: 'Asset', action: 'create' },
+      });
     });
   });
 

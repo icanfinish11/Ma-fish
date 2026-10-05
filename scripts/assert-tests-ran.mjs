@@ -66,7 +66,12 @@ const GATES = {
   // `tests/security/` 里的用例。这一轮把那九条（八样本 + 零落盘）**搬进** security 门
   // （`tests/security/validate-archive-samples.test.ts`，复用同一份样本生成器与构造辅助，
   // 不是复制两份），下限随之对齐到实际执行数：59 → 68。任何删除现在都会红一次。
-  security: 68,
+  //
+  // P1 / Task 8：越权矩阵（判据 11）落在 `tests/security/asset/authz-matrix.test.ts`——17 条
+  // （4 端点 × 4 角色 + 1 条「矩阵覆盖全部已注册路由」）。**它必须进入被计数的门**：
+  // 「未授权用户拿不到签名 URL」是 P1 的三条判据之一，而这条控制在 security 的账上
+  // 才有「被静默删掉就会红」的性质。下限随之对齐到实际执行数：68 → 85。
+  security: 85,
   architecture: 5,
 };
 
