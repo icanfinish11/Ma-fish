@@ -26,6 +26,22 @@ import { NotifyModule } from '@vca/api/modules/notify/index.js';
  * `notify` 的内部布局。现在两者都只从 `modules/notify/index.js` 取
  * （`NotifyModule` / `OutboxConsumer`），这条边界由 `.dependency-cruiser.cjs` 的
  * `no-cross-module-internals` 守着——`apps/worker` 深引 `modules/*` 的内部文件会直接报错。
+ *
+ * ## 为什么这里**没有** `LedgerModule`（P2 裁定；复访触发条件在下）
+ *
+ * P2 的控制器裁定里曾写「P2 的结算跑在 worker 里」，**这句话不成立**：P2 不交付任何
+ * 业务状态机（C29），因此 P2 里**没有任何 worker 侧的账本写者**。把 `LedgerModule`
+ * 放进这个 `imports` 会是「一个零调用方的模块进了 worker 的依赖图」（C16）——
+ * 账本在 P2 里只被 api 侧的管理员额度发放路由与测试调用。P2 计划据此明确不改本文件。
+ *
+ * 但 worker 的**运行期角色校验**照旧在 P2 补上了（`main.ts` 里 `assertRuntimeDbRole`，
+ * 设计 §14 点名它是 P1 的欠账）：worker 与 api 共用同一个 `DATABASE_URL` 契约与同一个库，
+ * 「账本 append-only 在这条连接上是不是空操作」这个问题它今天就该回答。
+ *
+ * **复访触发条件：worker 第一次写账本时（P3 结算），同一次改动里必须**
+ * **(a) `imports` 加 `LedgerModule`，(b) 加对账（不变式 #2）的周期执行者（计划 D11）。**
+ * 两条必须一起做，因为它们共享同一个理由：worker 是唯一能**自动**动账本的进程——
+ * 一旦它开始写账本，没人周期性对账就意味着不变式 #2 又回到了「声明了但未强制」。
  */
 @Module({ imports: [ConfigModule, DbModule, NotifyModule] })
 export class WorkerModule {}

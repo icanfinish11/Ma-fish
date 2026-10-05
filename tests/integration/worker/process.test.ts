@@ -86,6 +86,15 @@ describe('worker 进程（C15）', () => {
         await waitForOutput(run, CONSUME_FAILED, 10_000),
         `worker 没有在消费失败后记录可观测的一行。输出末段：${run.output().slice(-800)}`,
       ).toBe(true);
+      // **反空转**（P2 / Task 3）：只断言「它起来了」是不够的——如果运行期角色检查在
+      // 「连不上库」这条路径上**根本没跑**（例如被某段早退绕过），这一条也会绿。
+      // 断言那行 `unverifiable` 的 warn 存在，才证明检查**执行了并降级**，
+      // 而不是没执行。两种形态的差别正是「边界」与「缺口」的差别。
+      expect(
+        run.output(),
+        '运行期角色检查在连接故障时既没有检查、也没有记一行降级说明——' +
+          '「连不上不拒绝启动」这条边界没有被真正行使',
+      ).toContain('未能完成');
     } finally {
       run.child.kill('SIGKILL');
       await waitForExit(run.child, 5_000);
