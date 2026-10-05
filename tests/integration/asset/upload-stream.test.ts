@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import { readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import request from 'supertest';
@@ -8,12 +9,11 @@ import { createTestApp } from '../../helpers/app.js';
 import { startTestRedis, type TestRedis } from '../../helpers/redis.js';
 import { fetchCsrfToken } from '../../helpers/csrf.js';
 import { testEnv } from '../../helpers/env.js';
+import { buildZip } from '../../fixtures/archives/generate.js';
 import { REDIS } from '@vca/api/db/redis.module.js';
 import { SESSION_COOKIE } from '@vca/api/common/http/cookie.js';
 import { CSRF_COOKIE, CSRF_HEADER } from '@vca/api/common/security/csrf.middleware.js';
 import { SessionService } from '@vca/api/modules/auth/session.service.js';
-import { ARTIFACT_STORE } from '@vca/api/modules/asset/store/artifact-store.port.js';
-import type { ArtifactStore } from '@vca/api/modules/asset/store/artifact-store.port.js';
 
 /**
  * 上传接入的端到端契约（P1 / Task 1）。
@@ -63,6 +63,16 @@ function chunked(buffer: Buffer, chunkSize: number): Buffer[] {
     chunks.push(buffer.subarray(offset, Math.min(offset + chunkSize, buffer.length)));
   }
   return chunks;
+}
+
+/** 轮询直到条件成立（用于「异步清理最终会完成」这一类判据）。 */
+async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 5000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return false;
 }
 
 /** 库里现有的对象（相对路径 + 字节数）。用递归列目录而不是猜路径，才看得见「临时副本」。 */
@@ -212,42 +222,67 @@ describe('上传接入与制品存储（Task 1）', () => {
       .sessionId;
   });
 
-  it('上传成功：字节原样入库，返回键与字节数', async () => {
-    const body = payload(256 * 1024, 7);
+  it('上传成功：明文加密后入库（密文对象），返回版本记录', async () => {
+    // **Task 5 起这个负载必须是真的归档**：上传路径现在会在写完之后立刻校验内容
+    // （加密即入库，D1），随便一段字节会在 `validateArchive` 那里以 422 结束。
+    const body = buildZip([
+      { name: 'README.md', data: Buffer.from('# 加密即入库\n') },
+      // **stored（method 0）**而不是 deflate：`payload()` 是低熵的循环字节，deflate 后约 194:1，
+      // 会被 D6 的**压缩比上限（100:1）**拒掉——那是校验器在正常工作，不是这条用例要测的东西。
+      { name: 'src/index.ts', data: payload(256 * 1024, 7) },
+    ]);
 
     const res = await upload(port, body, { csrf, sessionId });
-    const parsed = JSON.parse(res.body) as { key: string; bytes: number };
+    const parsed = JSON.parse(res.body) as { sha256: string; plaintextBytes: number; kind: string };
 
     expect(res.status, `响应体=${res.body}`).toBe(201);
-    expect(parsed.bytes).toBe(body.length);
+    // 响应是版本记录里可对外的那三个字段（Task 1 的 {key, bytes} 临时形态到此结束）
+    expect(parsed.plaintextBytes).toBe(body.length);
+    expect(parsed.kind).toBe('zip');
+    expect(parsed.sha256).toBe(createHash('sha256').update(body).digest('hex'));
 
     const objects = await storedObjects();
     expect(objects).toHaveLength(1);
-    expect(objects[0]?.size).toBe(body.length);
-
-    // 逐字节比对：不是「大小对了就算对」——分块/边界处理写歪一个字节也必须红。
-    const store = app.get<ArtifactStore>(ARTIFACT_STORE);
-    const readBack = await store.getRange(parsed.key, 0, body.length - 1);
-    expect(readBack.equals(body), '库里读回的字节与上传的不一致').toBe(true);
+    // 落盘的是**密文**：对象字节数比明文多（头 + 每块 tag + 索引 + 尾部）。
+    // 旧版这条断言是 `size === body.length` 且逐字节相等——「加密即入库」之后它恒不成立，
+    // 判据因此换成「比明文大且解回来一致」（往返一致的那一半在 `ingest.test.ts` 里，
+    // 那里有真实密钥环与解密读取器）。
+    expect(objects[0]?.size).toBeGreaterThan(body.length);
   });
 
   it('请求进行中对象已在落盘（真流式），且目录里始终只有对象本身（无临时副本）', async () => {
-    const body = payload(2 * 1024 * 1024, 11);
+    // 2 MiB 的**合法 zip**（一个 stored 条目，未压缩）：内容必须真的是归档，
+    // 否则这条用例会在校验那一步以 422 结束，测不到流式行为。
+    const body = buildZip([{ name: 'big.bin', data: payload(2 * 1024 * 1024, 11) }]);
 
     const res = await upload(port, body, { csrf, sessionId, gapMs: 2 });
 
-    expect(res.status).toBe(201);
-    expect(res.observed.samples, '采样器一次都没采到（下面的断言会恒真）').toBeGreaterThan(0);
+    expect(res.status, `响应体=${res.body}`).toBe(201);
+    expect(
+      res.observed.samples,
+      '采样器几乎没采到东西——「请求进行中对象已在盘上」这条断言会因此恒真',
+    ).toBeGreaterThan(10);
     expect(
       res.observed.sawPartial,
       '整个上传期间都没见过「写到一半」的对象——这是「先把整份攒起来再落盘」的形态',
     ).toBe(true);
     expect(res.observed.maxFiles, `采样到的最大文件数=${res.observed.maxFiles}（>1 说明出现过临时副本）`).toBeLessThanOrEqual(1);
-    // 未完成字节数（已发出 − 已落盘）有界：验收口径是它，不是 RSS。
-    expect(
-      res.observed.peakUnfinished,
-      `未完成字节数峰值=${res.observed.peakUnfinished}（4 MiB 上限之下不该出现整份缓冲）`,
-    ).toBeLessThan(2 * 1024 * 1024);
+    /**
+     * **据实记载：Task 1 那条「未完成字节数有界」的断言在这里失去了判别力，已删掉。**
+     *
+     * 原来的口径是「已发出的明文 − 已落盘的字节」< 负载长度，它挡的是
+     * 「HTTP 层把整份 body 攒起来、最后才落盘」。加密即入库（Task 5）之后这个口径不再成立：
+     * 生产块大小是 **8 MiB**，而这台测试的上传上限只有 4 MiB ⇒ 任何合法负载都落在**一块之内**，
+     * 而加密器对末块要「押后」（末块标记只有流结束才知道，Task 2）⇒ 整段密文在源流结束前
+     * 根本不会出现在盘上，盘上先有的只有制品头（33 字节，也就是上面 `sawPartial` 看到的那个）。
+     * 于是这个量≈负载长度**恒成立**（实测峰值 2,097,355 = 负载 2,097,264 + multipart 框架字节），
+     * 无论 HTTP 层有没有攒整份 body。
+     *
+     * 真正的内存上界（与输入大小无关，恒为 `2 × CHUNK_SIZE + 一个源块`）在
+     * `tests/unit/asset/chunk-cipher.test.ts` 上用 16/64/128 MiB 的**未完成字节数**量过
+     * （Task 2，`evidence/t2-probe-crypto-8mib.txt`）；本文件能证明的是另外两件事：
+     * 请求还没结束对象就已经在盘上（`sawPartial`），以及目录里**始终只有对象本身**（C21：无临时副本）。
+     */
   });
 
   it('超过硬上限：413，且制品库里没有任何残留对象', async () => {
@@ -258,21 +293,33 @@ describe('上传接入与制品存储（Task 1）', () => {
 
     expect(res.status).toBe(413);
     expect(parsed.statusCode).toBe(413);
-    await expect(storedObjects()).resolves.toEqual([]);
+    /**
+     * **判据是「最终零残留」，不是「响应那一刻恰好为零」**——据实记载（Task 5 实测到的一次
+     * 满负载下的偶发失败）：存储端的「中止即删除」是**异步**的，而 multer 在超限那一刻就把
+     * 413 回了，它**不等待**存储引擎（`asset.module.ts` 记过同一条：中止时存储层交回的
+     * HttpException 会被忽略，因为 multer 已经先返回了）。于是紧随响应之后的列目录可能看到
+     * 那个**刚被 open 创建、还没来得及删**的空对象——它不是残留，只是还没删完。
+     * 这里等它删完（上限 5 秒）；真出现残留时下面这条断言照样红。
+     */
+    const cleared = await waitFor(async () => (await storedObjects()).length === 0);
+    expect(cleared, `制品库里仍有残留：${JSON.stringify(await storedObjects())}`).toBe(true);
   });
 
   it('超限中止之后，同一连接池里的下一次上传仍然正常（中止没把解析器写坏）', async () => {
     const tooBig = payload(MAX_UPLOAD_BYTES + 512 * 1024, 17);
     const oversize = await upload(port, tooBig, { csrf, sessionId });
     expect(oversize.status).toBe(413);
+    // 等上一条被中止的写入清完，下面那条「恰好一个对象」才是确定性的（理由同上一条用例）
+    await waitFor(async () => (await storedObjects()).length === 0);
 
-    const body = payload(128 * 1024, 19);
+    // 合法 zip（理由同「上传成功」那条：上传路径现在会校验内容）
+    const body = buildZip([{ name: 'ok.txt', data: payload(128 * 1024, 19) }]);
     const res = await upload(port, body, { csrf, sessionId });
 
-    expect(res.status).toBe(201);
+    expect(res.status, `响应体=${res.body}`).toBe(201);
     const objects = await storedObjects();
     expect(objects).toHaveLength(1);
-    expect(objects[0]?.size).toBe(body.length);
+    expect(objects[0]?.size).toBeGreaterThan(body.length);
   });
 
   it('缺少文件字段：400，且不落地任何字节', async () => {

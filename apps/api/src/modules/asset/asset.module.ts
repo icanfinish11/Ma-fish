@@ -4,11 +4,12 @@ import { MulterModule } from '@nestjs/platform-express';
 import type { Env } from '../../config/env.schema.js';
 import { createStreamingStorage } from '../../common/upload/stream-upload.js';
 import { AssetController } from './asset.controller.js';
+import { AssetService } from './asset.service.js';
 import { ARTIFACT_STORE, type ArtifactStore } from './store/artifact-store.port.js';
 import { LocalArtifactStore } from './store/local-artifact.store.js';
 
 /**
- * 制品存储的提供者模块。
+ * 制品存储**与接入服务**的提供者模块。
  *
  * ## 为什么它必须是一个**独立**模块（而不是 `AssetModule` 里的一条 provider）
  *
@@ -21,6 +22,16 @@ import { LocalArtifactStore } from './store/local-artifact.store.js';
  * Nest 对静态模块按类缓存实例，两边拿到的是**同一个**存储对象。
  * （这一点由 `tests/integration/asset/upload-stream.test.ts` 间接钉住：它用
  * `app.get(ARTIFACT_STORE)` 读回上传的字节，若上传走的是另一个实例/另一个目录，读回就是空。）
+ *
+ * ## Task 5 起：`AssetService` 也住在这里，理由与存储提供者**完全相同**
+ *
+ * multer 的存储引擎需要一个**会加密的 sink**（`createStreamingStorage` 的入参），
+ * 而那个 sink 就是 `AssetService`（它的 `putStream` 立即加密写入、`delete` 是唯一的
+ * 清理出口）。它必须能被上面那个动态模块的工厂注入 ⇒ 必须在动态模块自己的 `imports`
+ * 里可见 ⇒ 只能住在被 import 的这个静态模块里，不能住在 `AssetModule`。
+ *
+ * 模块名里那个 "Store" 因此比实际职责窄了一点；保留名字是**刻意的**：改名的收益只是名字
+ * 好看一点，代价是让 Task 1 那份「为什么必须独立成模块」的记载与代码对不上号。
  */
 @Module({
   providers: [
@@ -32,8 +43,10 @@ import { LocalArtifactStore } from './store/local-artifact.store.js';
         // 时引导期就已经拒绝了（schema 必填），这里能拿到的必然是显式配置过的值。
         new LocalArtifactStore(config.get('ARTIFACT_STORE_DIR', { infer: true })),
     },
+    // 加密即入库的接入服务：`putStream`（落盘的是密文）+ `finalize`（校验）+ `delete`（清理）。
+    AssetService,
   ],
-  exports: [ARTIFACT_STORE],
+  exports: [ARTIFACT_STORE, AssetService],
 })
 export class AssetStoreModule {}
 
@@ -66,16 +79,21 @@ export class AssetStoreModule {}
     AssetStoreModule,
     MulterModule.registerAsync({
       imports: [AssetStoreModule],
-      inject: [ARTIFACT_STORE, ConfigService],
-      useFactory: (store: ArtifactStore, config: ConfigService<Env, true>) => {
+      inject: [AssetService, ConfigService],
+      useFactory: (assets: AssetService, config: ConfigService<Env, true>) => {
         // **一个**上限值同时给两层：HTTP 层（`limits.fileSize`，唯一的 413 来源）与存储层
         // （`putStream({ maxBytes })`，中止并删除已写入的部分——它保证的是「无残留」，
         // 不是状态码）。两份数值迟早漂移，因此只允许有一个来源。
+        //
+        // Task 5 起这个上限的含义是**明文**字节数（用户上传的字节），而落盘的是密文：
+        // 换算与「超限即中止上游」都在 `AssetService.putStream` 里，因为只有它同时看得见
+        // 明文与制品两个量。HTTP 层这一份仍然是**明文**口径，两者因此仍然一致。
         const maxBytes = config.get('ARTIFACT_MAX_UPLOAD_BYTES', { infer: true });
         return {
-          // `ArtifactStore` 在**结构上**就满足 `UploadSink`（putStream + delete），
+          // `AssetService` 在**结构上**就满足 `UploadSink`（putStream + delete），
           // 因此不需要任何适配器——这正是把 sink 声明成本地接口的收益。
-          storage: createStreamingStorage(store, { maxBytes }),
+          // 它落盘的是**密文**（加密即入库，D1）：Task 1 时这里直接是存储本身。
+          storage: createStreamingStorage(assets, { maxBytes }),
           /**
            * 两类上限：`fileSize` 管**文件本身**，另外四条管**请求形状**。
            *
