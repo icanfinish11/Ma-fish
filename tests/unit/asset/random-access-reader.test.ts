@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -24,6 +24,7 @@ import {
   MemoryStore,
   at,
   collect,
+  countDecryptions,
   entriesOf,
   fakeRing,
   openForged,
@@ -298,6 +299,70 @@ describe('只解密所需块（验收：读尾部 N 字节解密的块数 ≤ 2�
     expect(store.requests).toEqual(expected);
     expect(blockOf(seeded.entries, 60)).toBe(0);
     expect(blockOf(seeded.entries, 199)).toBe(3);
+  });
+});
+
+describe('最近一块的 memo（修复轮 1 / Ruling 1）：判别力与「只留一格」的边界', () => {
+  /**
+   * 每条用例自己 `restore`，同时登记到 `afterEach`：断言失败时也要还原。
+   * 用的是 `countDecryptions` 而不是 `vi.spyOn`，因为 spy 会**保留每一次调用的实参**
+   * ——这里那些实参是整块明文（见该辅助函数的注释：8 MiB × 4 万次会把 worker 撑爆）。
+   */
+  let restoreDecryptions: (() => void) | null = null;
+
+  afterEach(() => {
+    // 第二道保险：断言中途失败时也必须还原替换掉的 `ChunkDecipher.prototype.decryptAt`，
+    // 否则会污染后面的用例（它们也会数解密次数）。
+    restoreDecryptions?.();
+    restoreDecryptions = null;
+  });
+
+  it('同一块连读只解密一次；换块之后**旧块必须重新解密**（刻意只留一格，不做通用缓存）', async () => {
+    const counter = countDecryptions();
+    restoreDecryptions = counter.restore;
+    const store = new MemoryStore();
+    const plaintext = pattern(3 * 64, 27);
+    const seeded = await seedArtifact(store, plaintext, { chunkSize: 64 });
+    const reader = await EncryptedArtifactReader.open(store, seeded.key, fakeRing());
+    store.reset();
+
+    // ① 块 0：解密 1 次
+    expect((await collect(reader._readStreamForRange(0, 8))).equals(plaintext.subarray(0, 8))).toBe(true);
+    expect(counter.calls()).toBe(1);
+
+    // ② 还是块 0 的**另一段**：命中 memo ⇒ 解密次数不变，**而且没有再读存储**
+    //    （存储读取与解密在同一侧：命中时两者都不发生）
+    const requestsAfterFirst = store.requests.length;
+    expect((await collect(reader._readStreamForRange(8, 16))).equals(plaintext.subarray(8, 16))).toBe(true);
+    expect(counter.calls()).toBe(1);
+    expect(store.requests).toHaveLength(requestsAfterFirst);
+
+    // ③ 换到块 1：memo 失效 ⇒ 2 次
+    expect((await collect(reader._readStreamForRange(70, 80))).equals(plaintext.subarray(70, 80))).toBe(true);
+    expect(counter.calls()).toBe(2);
+
+    // ④ **回到**块 0：memo 里只剩块 1 ⇒ 必须重新解密（3 次）。
+    //    这一条钉住的是**刻意的上限**：只记住最近一块。有人把它换成通用缓存时它会变红
+    //    ——那时应当连同 C16 的裁定一起重新审议（缓存的大小、失效与内存上限都是新的风险面），
+    //    而不是让缓存悄悄长大。同时它也是一条**字节正确性**检查：memo 若返回了别的块的
+    //    明文，上面的相等断言会先红。
+    expect((await collect(reader._readStreamForRange(0, 8))).equals(plaintext.subarray(0, 8))).toBe(true);
+    expect(counter.calls()).toBe(3);
+  });
+
+  it('跨块的一次读：每块各解密一次（memo 不会把跨块读变成重解整段）', async () => {
+    const counter = countDecryptions();
+    restoreDecryptions = counter.restore;
+    const store = new MemoryStore();
+    const plaintext = pattern(5 * 64, 28);
+    const seeded = await seedArtifact(store, plaintext, { chunkSize: 64 });
+    const reader = await EncryptedArtifactReader.open(store, seeded.key, fakeRing());
+    store.reset();
+
+    // 区间 [0, 200) 覆盖块 0..3：单调前进 ⇒ 恰好 4 次解密 + 4 次存储请求
+    expect((await collect(reader._readStreamForRange(0, 200))).equals(plaintext.subarray(0, 200))).toBe(true);
+    expect(counter.calls()).toBe(4);
+    expect(store.requests).toHaveLength(4);
   });
 });
 

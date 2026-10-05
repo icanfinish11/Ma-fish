@@ -94,6 +94,50 @@ export async function inspectTarGz(
       settle({ ok: false, reason: `tar.gz 解析失败：${sanitizeReason(errorMessageOf(error))}` }),
     );
     /**
+     * **在归档结束标记处提前判掉「一个有效条目都没有」**（修复轮 1 / Ruling 2）。
+     *
+     * ## 为什么必须有这一段（据实记载：原先的注释说错了一件事）
+     *
+     * 原先这里写着「拒绝发生在**第一个 512 字节块**上（`[CONSUMEHEADER]` 里 `new Header(...)`
+     * 抛出即 warn）」。**这句只对一部分载荷成立**，本轮实测（`evidence/t4-fix1-probe-bare-gzip-before.txt`）：
+     *
+     * | 裸 gzip 的载荷（都是合法 gzip、内容不是 tar） | 首次 warn 时**已解压**的字节数 | 耗时 |
+     * |---|---|---|
+     * | 8 MiB 随机（校验和不符 ⇒ `TAR_ENTRY_INVALID`） | 4,081 B | 8 ms |
+     * | 16 MiB 全 `A`（校验和不符） | 16,384 B | 11 ms |
+     * | **16 MiB 全零**（读到两个全零块 = tar 的**结束标记**） | **16,777,216 B（整份载荷）** | **2,851 ms** |
+     *
+     * 原因是 tar 自己的注释（`parse.js` 第 100 行）：
+     * `// these BADARCHIVE errors can't be detected early. listen on DONE.`
+     * ——`TAR_BAD_ARCHIVE / Unrecognized archive format` 这条警告**只在输入结束时**发出。
+     * 而「零字节载荷」这一类恰好会走到这里：tar 把前 1024 字节认成**空归档的结束标记**
+     * （`SAW_EOF`，此后它只是把剩下的输入丢掉），直到输入结束才在 DONE 里发警告。
+     * 于是**整份载荷都被解压并喂进解析器**才被拒——而且代价是**超线性**的
+     * （64 MiB 的同类载荷实测 43 秒 / 4,112 次写入，见同一份证据的 C 行）。
+     * D7 的 `mime === 'application/gzip'` 这一半会放行**任何** `.gz`（见文件头与报告 §F2），
+     * 因此这一类没有上限的成本就是一条真实的 DoS 面。
+     *
+     * ## 这一段做了什么
+     *
+     * 监听 `'eof'`（tar 读到**结束标记**时就发，实测在第一个 16 KiB 数据块上就发出来了），
+     * 若此时**一个有效条目都没有**，立刻以**同一条判据、同一个代号**拒掉
+     * ——这正是 tar 自己在 DONE 时做的判断（`SAW_VALID_ENTRY === false`），
+     * 只是不必把整条流解完。**判据没有变、阈值没有变、八样本的期望没有变**：
+     * 变的是「这条判断什么时候给出」。
+     *
+     * 反过来，**有**有效条目的归档照旧走 `'end'`：`entryCount > 0` 时这里直接返回。
+     */
+    parser.on('eof', () => {
+      if (entryCount > 0) return;
+      settle({
+        ok: false,
+        reason:
+          'tar.gz 归档不合法（TAR_BAD_ARCHIVE）：读到归档结束标记时一个有效条目都没有' +
+          '（空归档与「根本不是 tar」在 tar 的信号里无法区分，两者都拒）' +
+          '——本条判断在结束标记处提前给出，不把整条流解完',
+      });
+    });
+    /**
      * **警告也计为拒绝**（据实记载：这条是实测才发现必须有的）。
      *
      * `tar` 把「这压根不是 tar」「头部校验和不符」「条目缺 path」「输入被截断」这类问题
@@ -102,11 +146,12 @@ export async function inspectTarGz(
      * 因为「没有任何有效条目」这条信息在 DONE 时只以警告形式出现（`parse.js` 的 DONE 处理器），
      * 而 `'end'` 紧接着就到。
      *
-     * 反过来，打开它之后拒绝发生在**第一个 512 字节块**上（`[CONSUMEHEADER]` 里
-     * `new Header(...)` 抛出即 warn）⇒ 不是「把整条流走完才发现」。
+     * 上面那条 `'eof'` 处理器负责这一类里**走到结束标记**的那一半（零字节载荷：整份解压
+     * 才拒 ⇒ 提前到 16 KiB 量级）；这一条负责**第一个头部就校验和不符**的另一半
+     * （实测 4–16 KiB 就拒）。两者共用同一个 `settle`，先到的结论说了算。
      *
      * 代价（据实记载）：一个**空 tar.gz**（只有两个全零块）也在这一类里
-     * （`SAW_VALID_ENTRY === false` ⇒ 同一条警告）⇒ 被拒。这是刻意 fail-closed 的一侧：
+     * （`SAW_VALID_ENTRY === false` ⇒ 同一条判断）⇒ 被拒。这是刻意 fail-closed 的一侧：
      * 「空归档」与「根本不是归档」在 tar 自己的信号里无法区分，
      * 而放行前者就等于放行后者（任何 .gz 都能冒充 tar.gz）。
      */

@@ -14,6 +14,7 @@ import {
   type ArtifactHeader,
   type IndexEntry,
 } from '@vca/api/modules/asset/crypto/artifact-format.js';
+import { ChunkDecipher } from '@vca/api/modules/asset/crypto/chunk-decipher.js';
 import { ChunkEncryptor } from '@vca/api/modules/asset/crypto/chunk-cipher.js';
 import type { KeyRing } from '@vca/api/modules/asset/crypto/key-ring.js';
 import type { ArtifactStore } from '@vca/api/modules/asset/store/artifact-store.port.js';
@@ -82,6 +83,45 @@ export interface RangeRequest {
   key: string;
   start: number;
   endInclusive: number;
+}
+
+/** 一个「只计数」的观测器：`calls()` 读当前计数，`restore()` 还原被替换的函数。 */
+export interface CallCounter {
+  calls: () => number;
+  restore: () => void;
+}
+
+/**
+ * **块解密次数**的观测器（修复轮 1 / Ruling 1 的判据）。
+ *
+ * ## 为什么不用 `vi.spyOn(ChunkDecipher.prototype, 'decryptAt')`
+ *
+ * vitest 的 spy 会把**每一次调用的实参**留在 `mock.calls` 里，而这里的实参含有整块明文
+ * （生产块大小 8 MiB）。20,001 条目的 flood 会调用约 4 万次 ⇒ 约 320 GB 的 Buffer
+ * 被一直扣住无法回收，vitest 的 worker 直接
+ * `FATAL ERROR: Committing semi space failed. Allocation failed - JavaScript heap out of memory`
+ * （本轮修复的**探针第一版**就是这样崩的，见 evidence/t4-fix1-probe-before.txt）。
+ * 而判据需要的只是一个**数**，把实参留着纯属观测方式带来的副作用。
+ *
+ * ## 关于判据本身
+ *
+ * 「解密了多少块」是**读取器内部**的事，从存储请求上看不出来：不去缓存时，每一次
+ * `getRange` 后面都跟着一次完整解密，请求数与解密数同阶。因此成本判据必须落在解密次数上
+ * ——只数存储请求的话，「每个请求都重解一遍」的实现照样通过。
+ */
+export function countDecryptions(): CallCounter {
+  const original = ChunkDecipher.prototype.decryptAt;
+  let calls = 0;
+  ChunkDecipher.prototype.decryptAt = function (this: ChunkDecipher, position: number, record: Buffer): Buffer {
+    calls += 1;
+    return original.call(this, position, record);
+  };
+  return {
+    calls: () => calls,
+    restore: () => {
+      ChunkDecipher.prototype.decryptAt = original;
+    },
+  };
 }
 
 /**

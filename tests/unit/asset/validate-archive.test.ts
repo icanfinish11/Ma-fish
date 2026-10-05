@@ -33,6 +33,7 @@ import { EncryptedArtifactReader } from '@vca/api/modules/asset/store/random-acc
 import {
   MemoryStore,
   at,
+  countDecryptions,
   fakeRing,
   recordRange,
   seedArtifact,
@@ -686,6 +687,66 @@ describe('tar.gz：仅凭头部判定 + 提前中止（D8、C19）', () => {
     expect(blocks).toBeGreaterThan(500);
     expect(store.requests.length).toBeLessThanOrEqual(16);
   });
+
+  /**
+   * 修复轮 1 / Ruling 2：**裸 gzip**（合法 gzip、内容不是 tar）必须被拒，且拒绝前的
+   * **解压量有界**。
+   *
+   * ## 为什么另起一条用例，而不是加在上面那条上
+   *
+   * 上面那条用的是**不可压缩**的载荷（校验和不符 ⇒ `TAR_ENTRY_INVALID` 在第一个 512 字节块
+   * 上就发出来了）。而 D7 的 `mime === 'application/gzip'` 这一半会放行**任何** `.gz`，
+   * 其中有一类载荷的代价**完全不同**——它走到 tar 的**结束标记**上去：
+   *
+   * | 裸 gzip 的载荷（都是合法 gzip、内容都不是 tar） | 首次判定的位置（改前） | 耗时 |
+   * |---|---|---|
+   * | 8 MiB 随机（校验和不符） | 已解压 4,081 B | 8 ms |
+   * | 16 MiB 全 `A`（校验和不符） | 已解压 16,384 B | 11 ms |
+   * | **16 MiB 全零**（读成空归档的结束标记） | **已解压 16,777,216 B（整份载荷）** | **2,851 ms** |
+   *
+   * 第三行就是必须单独钉住的那一类：tar 把前 1024 字节认成空归档的结束标记之后，
+   * **只在输入结束时**才发 `TAR_BAD_ARCHIVE`（tar 自己的注释：
+   * `these BADARCHIVE errors can't be detected early. listen on DONE.`）⇒ 整份载荷被解压
+   * （64 MiB 的同类样本实测 43 秒，且代价是**超线性**的）。
+   *
+   * ## 判据为什么是「解压出的字节数」
+   *
+   * 这一类的**压缩**字节数（= 存储请求数）什么都证明不了：16 MiB 全零只压缩成 16 KB，
+   * 整份 .gz 本来就只有 4 个块。真正会失控的是**解压**出来的量，所以这里数的是
+   * 写进 tar 解析器的字节数（`Parser.prototype.write` 的实参长度之和）——
+   * 那正是「解压了多少」这个量的直接观测。
+   */
+  it('Ruling 2：裸 gzip 被拒，且**解压出的字节数**有界（不是把整份载荷解完）', async () => {
+    const written = vi.spyOn(Parser.prototype, 'write');
+    const payloadBytes = 16 * 1024 * 1024;
+    const bare = gzip(Buffer.alloc(payloadBytes));
+    // .gz 本身只有 16 KB ⇒ 「存储请求数有界」在这里是白送的，判据必须落在解压侧
+    expect(bare.length).toBeLessThan(32 * 1024);
+
+    const { reader } = await openPlaintext(bare);
+    const verdict = await validateArchive(reader);
+
+    expect(verdict.ok).toBe(false);
+    // 类型仍然是 tar.gz：D7 的 mime 那一半**确实**放行了任何 .gz（裁定：保留，见报告 §F2）。
+    // 这一句把它写成可执行的记载，免得以后有人以为「嗅探拒绝了它」。
+    expect(verdict.kind).toBe('tar.gz');
+    expect(reasonOf(verdict)).toContain('不合法');
+    expect(reasonOf(verdict)).toContain('TAR_BAD_ARCHIVE');
+
+    // tar 的 `write` 只可能收到字符串或字节（本链路上实际只收到 Buffer）。
+    // 用显式的运行期判断而不是类型断言：断言会在签名变化时悄悄量错东西。
+    const chunkBytes = (chunk: unknown): number => {
+      if (typeof chunk === 'string') return Buffer.byteLength(chunk);
+      if (chunk instanceof Uint8Array) return chunk.byteLength;
+      throw new Error(`tar 解析器收到了既不是字符串也不是字节的东西：${typeof chunk}`);
+    };
+    const decompressed = written.mock.calls.reduce((sum, call) => sum + chunkBytes(call[0]), 0);
+    // 上界 64 KiB = zlib 一个输出块（默认 16 KiB）的 4 倍：判定落在**第一个数据块**上。
+    // 留 4 倍是给流的调度余量；它同时仍然比「解完整份载荷」低 **256 倍**
+    // （实测：改前 16,777,216 B / 2,851 ms，改后 16,384 B / 20 ms）。
+    expect(decompressed).toBeLessThanOrEqual(64 * 1024);
+    expect(decompressed).toBeLessThan(payloadBytes / 256);
+  }, HEAVY_TEST_TIMEOUT_MS);
 });
 
 describe('validateArchive：末块认证 → 嗅探 → 分发（Step 0b 五条 + Step 4）', () => {
@@ -793,6 +854,103 @@ describe('validateArchive：末块认证 → 嗅探 → 分发（Step 0b 五条 
     await validateArchive(reader, { expectedPlaintextLength: 1 });
     expect(store.requests).toHaveLength(0);
   });
+});
+
+/**
+ * 修复轮 1 / Ruling 1：**高条目数归档的成本**必须有界（D6 的条目数上限的意义所在）。
+ *
+ * ## 这条判据为什么落在「解密次数」上，而不是「存储请求数」
+ *
+ * 裁决原文：条目数上限是为了给恶意上传的代价封顶。改写之前，yauzl 每个条目发**两次**
+ * `read`，而读取器**每次读都会重新解密整块**（无缓存）⇒ 成本 ≈ 条目数 × 块大小：
+ * 一份 **1.9 MB / 20,001 条目**的上传在**生产块大小 8 MiB** 下要走 **40,003 次解密**、
+ * 取回 **75.9 GB**、烧掉 **82 秒 CPU**（`evidence/t4-fix1-probe-before-A.txt`；
+ * 本轮修复前 Task 4 报告 §9.2 的独立测量是 96.0 秒，机器负载不同）。
+ * 也就是说，攻击者在**上传速率限制之内**就能让每次请求烧掉分钟级 CPU
+ * ——那条上限于是什么都没封住。
+ *
+ * 判据只能用**解密次数**：存储请求数在「每个请求都重解一遍」的实现下同样会是 4 万，
+ * 于是「请求数很小」这一点**证明不了解密次数很小**（裁决把这一点写明了）。
+ * 因此这里同时断言**工作量**（`reader.read` 的调用次数——那是 yauzl 发的，与缓存无关，
+ * 用来证明这条用例确实跑了 4 万次读）与**解密次数**（判据本身）。
+ */
+describe('Ruling 1：20,001 条目归档的解密次数必须与条目数解耦（成本判据）', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * 一次「成本画像」。
+   *
+   * 解密次数用 `countDecryptions`（只计数、不留实参）而不是 `vi.spyOn`：后者会把 4 万次
+   * 调用的实参（整块明文）全部扣在 `mock.calls` 里 ⇒ worker OOM。见该辅助函数的注释。
+   */
+  async function archiveCost(
+    zip: Buffer,
+    chunkSize: number,
+  ): Promise<{
+    reads: number;
+    decryptions: number;
+    requests: number;
+    blocks: number;
+    verdict: { ok: true } | { ok: false; reason: string };
+  }> {
+    const counter = countDecryptions();
+    try {
+      const store = new MemoryStore();
+      const seeded = await seedArtifact(store, zip, { chunkSize });
+      const reader = await EncryptedArtifactReader.open(store, seeded.key, fakeRing());
+      // 工作量：yauzl 调的是读取器的 `read`（`index.js` 第 909 行），它**不受 memo 影响**。
+      const read = vi.spyOn(reader, 'read');
+      store.reset();
+      const verdict = await validateArchive(reader);
+      return {
+        reads: read.mock.calls.length,
+        decryptions: counter.calls(),
+        requests: store.requests.length,
+        blocks: seeded.entries.length,
+        verdict,
+      };
+    } finally {
+      counter.restore();
+    }
+  }
+
+  it('生产块大小（8 MiB ⇒ 整份明文一块）：4 万次读只解密 **1** 次', async () => {
+    const cost = await archiveCost(sampleBytes('flood.zip'), 8 * 1024 * 1024);
+
+    // 判定本身没有变：仍然是条目数上限把它拒掉（这条用例问的是代价，不是结论）
+    expect(cost.verdict.ok).toBe(false);
+    expect(reasonOf(cost.verdict)).toContain('条目数');
+
+    // ① 工作量：20,001 条目 × 2 次读 + 嗅探那次 ⇒ 4 万次量级。
+    expect(cost.reads).toBeGreaterThan(40_000);
+    // ② 制品确实只有**一块**（1,897,898 B < 8 MiB）——下面那个「恰好 1 次」的结构性前提
+    expect(cost.blocks).toBe(1);
+    // ③ 判据：4 万次读全部落在这同一块上 ⇒ 一格 memo 就够 ⇒ 解密**恰好 1 次**。
+    //    改前是 40,003 次（同一条测量脚本，见 evidence/t4-fix1-probe-{before,after}-A.txt）。
+    expect(cost.decryptions).toBe(1);
+  }, HEAVY_TEST_TIMEOUT_MS);
+
+  it('多块（64 KiB ⇒ 20 块以上）：解密次数与**块数**同阶，而不是与条目数同阶', async () => {
+    const cost = await archiveCost(sampleBytes('flood.zip'), 64 * 1024);
+
+    expect(cost.verdict.ok).toBe(false);
+    expect(reasonOf(cost.verdict)).toContain('条目数');
+    expect(cost.reads).toBeGreaterThan(40_000);
+    // 块数够多，这条用例才不是上一条的重复：「只有一块」时任何缓存都成立
+    expect(cost.blocks).toBeGreaterThan(20);
+
+    /**
+     * 上界 = **2 × 块数**（本例 ≤ 58）。
+     *
+     * 为什么是这个数：一格 memo 之下，**单调**扫描里每一块最多解密一次；额外解密只来自
+     * **换方向**（① 先认证末块 → ② 回到开头嗅探 → ③ 再去末尾找 EOCD）。给「每块再解一次」
+     * 的余量，仍然比「每次读都解密」低**三个数量级**（40,020 → 实测 19）；
+     * 而且它是从**制品几何**推出来的，不是抄一个实测值——块数变了它跟着变。
+     */
+    expect(cost.decryptions).toBeLessThanOrEqual(2 * cost.blocks);
+  }, HEAVY_TEST_TIMEOUT_MS);
 });
 
 /**

@@ -41,6 +41,10 @@ interface BlockSpan {
  * 「要哪段给哪段、且只解密与之相交的块」的读取器。密文制品是
  * `[头][块数据][索引][尾部 24]`，**头 / 索引 / 尾部都是明文**，只有块数据是密文。
  *
+ * **修复轮 1 补的一格 memo**（`recent`，见该字段）：只解密密文块这一条还不够——
+ * yauzl 每个条目发两次读，而每次读都解密整块 ⇒ 成本 ≈ 条目数 × 块大小（量化见 `recent`）。
+ * 现在**最近读过的**那一块会被记住，命中时既不读存储也不解密。
+ *
  * ## 依赖登记的历史（K2/K6：本任务实测到的一次「依赖已装」是假的）
  *
  * 本任务的说明是「`yauzl` 3.4.0 已安装」。实测**为假**：`pnpm-lock.yaml` 里 `yauzl`
@@ -110,6 +114,36 @@ export class EncryptedArtifactReader extends EventEmitter implements RandomAcces
   private readonly decipher: ChunkDecipher;
   private readonly blocks: readonly BlockSpan[];
   private refCount = 0;
+
+  /**
+   * **最近一块的 memo**（修复轮 1 / Ruling 1）：命中时不碰存储、也不解密。
+   *
+   * 为什么必须有它（量化过的 DoS，见报告 §9.2 与本轮 §F1）：yauzl 读 zip 的中央目录时
+   * **每个条目发两次 `read`**（46 字节定长部分 + 名字），而改写之前每一次 `read` 都会
+   * 重新 `getRange` **整块**记录并**解密整块**。于是一份 1.9 MB / 20,001 条目的上传
+   * （正是会被 D6 条目数上限拒掉的那一类）在**生产块大小 8 MiB** 下要走
+   * **40,003 次解密**、取回 75.9 GB、烧掉 **82 秒 CPU**——D6 的条目数上限
+   * 本来就是为了给恶意上传的代价封顶，这个成本曲线让它**封不住任何东西**。
+   * 有了一格 memo，同一份制品变成 **1 次解密 / 1 次存储请求 / 数十毫秒**。
+   *
+   * ## 为什么只有一格（C16：刻意**不做**通用缓存）
+   *
+   * zip 的中央目录是**顺序**读的（读完一条紧接写一条），tar.gz 是一条顺序流，
+   * 因此「上一次读的那一块」命中率接近 100%，再加淘汰策略只是把内存与失效逻辑
+   * 变成新的风险面。代价明说：内存里最多多留**一块明文**（生产块大小 8 MiB），
+   * 且**任何换块的读都会让它失效**——`countDecryptions` 的用例把这条语义钉住了
+   * （A→B→A 的三次读必须解密 3 次）。
+   *
+   * ## 为什么它不改变任何判据
+   *
+   * 只缓存**成功解密**的结果，且键是**位置**（C20：位置是块序号的唯一事实来源）。
+   * 同一个位置上，明文是那段记录的纯函数，因此命中与重算逐字节等价；
+   * 认证失败的块**不入 memo**（失败照旧抛错，不会把一次拒绝变成一次命中）。
+   *
+   * 交出去的切片是这块明文的**视图**：与 Node 流的一般约定一致——消费方不得改写
+   * 收到的 chunk（本仓库的消费方只有 `copyInto`（只读源）与 yauzl / gunzip）。
+   */
+  private recent: { position: number; plaintext: Buffer } | null = null;
 
   private constructor(
     store: ArtifactStore,
@@ -247,7 +281,7 @@ export class EncryptedArtifactReader extends EventEmitter implements RandomAcces
     });
   }
 
-  /** 逐块产出明文区间 `[start, end)`：只解密与之相交的块，每块最多取一次。 */
+  /** 逐块产出明文区间 `[start, end)`：只解密与之相交的块，最近一块走 memo（见 `recent`）。 */
   private async *serveRange(start: number, end: number): AsyncGenerator<Buffer> {
     if (end > this.plaintextLength) {
       throw new Error(
@@ -265,19 +299,34 @@ export class EncryptedArtifactReader extends EventEmitter implements RandomAcces
         // 表现为一句看得懂的错，而不是一个 undefined 的 TypeError。
         throw new Error(`第 ${position} 块不存在：明文偏移 ${cursor} 落在所有块之外（索引与尾部不自洽）`);
       }
-      // 存储端口是**闭**区间：记录的末字节 = 起点 + 明文长度 + tag - 1
-      const record = await this.store.getRange(
-        this.key,
-        block.artifactStart,
-        block.artifactStart + block.length + TAG_BYTES - 1,
-      );
-      const plaintext = this.decipher.decryptAt(position, record);
+      const plaintext = await this.plaintextOf(position, block);
       const from = cursor - block.plaintextStart;
       const to = Math.min(block.length, end - block.plaintextStart);
       yield plaintext.subarray(from, to);
       cursor = block.plaintextStart + to;
       position += 1;
     }
+  }
+
+  /**
+   * 第 `position` 块的明文：命中最近一块的 memo 就直接返回，否则读记录并解密。
+   *
+   * **存储读取与解密在同一侧**：命中时两者都不发生。分开写（先无条件 `getRange` 再看
+   * memo）会把「每半条记录读一整块」的成本留下——那正是 Ruling 1 要消掉的东西。
+   */
+  private async plaintextOf(position: number, block: BlockSpan): Promise<Buffer> {
+    const cached = this.recent;
+    if (cached !== null && cached.position === position) return cached.plaintext;
+    // 存储端口是**闭**区间：记录的末字节 = 起点 + 明文长度 + tag - 1
+    const record = await this.store.getRange(
+      this.key,
+      block.artifactStart,
+      block.artifactStart + block.length + TAG_BYTES - 1,
+    );
+    const plaintext = this.decipher.decryptAt(position, record);
+    // 只有**成功**解密才入 memo：抛出（篡改 / 被当成别的块解读）不会被记成一次命中。
+    this.recent = { position, plaintext };
+    return plaintext;
   }
 
   /** 带字节数断言的区间读取（短读必须响亮，否则 yauzl 会静默解析错位）。 */
