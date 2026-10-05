@@ -11,10 +11,52 @@ import {
   SystemAccountMissingError, UnknownAccountKindError,
 } from './core/errors.js';
 import { applyPosting, assertBalanced, movesToLegs, sameLegs } from './core/posting.js';
-import type {
-  AccountRef, AccountSnapshot, MoneyMove, PostingLeg, PostingLegsRequest, PostingRequest, PostingResult,
+import {
+  TRANSACTION_KINDS, type AccountRef, type AccountSnapshot, type MoneyMove, type PostingLeg,
+  type PostingLegsRequest, type PostingRequest, type PostingResult,
 } from './core/types.js';
 import type { Prisma } from '../../generated/prisma/client.js';
+import { PLATFORM_FEE_BPS, computeFeeSplit } from './core/fee-split.js';
+
+/**
+ * 五个原语的入参（**显式命名**，不用内联匿名类型——它们是这个模块对外契约的一部分）。
+ *
+ * 三者形状几乎相同（`(userId|buyerId|sellerId) + amount/gross + idempotencyKey + actorId`），
+ * 但刻意**不合并成一个泛型**（C16）：`releaseEscrow` 收的是 `gross` 且多一个 `feeBps`，
+ * 把它塞进一个「有时是 amount、有时是 gross」的字段，会让每个读它的人都要先猜一次语义。
+ */
+export interface UserAmountInput {
+  readonly userId: string;
+  readonly amount: bigint;
+  readonly idempotencyKey: string;
+  readonly actorId?: string | null;
+}
+
+export interface EscrowLockInput {
+  readonly buyerId: string;
+  readonly amount: bigint;
+  readonly idempotencyKey: string;
+  readonly actorId?: string | null;
+}
+
+export interface EscrowReleaseInput {
+  readonly sellerId: string;
+  /** 释放的**总额**（手续费从它里面出；D4：`fee + net === gross` 按构造成立）。 */
+  readonly gross: bigint;
+  readonly idempotencyKey: string;
+  /** 显式传入（默认值取 `PLATFORM_FEE_BPS`）⇒ P3/P4 换费率不必改账本（D4/D14）。 */
+  readonly feeBps?: number;
+  readonly actorId?: string | null;
+}
+
+/** 三个系统账户的引用（owner 恒为 NULL；D2 说它们只由迁移创建，这里只查不建）。 */
+const TOPUP_REF: AccountRef = { kind: ACCOUNT_KINDS.EXTERNAL_TOPUP, ownerUserId: null };
+const ESCROW_REF: AccountRef = { kind: ACCOUNT_KINDS.PLATFORM_ESCROW, ownerUserId: null };
+const REVENUE_REF: AccountRef = { kind: ACCOUNT_KINDS.PLATFORM_REVENUE, ownerUserId: null };
+const availableRef = (userId: string): AccountRef =>
+  ({ kind: ACCOUNT_KINDS.USER_AVAILABLE, ownerUserId: userId });
+const frozenRef = (userId: string): AccountRef =>
+  ({ kind: ACCOUNT_KINDS.USER_FROZEN, ownerUserId: userId });
 
 /**
  * 过账（P2 的核心；设计 §8.2 / §8.3 / §8.5）。
@@ -145,6 +187,89 @@ export class LedgerService {
       tx, // ← 与账本同生共死（Task 2）
     );
     return { transactionId: transaction.id, created: true };
+  }
+
+  /**
+   * ## 五个原语（§2.1 的「额度发放、冻结与释放」）
+   *
+   * 每个都只做两件事：**构造一组转移**，然后交给 `post`。本类里没有任何余额算术、
+   * 任何百分比（除了 `releaseEscrow` 调用**唯一那个**拆分函数）、任何状态机（C29）。
+   * 「什么时候冻、冻多少、费率是多少」都是 P3/P4 的决定，这里只提供机械部分。
+   *
+   * ## 它们与 §8.2 六行的关系（**不是一对一**，据实说清）
+   * 行 1→`grantCredit`、行 2→`freeze`、行 4→`lockToEscrow`、行 5→`releaseEscrow`；
+   * 行 3 由通用 `post` 走通（金额规则属 P4）；行 6 由 `lockToEscrow` + `releaseEscrow`
+   * 两次调用走通，**与行 4 共用 `ESCROW_LOCK`**。而 `unfreeze` 是 §2.1「冻结与释放」的
+   * 字面对偶，**不在 §8.2 的六行里**。六行各有用例：`tests/integration/ledger/primitives.test.ts`。
+   *
+   * ## 为什么不为行 3 / 行 6 建命名包装（D12 / C16）
+   * 它们的**金额规则**属于 P4/P3（罚没比例、补差额），而它们的**记账形状**完全由通用
+   * `post`（或两次原语调用）表达。给它们建命名包装等于把「谁分多少」这个还不存在的
+   * 决定预埋进账本——那正是本项目反复惩罚过的「声明了但没人读」。
+   */
+
+  /** 额度发放：§8.1「MVP 由管理员发放虚拟额度」⇒ `DR EXTERNAL_TOPUP / CR USER_AVAILABLE`。 */
+  async grantCredit(tx: Prisma.TransactionClient, input: UserAmountInput): Promise<PostingResult> {
+    return this.post(tx, {
+      kind: TRANSACTION_KINDS.TOPUP,
+      idempotencyKey: input.idempotencyKey,
+      actorId: input.actorId ?? null,
+      moves: [{ from: TOPUP_REF, to: availableRef(input.userId), amount: input.amount }],
+    });
+  }
+
+  /**
+   * 冻结：可用 → 冻结（§8.2 行 2）。
+   * **不含**业务状态机：什么时候冻、冻多少是 P4 的规则，本原语只提供机械部分（C29）。
+   */
+  async freeze(tx: Prisma.TransactionClient, input: UserAmountInput): Promise<PostingResult> {
+    return this.post(tx, {
+      kind: TRANSACTION_KINDS.FREEZE,
+      idempotencyKey: input.idempotencyKey,
+      actorId: input.actorId ?? null,
+      moves: [{ from: availableRef(input.userId), to: frozenRef(input.userId), amount: input.amount }],
+    });
+  }
+
+  /** 解冻：冻结 → 可用（冻结的对偶；§2.1 的「冻结与释放」，**不是** §8.2 的一行）。 */
+  async unfreeze(tx: Prisma.TransactionClient, input: UserAmountInput): Promise<PostingResult> {
+    return this.post(tx, {
+      kind: TRANSACTION_KINDS.UNFREEZE,
+      idempotencyKey: input.idempotencyKey,
+      actorId: input.actorId ?? null,
+      moves: [{ from: frozenRef(input.userId), to: availableRef(input.userId), amount: input.amount }],
+    });
+  }
+
+  /** 进托管：买家可用 → `PLATFORM_ESCROW`（§8.2 行 4 / §8.4「成交 → 全额冻结进托管」）。 */
+  async lockToEscrow(tx: Prisma.TransactionClient, input: EscrowLockInput): Promise<PostingResult> {
+    return this.post(tx, {
+      kind: TRANSACTION_KINDS.ESCROW_LOCK,
+      idempotencyKey: input.idempotencyKey,
+      actorId: input.actorId ?? null,
+      moves: [{ from: availableRef(input.buyerId), to: ESCROW_REF, amount: input.amount }],
+    });
+  }
+
+  /**
+   * 释放：**手续费先按 D4 那唯一一个函数算出来**，再把两条转移交给 `post`；
+   * 零额的那一条**不构造**——「转移 0 分」会被 `movesToLegs` 的 `InvalidAmountError` 拒，
+   * 而写一条 0 金额的腿会撞迁移里的 `entries_amount_nonzero`。两条路都不该被走到。
+   *
+   * `feeBps` 显式收到（默认 `PLATFORM_FEE_BPS`）：P3/P4 换费率不必改账本（D4/D14），
+   * 也让「补差不收手续费」这类业务规则在外层表达（`feeBps: 0`），而不是在这里写死。
+   */
+  async releaseEscrow(tx: Prisma.TransactionClient, input: EscrowReleaseInput): Promise<PostingResult> {
+    const { fee, net } = computeFeeSplit(input.gross, input.feeBps ?? PLATFORM_FEE_BPS);
+    const moves: MoneyMove[] = [];
+    if (net > 0n) moves.push({ from: ESCROW_REF, to: availableRef(input.sellerId), amount: net });
+    if (fee > 0n) moves.push({ from: ESCROW_REF, to: REVENUE_REF, amount: fee });
+    return this.post(tx, {
+      kind: TRANSACTION_KINDS.ESCROW_RELEASE,
+      idempotencyKey: input.idempotencyKey,
+      actorId: input.actorId ?? null,
+      moves,
+    });
   }
 
   /**
