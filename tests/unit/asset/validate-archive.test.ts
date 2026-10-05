@@ -345,6 +345,18 @@ function reasonOf(result: { ok: true } | { ok: false; reason: string }): string 
 }
 
 /**
+ * 重用例的显式超时（30 秒）。
+ *
+ * 为什么需要它：`flood` 系用例要**真的**走完 20,001 个条目（这本身就是判据的一部分：
+ * 走不完就说明有什么东西提前死了），单独跑约 4 秒。而 `pnpm test` 会把 5 个 project
+ * 一起开来、testcontainers 还在起 Postgres/Redis —— 实测在那种负载下这两条超过
+ * vitest 的 **5 秒默认值**并以 `Test timed out in 5000ms` 失败（不是判据被违反）。
+ * 同一个坑本仓库在架构守护那条用例上已经踩过一次（见 `vitest.config.ts` 的注释）；
+ * 默认值在这里量的是**机器有多忙**，不是这段代码对不对。
+ */
+const HEAVY_TEST_TIMEOUT_MS = 30_000;
+
+/**
  * yauzl `RandomAccessReader` 的测试替身：内存 + **同步**回调。
  *
  * 只服务一条用例（见 `zip：…` 那一节）：把「同步回调用真递归」这个形状**做出来**，
@@ -406,6 +418,15 @@ describe('zip：只读中央目录 + 解析器抛错计为拒绝（D6 的两条�
     expect(result).toEqual({ ok: true });
   });
 
+  it('0 个条目的 zip 放行——与 tar.gz 侧**不对称**，据实记载（见报告 §自审）', async () => {
+    // zip 有中央目录，「0 个条目」是一个确定的事实（EOCD 说 0 就是 0），因此这里放行；
+    // 而 tar.gz 侧的「0 个条目」与「压根不是 tar」在 tar 自己的信号里**无法区分**
+    // （同一条 TAR_BAD_ARCHIVE 警告），那边因此 fail-closed 拒绝。
+    // 这条用例没有任何变异探针：它断言的是「**没有**加一条规则」，变异无从谈起。
+    const { result } = await inspectZipOf(buildZip([]));
+    expect(result).toEqual({ ok: true });
+  });
+
   it('zip-slip：yauzl 在中央目录阶段抛错 ⇒ **返回拒绝**，不是异常、不是崩溃', async () => {
     const { result } = await inspectZipOf(sampleBytes('zip-slip.zip'));
     expect(result.ok).toBe(false);
@@ -443,7 +464,7 @@ describe('zip：只读中央目录 + 解析器抛错计为拒绝（D6 的两条�
     expect(result.ok).toBe(false);
     expect(reasonOf(result)).toContain('条目数');
     expect(reasonOf(result)).toContain('20001');
-  });
+  }, HEAVY_TEST_TIMEOUT_MS);
 
   it('C19 验收：所有**真的 zip** 样本走完，`openReadStream` **一次都没被调用**', async () => {
     const openReadStream = vi.spyOn(yauzl.ZipFile.prototype, 'openReadStream');
@@ -457,7 +478,7 @@ describe('zip：只读中央目录 + 解析器抛错计为拒绝（D6 的两条�
       await inspectZipOf(sample.bytes());
     }
     expect(openReadStream).not.toHaveBeenCalled();
-  });
+  }, HEAVY_TEST_TIMEOUT_MS);
 
   it('累计未压缩大小：中心目录自称 1.1 GiB ⇒ 用**真实阈值**拒绝（而压缩比那条并不超限）', async () => {
     const zip = buildZip([
@@ -522,7 +543,7 @@ describe('zip：只读中央目录 + 解析器抛错计为拒绝（D6 的两条�
     const result = await inspectZip(new SynchronousBufferReader(zip), zip.length, ARCHIVE_LIMITS);
     expect(result.ok).toBe(false);
     expect(reasonOf(result)).toContain('条目数');
-  });
+  }, HEAVY_TEST_TIMEOUT_MS);
 
   it('解析器吐回的条目名会被转义：拒绝理由里不出现裸控制字符', async () => {
     // 反斜杠会让 yauzl 抛 `invalid characters in fileName: <名字>`。
