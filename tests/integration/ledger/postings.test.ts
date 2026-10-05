@@ -276,6 +276,9 @@ describe('过账：LedgerService.post（C25 / C26 / C28 / D9 / D10）', () => {
   it('并发扣款：初始 10000 分、两笔并发各冻结 6000 ⇒ 恰好一笔成功、余额 4000', async () => {
     // ★ 这条用例是 C25 的判据。预检实测的两种失败形态：读-判断-写 ⇒ 两笔都成功、
     // 库里剩 4000（实际扣了 12000）；无条件 decrement ⇒ 余额 −2000。变异探针见 Step 6。
+    // ★ 判别力是**量出来的**（探针 p1 / p2）：只有在两行账户都**已经存在**时，这两笔才是
+    // 真并发的；否则它们被账户创建那条 INSERT 串行化，两种坏实现都能骗过这条用例。
+    // 改完之后的实测：p1（无条件 decrement）与 p2（读-判断-写）都让**这一条**红。
     const userId = uuidv7();
     await prisma.$transaction((tx) =>
       ledger.post(tx, {
@@ -284,6 +287,13 @@ describe('过账：LedgerService.post（C25 / C26 / C28 / D9 / D10）', () => {
         moves: [{ from: topup, to: available(userId), amount: 10_000n }],
       }),
     );
+    // ★ 两行都要先建出来，否则这两笔**根本不是并发的**（探针 p1/p2 实测）：
+    //   `USER_FROZEN` 那一刻还不存在 ⇒ 先到的那个请求建它，后到的那个卡在那条 INSERT 上，
+    //   等前者提交之后才读快照 ⇒ 由纯核心的预判拦下。于是把 `applyBalances` 改成
+    //   **无条件 decrement** 之后，这条用例**照样绿**——它当时证明的不是「条件更新挡住了
+    //   第二笔」，而是「账户创建那条 INSERT 把两笔串行化了」。这不改变结论（钱确实没被
+    //   重复冻结），但它让「并发权威」这句话在这条用例里**没有见证**。
+    await materializeAccounts(userId);
 
     const freeze = (n: number) =>
       ledger.runWithIdempotentRetry((tx) =>
