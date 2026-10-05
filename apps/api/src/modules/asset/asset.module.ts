@@ -6,6 +6,7 @@ import { createStreamingStorage } from '../../common/upload/stream-upload.js';
 import { AuditModule } from '../audit/index.js';
 import { AssetController } from './asset.controller.js';
 import { AssetService } from './asset.service.js';
+import { AssetVersionService } from './asset-version.service.js';
 import { ARTIFACT_STORE, type ArtifactStore } from './store/artifact-store.port.js';
 import { LocalArtifactStore } from './store/local-artifact.store.js';
 
@@ -50,8 +51,12 @@ import { LocalArtifactStore } from './store/local-artifact.store.js';
     },
     // 加密即入库的接入服务：`putStream`（落盘的是密文）+ `finalize`（校验）+ `delete`（清理）。
     AssetService,
+    // 接入记录与元数据的落库（Task 7）：`AssetService` 那一半产出**待落库**的记录，
+    // 这一半把它写进 `asset` schema。两者都在本模块里提供，注入方（Task 8 的接入路径）
+    // 因此拿到的必然是同一对实例。
+    AssetVersionService,
   ],
-  exports: [ARTIFACT_STORE, AssetService],
+  exports: [ARTIFACT_STORE, AssetService, AssetVersionService],
 })
 export class AssetStoreModule {}
 
