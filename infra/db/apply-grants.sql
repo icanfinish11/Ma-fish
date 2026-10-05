@@ -48,6 +48,28 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA notify TO app_user;
 -- 再写一对 GRANT/REVOKE**——否则它会被这一行默默授予 UPDATE/DELETE。
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA asset TO app_user;
 
+-- ── asset.ownership_history：**append-only**（C7 / 不变式 #5，D11）──
+-- 所有权史的全部价值在于「写进去就删不掉、改不了」——一份可以被改写的所有权史，
+-- 在争议里不构成任何证据。因此它与 `audit` 走同一条路：`app_user` 只有 SELECT + INSERT。
+--
+-- ## 为什么这两行是**逐表**写，而不是像 audit 那样发 schema 级
+--
+-- `asset` 这个 schema 里另外三张表（作品 / 版本 / 元数据）是**要可写的**（元数据会重算、
+-- 版本记录要补 uploaded_by_id），所以上面那条 `ALL TABLES` 是必要的；它同时**顺带**
+-- 把 UPDATE/DELETE 授给了本表——下面那对语句就是在这条广播之后把它单独收回来的。
+--
+-- ## 两行都在是刻意的（与 audit 同一条实测理由）
+--
+--   * `GRANT SELECT, INSERT` 是**实际执行点**——`GRANT` 是白名单，未授予即无权限；
+--   * `REVOKE UPDATE, DELETE` 是**兜底**——权限是可叠加的，**后执行的 `REVOKE` 能覆盖
+--     先前那条 `ALL TABLES` 的 `GRANT`**（audit 那段有实测：`has_table_privilege` 从 true
+--     变回 false、relacl 从 `app_user=arw/...` 回到 `app_user=ar/...`）。
+-- 只写 `REVOKE` 挡不住将来被重新授予，只写 `GRANT SELECT, INSERT` 则挡不住上面那条
+-- 广播语句——因此两行缺一不可。**删掉 `REVOKE` 那一行会让判据 10 立刻变红**
+-- （变异探针实测：`app_user` 的 `UPDATE` 从「被拒」变成「改写成功」）。
+GRANT SELECT, INSERT ON asset.ownership_history TO app_user;
+REVOKE UPDATE, DELETE ON asset.ownership_history FROM app_user;
+
 -- ── audit：append-only，只给 SELECT + INSERT，撤销 UPDATE/DELETE（不变式 #5）──
 -- 两行都在是刻意的，各有分工（已实测，勿删其中任何一行）：
 --   * `GRANT SELECT, INSERT` 是不变式的**实际执行点**——`GRANT` 是白名单，未授予即无权限；

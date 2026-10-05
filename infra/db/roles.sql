@@ -21,9 +21,9 @@
 --   1. `docker-compose.yml` 的 `docker-entrypoint-initdb.d`（容器首次初始化，`vca_owner` 身份）；
 --   2. 集成测试里 testcontainer 起来之后（`tests/helpers/db.ts`，`vca_owner` 身份）。
 --
--- 两处都发生在 **`prisma migrate deploy` 之前**：此时 `auth`/`audit`/`notify` 三个 schema
--- 以及所有表都还不存在。所以这里**只允许**出现「建角色」与「`GRANT CONNECT`」这类
--- 与 schema/表无关的语句。
+-- 两处都发生在 **`prisma migrate deploy` 之前**：此时各模块 schema（`auth`/`audit`/`notify`，
+-- P1 起还有 `asset`）以及所有表都还不存在。所以这里**只允许**出现「建角色」与
+-- `GRANT CONNECT` 这类与 schema/表无关的语句。
 -- 一旦在此写 `ALTER SCHEMA auth OWNER TO ...` 或 `GRANT ... ON ALL TABLES IN SCHEMA auth`，
 -- 容器初始化会直接报错（`ALL TABLES` 更糟：它会静默地授予零个对象，留下一个看起来
 -- 成功、实际没有任何授权的假象）。建表授权与 append-only 的 `GRANT`/`REVOKE` 全在
@@ -72,8 +72,9 @@ GRANT CONNECT ON DATABASE vca TO app_user;
 --   has_table_privilege('app_user','public._prisma_migrations','DELETE') = t
 -- 即运行期角色可以改写或抹掉迁移历史——而它**从未**被 brief 或任何 ruling 要求过。
 --
--- 应用真正需要的一切都在 `auth`/`audit`/`notify` 三个模块 schema 里，`public` 里没有任何
--- 属于应用的表（迁移台账是 Prisma 的内部结构，应用不该碰）。所以：把 public 的默认权限
--- 整段删掉，运行期角色在 public 上不留任何表级权限。三个模块 schema 的默认权限仍在
--- `apply-grants.sql` 里按模块分别施加（那里本来就覆盖了，删掉这条零损失）。
+-- 应用真正需要的一切都在各模块 schema 里（`auth`/`audit`/`notify`，P1 起还有 `asset`），
+-- `public` 里没有任何属于应用的表（迁移台账是 Prisma 的内部结构，应用不该碰）。所以：
+-- 把 public 的默认权限整段删掉，运行期角色在 public 上不留任何表级权限。
+-- 各模块 schema 的默认权限仍在 `apply-grants.sql` 里按模块分别施加
+-- （那里本来就覆盖了，删掉这条零损失）。
 -- ════════════════════════════════════════════════════════════════════════════
