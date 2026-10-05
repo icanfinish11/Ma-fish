@@ -63,6 +63,22 @@ import { MemoryStore, seedArtifact } from '../../helpers/craft-encrypted-artifac
 
 const MAX_UPLOAD_BYTES = Number(testEnv.ARTIFACT_MAX_UPLOAD_BYTES);
 
+/**
+ * 手工签一张**超过** TTL 上界的票时，超出多少秒。
+ *
+ * 判据是 `expiresAt - now_at_validation > 300`，而 `now_at_validation` 是**服务端读到的那一刻**：
+ * 它总是不早于测试这一侧落笔的那一刻。因此一张 `now + 301` 的票只在「这条请求没跨过秒边界」
+ * 时才仍然超界——**旧写法就是 +1 秒**，实测（对同一条件注入 1.1 秒延迟）那张票会变成一张
+ * *合法*的票并回 200，判据以约 0.5% 的概率红（全量负载下 600 次里 3 次，见报告）。
+ *
+ * 60 秒比一次请求的往返（全量负载下实测 p99 = 64 ms、最大 77 ms）大两个数量级，因此这条判据
+ * 只关于「校验侧有没有那道检查」，不再关于「请求有多快」——判别力有实测：把校验侧那道上界检查
+ * 删掉之后，这条判据仍然红（`expected 200 to be 403`）。**±1 秒的边界没有被丢掉**：
+ * 它住在 `tests/unit/asset/signed-url.test.ts`（`NOW + 301 ⇒ ttl_too_long`、`NOW + 300 ⇒ ok`，
+ * `now` 由调用方传入）——那才是能确定性地钉住边界的地方；HTTP 这一层钉的是接线之后它仍然成立。
+ */
+const TTL_OVERSHOOT_SECONDS = 60;
+
 /** 样本字节（八样本表里那两个合法归档）。 */
 function sampleBytes(name: 'ok.zip' | 'ok.tar.gz'): Buffer {
   const sample = ARCHIVE_SAMPLES.find((item) => item.name === name);
@@ -281,16 +297,41 @@ describe('签名下载（D10）：授权、单次使用、超时、篡改、审�
     const { versionId, storageKey } = await createVersion({ ownerId: owner });
     const { cookie } = await login(owner);
 
+    /**
+     * 两次时钟采样把**服务端那次采样**夹在中间。
+     *
+     * `expiresAt` 是服务端在**请求处理期间**算出来的（`floor(它自己的 now) + 300`），那一刻
+     * 必然落在 `[before, after]` 里，因此 `expiresAt` 必然落在 `[before + 300, after + 300]` 里。
+     * 两侧都是**紧的**（0 秒余量），下面对两侧各断言一次。
+     *
+     * 为什么要两个锚点：旧写法只采了 `before`（请求**之前**），却拿它去量一个在请求**之后**
+     * 才产生的时刻——请求只要跨过一次秒边界，差值就变成 301 而判据变红。实测（全量负载下
+     * 签发往返 p50 = 43 ms / p99 = 128 ms）：600 次里 **18 次**跨过 ⇒ 这条判据以约 **3%**
+     * 的概率红，而它测的其实是「机器有多快」。现在这条判据与请求快慢无关：对同一条件注入
+     * 1.1 秒延迟之后，旧写法必然红（`expected 301 to be less than or equal to 300`），
+     * 新写法仍然全绿。
+     *
+     * 判别力没有变小：删掉校验侧那道上界检查、或者把签发改成 `now + 1`，本文件都仍然红
+     * （实测：`expected 200 to be 403` / `expected 1 to be greater than or equal to 300`——
+     * 后者是**新**的判别力，旧写法那句 `toBeGreaterThan(0)` 抓不住）。
+     *
+     * **据实记载**：常数本身的**取值**不由本文件钉住，旧写法亦然——两条判据都是拿
+     * `DOWNLOAD_TTL_SECONDS` 去量 `expiresAt`，常数改成 400 时两边一起变，本文件不会红
+     * （实测：红的是 `tests/unit/asset/signed-url.test.ts` 的
+     * `expected 400 to be less than or equal to 300`）。钉住取值是单测那一侧的职责，
+     * 这里钉的是「接线之后这条性质仍然成立」。
+     */
     const before = Math.floor(Date.now() / 1000);
     const res = await issue(versionId, cookie);
+    const after = Math.floor(Date.now() / 1000);
     const body = res.body as { url?: string; expiresAt?: number };
 
     expect(res.status, `响应体=${res.text}`).toBe(200);
     expect(body.url?.startsWith('/assets/download?')).toBe(true);
     expect(typeof body.expiresAt).toBe('number');
     // 威胁 #3 的「≤5 分钟」在**响应**上成立（签发侧的常数由单测钉住，这里是端到端的同一件事）
-    expect((body.expiresAt as number) - before).toBeLessThanOrEqual(DOWNLOAD_TTL_SECONDS);
-    expect((body.expiresAt as number) - before).toBeGreaterThan(0);
+    expect((body.expiresAt as number) - after).toBeLessThanOrEqual(DOWNLOAD_TTL_SECONDS);
+    expect((body.expiresAt as number) - before).toBeGreaterThanOrEqual(DOWNLOAD_TTL_SECONDS);
     // 相对路径：本进程不猜自己的对外 origin（理由见 buildDownloadPath）
     expect(body.url?.startsWith('http')).toBe(false);
     // 存储键、fileId、keyId、nonce 之外的任何东西都不该出现在响应里
@@ -485,7 +526,8 @@ describe('签名下载（D10）：授权、单次使用、超时、篡改、审�
     const path = craftTicket({
       assetVersionId: versionId,
       userId: owner,
-      expiresAt: now + DOWNLOAD_TTL_SECONDS + 1,
+      // 超出量见 `TTL_OVERSHOOT_SECONDS` 的注释：+1 秒会被一次跨过秒边界的请求吃掉
+      expiresAt: now + DOWNLOAD_TTL_SECONDS + TTL_OVERSHOOT_SECONDS,
       nonce: createNonce(),
     });
 
