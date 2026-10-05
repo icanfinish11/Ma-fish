@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { Client } from 'pg';
 import { uuidv7 } from '@vca/shared';
 import { AuditService } from '@vca/api/modules/audit/audit.service.js';
 import { PrismaService } from '@vca/api/db/prisma.service.js';
@@ -89,6 +90,30 @@ async function kindOf(idempotencyKey: string): Promise<string | null> {
 /** 一笔过账留下的审计行数（按审计 metadata 里的幂等键找）。 */
 async function auditRowsFor(key: string): Promise<number> {
   return prisma.auditLog.count({ where: { metadata: { path: ['idempotencyKey'], equals: key } } });
+}
+
+/**
+ * 等到有 n 个后端卡在锁上（`wait_event_type = 'Lock'`），并**返回它们正在执行的语句**。
+ *
+ * 与 `postings.test.ts` 里那个同名 helper 同一形状（此处不共用：把测试装置提到
+ * `tests/helpers/` 是一次真正的共享决定，而今天只有两条用例用它）。
+ * 返回语句这件事不是装饰：**光看见「有后端在等锁」推不出「它在等那把行锁」**——
+ * Task 6 正是靠这一点量出「两个所谓的赛跑者其实被账户 INSERT 串行化了」（探针 p1/p2）。
+ *
+ * 观察者与 Prisma 用**同一个** `app_user` 连接：`pg_stat_activity` 的 `wait_event_type` /
+ * `query` 只对「本会话属主」可见，两边同角色才看得见（换成属主去看反而读到 NULL，
+ * 那会让这条构造**静默**失效）。
+ */
+async function waitForLockWaiters(client: Client, n: number): Promise<string[]> {
+  for (let i = 0; i < 80; i += 1) {
+    const r = await client.query<{ query: string }>(
+      `SELECT query FROM pg_stat_activity
+        WHERE datname = current_database() AND wait_event_type = 'Lock'`,
+    );
+    if (r.rows.length >= n) return r.rows.map((row) => row.query);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error('2 s 内没有观察到等待锁的后端 —— 这条用例的时序前提不成立（构造失败，不是断言失败）');
 }
 
 describe('五个原语（§8.2 / §8.4）', () => {
@@ -299,4 +324,71 @@ describe('五个原语（§8.2 / §8.4）', () => {
     // 那笔已提交的冻结**一字未动**：
     expect(await prisma.ledgerEntry.count({ where: { transactionId: (await prisma.ledgerTransaction.findUniqueOrThrow({ where: { idempotencyKey: okKey }, select: { id: true } })).id } })).toBe(2);
   });
+
+  it('★ 解冻的借方守卫对 `USER_FROZEN` **同样**成立（确定性构造：预判放行、由受影响行数拦下 ⇒ stage = conditional-update）', async () => {
+    // 为什么单独要这一条：`applyBalances` 的余额守卫是**条件化**的——
+    // `isUserAccountKind(kind) ? {id, balance: {gte: x}} : {id}`。已有的并发用例
+    // （postings.test.ts 的「并发扣款」与那条确定性用例）借的都是 `USER_AVAILABLE`，
+    // 而 `unfreeze` 借的是 `USER_FROZEN` ⇒ 「守卫对冻结余额也生效」这件事**今天没有任何见证**：
+    // 把守卫收窄成「只有 USER_AVAILABLE 才带 balance >= x」，整个套件一条都不会红
+    // （探针 **p-frozen-guard**：删掉它 ⇒ 恰好这一条变红）。
+    // 后果不是账面好看不好看：那会让**冻结余额被透支**（不变式 #3），唯一挡在前面的是
+    // 迁移里那条条件化 CHECK，而它经 Prisma 退化成 `DriverAdapterError`（C28 的同一个洞）。
+    //
+    // 构造是确定性的，不靠 sleep 猜时序（与 postings.test.ts 那条同一形状）：
+    //   W：一笔**合法的**解冻（冻结 10000 → 6000），扣款之后把事务挂住 ⇒ 那一行的写锁已持有；
+    //   A：另一笔解冻（同样 6000）⇒ 读到的快照是旧的 10000 ⇒ 预判放行 ⇒ 卡在那把行锁上；
+    //   观察者逐字确认**等锁的语句就是那条带守卫的 UPDATE**（否则这条用例证明的不是这回事）；
+    //   放行 W ⇒ A 的条件更新重新求值（4000 >= 6000 为假）⇒ count = 0 ⇒ conditional-update。
+    const userId = uuidv7();
+    // 两行账户都要先建出来：`grantCredit` 建 `USER_AVAILABLE`、`freeze` 建 `USER_FROZEN`。
+    // 不先建的话先到的那个请求会卡在**账户 INSERT** 上，等它提交后另一笔才读快照 ⇒
+    // 由纯核心的预判拦下（`predicted`），条件更新那条路一次都走不到（Task 6 的 p1/p2 实测）。
+    await prisma.$transaction(async (tx) => {
+      await ledger.grantCredit(tx, { userId, amount: 10_000n, idempotencyKey: `topup:${userId}` });
+      await ledger.freeze(tx, { userId, amount: 10_000n, idempotencyKey: `freeze:${userId}` });
+    });
+
+    let writerHoldsTheRow!: () => void;
+    const writerLocked = new Promise<void>((resolve) => { writerHoldsTheRow = resolve; });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const writer = prisma.$transaction(
+      async (tx) => {
+        const result = await ledger.unfreeze(tx, { userId, amount: 6_000n, idempotencyKey: `unfreeze:${userId}:1` });
+        writerHoldsTheRow(); // `applyBalances` 的 updateMany 已经发过 ⇒ USER_FROZEN 那一行的写锁已持有
+        await gate;          // 事务保持打开：锁不放、改动不提交
+        return result;
+      },
+      { timeout: 20_000 },   // Prisma 交互式事务默认 5 s 超时；显式放宽，免得慢 CI 把它变成超时
+    );
+    await writerLocked;
+
+    const blocked = prisma.$transaction((tx) =>
+      ledger.unfreeze(tx, { userId, amount: 6_000n, idempotencyKey: `unfreeze:${userId}:2` }),
+    );
+
+    const observer = new Client({ connectionString: pg.appUri });
+    await observer.connect();
+    let blockedStatements: string[];
+    try {
+      blockedStatements = await waitForLockWaiters(observer, 1);
+    } finally {
+      await observer.end();
+    }
+    expect(
+      blockedStatements.filter((sql) => /UPDATE\s+"ledger"\."accounts"[\s\S]*"balance" >=/.test(sql)),
+      `等锁的语句必须**是那条带余额守卫的条件更新**（否则这条用例证明的不是「守卫对冻结余额生效」）。实测等锁语句：${JSON.stringify(blockedStatements)}`,
+    ).toHaveLength(1);
+
+    release();
+    const rejected = await blocked.then(() => null, (error: unknown) => error);
+    expect(rejected).toBeInstanceOf(InsufficientFundsError);
+    expect((rejected as InsufficientFundsError).kind).toBe(ACCOUNT_KINDS.USER_FROZEN); // ← 借的是**冻结**那一行
+    expect((rejected as InsufficientFundsError).stage).toBe('conditional-update');
+    await expect(writer).resolves.toMatchObject({ created: true });
+    // 结果方向：恰好一笔生效（冻结 10000 − 6000 = 4000，解冻进可用 6000）。
+    expect(await ledger.readBalances(prisma, userId)).toEqual({ available: 6_000n, frozen: 4_000n });
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: `unfreeze:${userId}:2` } })).toBe(0);
+  }, 120_000);
 });
