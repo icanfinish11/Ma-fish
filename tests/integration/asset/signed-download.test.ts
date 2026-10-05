@@ -262,6 +262,20 @@ describe('签名下载（D10）：授权、单次使用、超时、篡改、审�
     return buildDownloadPath({ ...payload, signature: signTicket(payload, testEnv.DOWNLOAD_URL_SECRET) });
   }
 
+  /**
+   * 把签名改成**保证不同**的另一个值。
+   *
+   * 第一版写的是「把最后一位换成 `A`」——而 base64url 的字母表里本来就有 `A`：
+   * 签名末位**恰好**是 `A` 时那次「篡改」什么也没改，票据照样通过（实测：全量运行时
+   * 以约 1/64 的概率红了「把签名改一位 ⇒ 403」这条）。一次「有时不是篡改」的篡改
+   * 与恒真断言是同一个缺陷形状，因此这里先保证改得动、再断言它被拒。
+   */
+  function flipSignature(signature: string): string {
+    const mutated = `${signature.slice(0, -1)}${signature.endsWith('A') ? 'B' : 'A'}`;
+    if (mutated === signature) throw new Error('探针没有改变签名：这条用例会变成恒真断言');
+    return mutated;
+  }
+
   it('属主签发：200 + 一条相对路径 + 距今 ≤ 300 秒的过期时刻（响应里没有任何内部标识）', async () => {
     const owner = await createUser();
     const { versionId, storageKey } = await createVersion({ ownerId: owner });
@@ -499,7 +513,7 @@ describe('签名下载（D10）：授权、单次使用、超时、篡改、审�
       ['把 assetVersionId 换成另一个', { ...query, assetVersionId: randomUUID() }],
       ['把过期时间往后挪（不重签）', { ...query, expiresAt: String(Number(query['expiresAt']) + 3600) }],
       ['把 nonce 换掉', { ...query, nonce: createNonce() }],
-      ['把签名改一位', { ...query, signature: `${String(query['signature']).slice(0, 42)}A` }],
+      ['把签名改一位', { ...query, signature: flipSignature(String(query['signature'])) }],
       ['把签名截短', { ...query, signature: String(query['signature']).slice(0, 20) }],
       ['超长签名', { ...query, signature: 'A'.repeat(4096) }],
       ['缺一个字段', Object.fromEntries(Object.entries(query).filter(([key]) => key !== 'nonce'))],
@@ -788,7 +802,11 @@ describe('签名下载：制品被换成更短的自洽制品时，带外长度�
 });
 
 /**
- * 「这条新路由真的接进了 P0 的限流器」的**行为**见证。
+ * 「签名下载这条新路由真的接进了 P0 的限流器」的**行为**见证。
+ *
+ * 标题里带「签名下载」是刻意的：验收命令是 `vitest run --project integration -t 签名下载`，
+ * 而这个文件里的每一条都该被那条命令覆盖到（否则「跑了验收命令」与「跑了本文件的全部用例」
+ * 会差一条，而那一条恰好是限流归属的见证）。
  *
  * 覆盖率门只证明「声明存在」（那是它能证明的全部），而这里打满一个桶：
  * 第 61 次要 429。判据选**元数据**端点（公开、只读、无副作用、无审计），
@@ -796,7 +814,7 @@ describe('签名下载：制品被换成更短的自洽制品时，带外长度�
  * （`TRUST_PROXY=loopback` 下，来自 127.0.0.1 的请求其 XFF 是被信任的，
  * 因此 `req.ip` 就是这里给的值——`search` 层正是按 IP 分桶）。
  */
-describe('资产模块的新路由归属 P0 的限流层（打到上限即 429）', () => {
+describe('签名下载：资产模块的新路由归属 P0 的限流层（打到上限即 429）', () => {
   let app: INestApplication;
   let redis: TestRedis;
   let pg: TestPg;
