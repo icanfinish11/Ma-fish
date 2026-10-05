@@ -146,14 +146,37 @@ function responseBytes(res: request.Response): Buffer {
   return Buffer.from(typeof res.text === 'string' ? res.text : '', 'utf8');
 }
 
-/** 判据：响应体里**一个制品的字节都没有**（被拒时不许流出半个文件）。 */
+/**
+ * 判据：响应体里**一个制品的字节都没有**（被拒时不许流出半个文件）。
+ *
+ * ## M6：这条判据的**实际射程**（据实记载，别按名字读）
+ *
+ * 名字承诺的是「内容级别的缺席」，而**内容判据只能比原始字节**。这里做的是与
+ * `ingest-memory.test.ts` 同款的那一条：`body.includes(plaintext)` **整份明文**都比一次
+ * （取到的样本都不大，代价可以忽略），另加中段与尾段的窗口——只查前缀会漏掉
+ * 「从中间开始的一次泄漏」。
+ *
+ * **它挡不住什么（实测，见报告 M6 的两个探针）**：错误响应体是 `JSON.stringify` 出来的，
+ * 明文里那些控制字节与高位字节会变成 `\u00XX` 这样的**转义序列**，于是原始字节判据对
+ * 「经 JSON 转义后的、且很短的一次泄漏」是**瞎的**（探针：把 64 字节明文塞进 422 的
+ * `reason` 里，本函数三条内容判据与 1 KiB 的形状判据**全部通过**）。
+ * 它**能**抓住的是「明文里有足够长的可打印 ASCII 段、且泄漏覆盖了判据窗口」那种形态
+ * （探针：同一处泄漏、明文换成 ASCII ⇒ 中段窗口判据立刻变红）。
+ * 因此这条路径上「无制品字节」真正承重的还有另外两条：**响应必须是 JSON**
+ * （`errorBody()` 在调用方还会 `JSON.parse`）与**响应体很小**（`< 1024`，成规模的泄漏会被它拦下）。
+ * 这一条如实写着，免得下一个读者以为内容判据已经覆盖了全部形态。
+ */
 function expectNoArtifactBytes(res: request.Response, plaintext: Buffer): void {
   expect(res.headers['content-type'] ?? '', `被拒的响应不是 JSON：${res.headers['content-type']}`).toContain('json');
   const body = responseBytes(res);
-  // 制品的最小可能形态也远大于 1 KiB 的错误体；这条是「没有把文件当错误体发出去」
-  // 的第一道信号，第二条是内容判据（连前 16 字节都不许出现）。
+  // 内容判据（M6）：整份明文 + 中段窗口 + 尾段窗口——三种形态都不许出现在响应体里。
+  expect(body.includes(plaintext), '响应体里出现了整份制品明文').toBe(false);
+  const middle = Math.floor(plaintext.length / 2);
+  expect(body.includes(plaintext.subarray(middle, middle + 32)), '响应体里出现了明文中段的片段').toBe(false);
+  expect(body.includes(plaintext.subarray(Math.max(0, plaintext.length - 32))), '响应体里出现了明文尾段的片段').toBe(false);
+  // 形状判据（**不是**内容判据）：制品的最小可能形态也远大于 1 KiB 的错误体，
+  // 因此它是「没有把文件当错误体发出去」的那道界。放在内容判据之后，失败时不会掩盖原因。
   expect(body.length, `错误响应体里带了 ${body.length} 字节`).toBeLessThan(1024);
-  expect(body.includes(plaintext.subarray(0, 16)), '响应体里出现了制品的开头字节').toBe(false);
   expect(res.headers['content-disposition']).toBeUndefined();
 }
 
@@ -960,10 +983,24 @@ describe('签名下载：制品被换成更短的自洽制品时，带外长度�
  * 会差一条，而那一条恰好是限流归属的见证）。
  *
  * 覆盖率门只证明「声明存在」（那是它能证明的全部），而这里打满一个桶：
- * 第 61 次要 429。判据选**元数据**端点（公开、只读、无副作用、无审计），
- * 并用一个独立的 `X-Forwarded-For` 把它与同文件其它请求的桶分开
- * （`TRUST_PROXY=loopback` 下，来自 127.0.0.1 的请求其 XFF 是被信任的，
- * 因此 `req.ip` 就是这里给的值——`search` 层正是按 IP 分桶）。
+ * 第 61 次要 429。判据选**元数据**端点（公开、只读、无副作用、无审计）。
+ *
+ * ## 请求里的那个 `X-Forwarded-For` **不是**在证明「按 IP 分桶」（M9：修正一条假理由）
+ *
+ * 上一版这里写着「用一个独立的 `X-Forwarded-For` 把它与同文件其它请求的桶分开
+ * （`TRUST_PROXY=loopback` 下来自 127.0.0.1 的请求其 XFF 是被信任的，因此 `req.ip` 就是
+ * 这里给的值——`search` 层正是按 IP 分桶）」。**那句话是假的**，两处都假：
+ *
+ * 1. **这一节自己起了一个新的 Redis**（`beforeAll` 里的 `startTestRedis()`），因此这个桶
+ *    从空开始——无论 `req.ip` 是什么、无论分桶键是什么，前 60 次都会通过。
+ *    「隔离」这件事在这里**没有被证明，也不可能被证伪**：断言无论如何都过。
+ * 2. 更直接的是：**测试应用从未设置 trust proxy**，所以 `req.ip` 根本不是这里给的值
+ *    （实测，见进度文件 M9：200 个不同的 XFF 值恰好拿到 60 次通过 = **同一个桶**）。
+ *
+ * 保留这个请求头是可以的（它让请求形状与真实反代下的样子一致），但**不能声称它在隔离**。
+ * 这条用例真正证明的是：**这三条新路由确实挂了 P0 的 `search` 限流层**（第 61 次 429）。
+ * 分桶键（`req.ip`）是否正确，由 `tests/security/trust-proxy.test.ts` 负责——
+ * 那才是能确定性地钉住「XFF 被信任 / 不被信任」两种形态的地方。
  */
 describe('签名下载：资产模块的新路由归属 P0 的限流层（打到上限即 429）', () => {
   let app: INestApplication;
