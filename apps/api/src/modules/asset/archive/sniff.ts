@@ -16,6 +16,16 @@ import type { EncryptedArtifactReader } from '../store/random-access-reader.js';
  * 因此本条件的判别力由**两条**用例共同承担：依赖契约用例（直接断言 `file-type` 的返回值）
  * 与合法 tar.gz 的**接受**用例。缺任何一条，这个错误都能在绿灯下存活。
  *
+ * ## 一处**保留但已记录**的模糊（修复轮 1 / Ruling 2 的裁定）
+ *
+ * `mime === 'application/gzip'` 这一半对**所有** gzip 成立 ⇒ 任何 `.gz` 都会被当成 tar.gz
+ * 送进 tar.gz 校验器（`ext === 'gz'` 的普通 `.gz` 也在内）。裁定是**保留该行为**：
+ * 它是 D7 的原文，而且正是这一半让「合法 tar.gz 被误判为 `gz`」这类错误无法 100% 误拒。
+ * 代价（已量化并有界）：非 tar 的 `.gz` 在**归档结束标记**处被拒——
+ * 判据与文案见 `targz-inspector.ts` 的 `'eof'` 处理器与 `'warn'` 处理器，
+ * 用例见 `tests/unit/asset/validate-archive.test.ts` 的 Ruling 2 那条
+ * （断言的是**解压出的字节数**有界，而不是「反正拒了」）。
+ *
  * ## 只读前 4100 字节
  *
  * `file-type` 的官方建议是至少给它 4100 字节；而 zip 的判定其实只看前 4 字节

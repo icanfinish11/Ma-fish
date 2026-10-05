@@ -1,9 +1,6 @@
-import { afterEach, beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, readdir, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { createGunzip } from 'node:zlib';
 import { fileTypeFromBuffer } from 'file-type';
@@ -25,7 +22,6 @@ import { inspectZip } from '@vca/api/modules/asset/archive/zip-inspector.js';
 import { inspectTarGz } from '@vca/api/modules/asset/archive/targz-inspector.js';
 import { validateArchive } from '@vca/api/modules/asset/archive/validate-archive.js';
 import { TAG_BYTES } from '@vca/api/modules/asset/crypto/artifact-format.js';
-import { LocalArtifactStore } from '@vca/api/modules/asset/store/local-artifact.store.js';
 import { EncryptedArtifactReader } from '@vca/api/modules/asset/store/random-access-reader.js';
 // 制品（密文外壳）的构造与观察住在 Task 3 的共享夹具里：Task 4 的输入是
 // `EncryptedArtifactReader`，因此这里的「样本」是**先加密成制品、再打开读取器**。
@@ -832,6 +828,12 @@ describe('validateArchive：末块认证 → 嗅探 → 分发（Step 0b 五条 
   });
 
   it('Step 0b-5：带外长度与制品自称不符 ⇒ 拒绝（唯一非自称的长度载体）', async () => {
+    // **Task 5 的义务（移交要求，修复轮 1 明确下来）**：建 `AssetVersion` 时**必须**把
+    // 明文的 `plaintextLength` 记进版本记录并作为 `expectedPlaintextLength` 传进
+    // `validateArchive`。今天没有这个数（模型还不存在，`POST /assets/upload` 返回的
+    // `bytes` 是**密文对象**的长度）⇒ 这条交叉核对目前是**空的**：制品自称的长度
+    // 不在任何 AAD 里，可被攻击者改写。这一步不接上，「长度对不对」就没有独立核对源。
+    // 反过来，**绝不能把密文对象长度传进来**——那会让每一次合法上传都被拒（M13 的形态）。
     const { reader } = await openPlaintext(sampleBytes('ok.zip'));
     const verdict = await validateArchive(reader, {
       expectedPlaintextLength: reader.plaintextLength + 1,
@@ -953,98 +955,9 @@ describe('Ruling 1：20,001 条目归档的解密次数必须与条目数解耦�
   }, HEAVY_TEST_TIMEOUT_MS);
 });
 
-/**
- * 每条样本**期望由哪一条控制拦下**（不是「反正拒了就行」）。
- *
- * 六条恶意样本按控制分开：路径（yauzl 自带防护，D6 约束 1）、链接（我们自己的检查，
- * D6 约束 2）、压缩比（炸弹）、条目数（flood）、类型（magic bytes）。
- * 这一列是刻意留在这里而不是生成器里的：它写的是**实现给出的理由**，
- * 属于用例的知识，不属于样本的形状。
- */
-const SAMPLE_EXPECTATION: Record<string, { kind: 'zip' | 'tar.gz' } | { reason: string }> = {
-  'zip-slip.zip': { reason: 'invalid relative path' },
-  'symlink.zip': { reason: '符号链接' },
-  'bomb.zip': { reason: '压缩比' },
-  'flood.zip': { reason: '条目数' },
-  'fake-mime.zip': { reason: 'png' },
-  'bomb.tar.gz': { reason: '压缩比' },
-  'ok.zip': { kind: 'zip' },
-  'ok.tar.gz': { kind: 'tar.gz' },
-};
-
-describe('八样本判定 + 零落盘（Step 5/6）：走**真实** LocalArtifactStore，不是内存替身', () => {
-  // 为什么必须用真实存储：零落盘（C21）这条断言在内存储上**恒真**——那样的用例
-  // 证明不了任何东西。真实存储会在磁盘上建目录、写对象，因此「跑完八样本目录里没有新增」
-  // 才是可以被违反、也就可以被检测的判据。
-  const storeEnvKeys = ['TMPDIR', 'TMP', 'TEMP'] as const;
-  const savedEnv = new Map<string, string | undefined>();
-  let storeRoot = '';
-  let probeTmp = '';
-  let store: LocalArtifactStore;
-  let beforeRun: string[] = [];
-  const keysBySample = new Map<string, string>();
-
-  /** 制品库目录 + 临时目录的**全部条目**（相对路径，含目录），排序后便于比较。 */
-  async function snapshot(): Promise<string[]> {
-    const fromStore = await readdir(storeRoot, { recursive: true });
-    const fromTmp = await readdir(probeTmp, { recursive: true });
-    return [...fromStore.map((entry) => `store/${entry}`), ...fromTmp.map((entry) => `tmp/${entry}`)].sort();
-  }
-
-  beforeAll(async () => {
-    storeRoot = await mkdtemp(join(tmpdir(), 'vca-t4-store-'));
-    probeTmp = await mkdtemp(join(tmpdir(), 'vca-t4-tmp-'));
-    // 把三个临时目录变量指到我们自己的空目录：任何走 `os.tmpdir()` 的写入都会落在
-    // **能被断言的**地方（否则「跑完八样本临时目录没新增」这条只是在看别的进程的噪音）。
-    for (const name of storeEnvKeys) {
-      savedEnv.set(name, process.env[name]);
-      process.env[name] = probeTmp;
-    }
-    store = new LocalArtifactStore(storeRoot);
-    for (const sample of ARCHIVE_SAMPLES) {
-      // 明文的加密在内存里做完，再把**制品字节**写进真实存储（写入本身是 Task 1/2 的事）。
-      const { artifact } = await seedArtifact(new MemoryStore(), sample.bytes(), { chunkSize: 4096 });
-      const { key } = await store.putStream(Readable.from([artifact]), { maxBytes: 256 * 1024 * 1024 });
-      keysBySample.set(sample.name, key);
-    }
-    // 快照取在**八样本开始跑之前**：制品本身已经落盘（那是预期的），校验不该再落任何东西。
-    beforeRun = await snapshot();
-  }, 120_000);
-
-  afterAll(async () => {
-    for (const name of storeEnvKeys) {
-      const previous = savedEnv.get(name);
-      if (previous === undefined) delete process.env[name];
-      else process.env[name] = previous;
-    }
-    await rm(storeRoot, { recursive: true, force: true });
-    await rm(probeTmp, { recursive: true, force: true });
-  });
-
-  for (const sample of ARCHIVE_SAMPLES) {
-    const expectation = SAMPLE_EXPECTATION[sample.name];
-    it(`${sample.name} ⇒ ${sample.expected === 'accept' ? '接受' : '拒绝'}（${sample.note}）`, async () => {
-      const key = keysBySample.get(sample.name);
-      if (key === undefined) throw new Error(`样本 ${sample.name} 没有写进制品库`);
-      const reader = await EncryptedArtifactReader.open(store, key, fakeRing());
-      const verdict = await validateArchive(reader);
-      if (expectation !== undefined && 'kind' in expectation) {
-        expect(verdict).toEqual({ ok: true, kind: expectation.kind });
-      } else {
-        expect(verdict.ok).toBe(false);
-        expect(reasonOf(verdict)).toContain(expectation?.reason ?? '');
-      }
-    }, 120_000);
-  }
-
-  it('跑完八样本后：制品库目录与临时目录**零新增文件**（C21 / Step 6）', async () => {
-    const afterRun = await snapshot();
-    expect(afterRun).toEqual(beforeRun);
-    // 顺带把「快照不是空的」钉住：八份制品确实躺在制品库里，否则上面那条恒真
-    for (const key of keysBySample.values()) {
-      await expect(store.stat(key)).resolves.toMatchObject({ bytes: expect.any(Number) });
-    }
-    expect(beforeRun.length).toBeGreaterThanOrEqual(8);
-    expect(beforeRun.filter((entry) => entry.startsWith('tmp/'))).toHaveLength(0);
-  });
-});
+// 八样本判定 + 零落盘（brief 的 Step 5/6）**已搬到** `tests/security/validate-archive-samples.test.ts`
+// （修复轮 1 / Ruling 3）：归档校验器就是威胁 #2 的控制面，而 `scripts/assert-tests-ran.mjs`
+// 给 `security` 门登记的下限只数那个目录里的用例——那些判定住在这里时，把六条恶意样本的判据
+// 逐条删掉也不会让安全门变红。裁决要求「进安全门 + 复用同一份生成器与辅助函数、不许复制成两份」，
+// 因此这里是**搬走**：`ARCHIVE_SAMPLES` 与 `tests/helpers/craft-encrypted-artifact.ts` 两个
+// project 各自 import。本文件继续负责每条判据的**判别力**、边界与文案（C19 / D6 / D7 / Step 0b）。
