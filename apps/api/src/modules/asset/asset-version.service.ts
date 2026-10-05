@@ -1,5 +1,4 @@
 import { Injectable } from '@nestjs/common';
-import type { Prisma } from '../../generated/prisma/client.js';
 import { PrismaService } from '../../db/prisma.service.js';
 import type { IngestedVersion } from './asset.service.js';
 import type { ParsedMetadata } from './metadata/parse-metadata.js';
@@ -83,9 +82,9 @@ export class AssetVersionService {
           readmeExcerpt: metadata.readmeExcerpt,
           // 三份结构化内容整份存（JSONB）：它们是**展示**用的资料，压缩/裁剪都发生在
           // Task 6 的解析里（那些上限是它的职责），这里再削一次只会让两处口径打架。
-          fileTree: metadata.fileTree as unknown as Prisma.InputJsonValue,
-          languages: metadata.languages as unknown as Prisma.InputJsonValue,
-          dependencies: metadata.dependencies as unknown as Prisma.InputJsonValue,
+          fileTree: metadata.fileTree,
+          languages: metadata.languages,
+          dependencies: metadata.dependencies,
           completeness: metadata.completeness,
           fileTreeTruncated: metadata.fileTreeTruncated,
         },

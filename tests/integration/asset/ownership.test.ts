@@ -14,7 +14,6 @@ import { AuditService } from '@vca/api/modules/audit/index.js';
 import { AssetService } from '@vca/api/modules/asset/asset.service.js';
 import { AssetVersionService } from '@vca/api/modules/asset/asset-version.service.js';
 import { AssetNotFoundError, OwnershipService } from '@vca/api/modules/asset/ownership.service.js';
-import type { Env } from '@vca/api/config/env.schema.js';
 import { createKeyRing, type KeyRing } from '@vca/api/modules/asset/crypto/key-ring.js';
 import { parseMetadata } from '@vca/api/modules/asset/metadata/parse-metadata.js';
 import { LocalArtifactStore } from '@vca/api/modules/asset/store/local-artifact.store.js';
@@ -253,7 +252,7 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
     // 审计（真库）。`ConfigService` 的类型参数是 `get()` 的重载形状，构造期不需要它。
     assets = new AssetService(
       store,
-      new ConfigService(testEnv) as unknown as ConfigService<Env, true>,
+      new ConfigService(testEnv),
       new AuditService(prisma),
     );
     versions = new AssetVersionService(prisma);
@@ -378,7 +377,7 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
     store = new LocalArtifactStore(storeDir);
     assets = new AssetService(
       store,
-      new ConfigService(testEnv) as unknown as ConfigService<Env, true>,
+      new ConfigService(testEnv),
       new AuditService(prisma),
     );
     versions = new AssetVersionService(prisma);
