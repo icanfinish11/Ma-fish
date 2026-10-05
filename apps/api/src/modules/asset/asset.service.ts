@@ -290,10 +290,11 @@ export class AssetService {
 /**
  * 「密文对象没删掉」的审计动作名（append-only 表里的可检索键，**同时也是待清理标记**）。
  *
- * 稳定字符串：运维的告警规则与将来的清理 worker 都按它匹配（同 `audit.service.ts` 里
- * `<域>.<动作>` 的命名约定）。
+ * 稳定字符串，按 `audit.service.ts` 的 `<域>.<动作>` 命名约定：运维的告警规则与将来的清理
+ * worker 都按它匹配。**刻意不导出**：今天只有 `delete` 一个写入方（C16），
+ * 而用例里写的是**字面量**——那样改掉这个名字会让用例变红，而不是跟着一起漂移。
  */
-export const ARTIFACT_CLEANUP_FAILED_ACTION = 'asset.artifact.cleanup_failed';
+const ARTIFACT_CLEANUP_FAILED_ACTION = 'asset.artifact.cleanup_failed';
 
 /** 删除的同步尝试次数（含第一次）。 */
 const CLEANUP_ATTEMPTS = 3;
