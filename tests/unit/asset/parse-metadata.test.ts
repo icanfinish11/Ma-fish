@@ -253,4 +253,55 @@ describe('Task 6 · 元数据解析', () => {
       });
     }
   });
+
+  describe('Step 2：README 抽取', () => {
+    it('大小写不敏感，且取归档顺序里的**第一个**匹配', async () => {
+      const bytes = buildZip([
+        { name: 'docs/Notes.md', data: Buffer.from('不是 README\n') },
+        { name: 'src/ReadMe.MD', data: Buffer.from('# 第一个匹配（大小写不同）\n') },
+        { name: 'README.md', data: Buffer.from('# 后面那个不该赢\n') },
+      ]);
+      expect((await parseOf(bytes, 'zip')).readmeExcerpt).toBe('# 第一个匹配（大小写不同）\n');
+    });
+
+    it('截断到 2000 字符的上限（源文件 5000 字符）', async () => {
+      const bytes = buildZip([{ name: 'README.md', data: Buffer.from('x'.repeat(5000)) }]);
+      const excerpt = (await parseOf(bytes, 'zip')).readmeExcerpt;
+      expect(excerpt).toHaveLength(2000);
+      expect(excerpt).toBe('x'.repeat(2000));
+    });
+
+    it('比读取上限还大的 README（源文件 200 KiB）：摘录仍然只有 2000 字符', async () => {
+      const bytes = buildZip([{ name: 'README', data: Buffer.from('y'.repeat(200 * 1024)) }]);
+      const excerpt = (await parseOf(bytes, 'zip')).readmeExcerpt;
+      expect(excerpt).toHaveLength(2000);
+      expect(excerpt).toBe('y'.repeat(2000));
+    });
+
+    it('没有 README ⇒ null；README 是 0 字节 ⇒ 空串（两者不是同一件事）', async () => {
+      const none = buildZip([{ name: 'src/index.ts', data: Buffer.from('export const x = 1;\n') }]);
+      expect((await parseOf(none, 'zip')).readmeExcerpt).toBeNull();
+
+      const empty = buildZip([{ name: 'README.md', data: Buffer.alloc(0) }]);
+      expect((await parseOf(empty, 'zip')).readmeExcerpt).toBe('');
+    });
+
+    it('tar.gz 侧走同一批判据（大小写不敏感 + 截断）', async () => {
+      const bytes = buildTarGz([
+        { name: 'docs/OTHER.md', data: Buffer.from('不是 README\n') },
+        { name: 'ReadMe.txt', data: Buffer.from('z'.repeat(3000)) },
+      ]);
+      const excerpt = (await parseOf(bytes, 'tar.gz')).readmeExcerpt;
+      expect(excerpt).toHaveLength(2000);
+      expect(excerpt).toBe('z'.repeat(2000));
+    });
+
+    it('目录条目不算 README（`readme/` 不是文件）', async () => {
+      const bytes = buildZip([
+        { name: 'readme/', data: Buffer.alloc(0) },
+        { name: 'src/index.ts', data: Buffer.from('export const x = 1;\n') },
+      ]);
+      expect((await parseOf(bytes, 'zip')).readmeExcerpt).toBeNull();
+    });
+  });
 });

@@ -1,4 +1,5 @@
 import { createGunzip } from 'node:zlib';
+import type { Readable } from 'node:stream';
 import { Parser, type ReadEntry } from 'tar';
 import { fromRandomAccessReader, type Entry, type RandomAccessReader, type ZipFile } from 'yauzl';
 import type { EncryptedArtifactReader } from '../store/random-access-reader.js';
@@ -76,6 +77,28 @@ export async function parseMetadata(
   return scanner.result();
 }
 
+// ── 内容读取的上限（**唯一的例外**：只有下面这几类文件会被读进内存）────────────
+//
+// 每一条都写清「为什么是这个数」；它们都是**模块私有**的（用例里写死了同一批字面量，
+// 改这里会让用例红，而不是让判据跟着漂移）。
+
+/**
+ * README 的读取上限（字节）。
+ *
+ * 它必须**大于** `README_EXCERPT_CHARS` 的 UTF-8 上界才不至于把摘录饿死：
+ * 2000 个汉字是 6000 字节，8192 留了约 1.36 倍余量。代价：最多 8 KiB 的内存。
+ */
+const README_READ_BYTES = 8 * 1024;
+
+/** README 摘录的字符上限（设计 D9「截断到上限」）。 */
+const README_EXCERPT_CHARS = 2000;
+
+/** 一个条目需要读内容时给出的请求（`cap` 是允许读进内存的字节数）。 */
+interface ContentRequest {
+  readonly kind: 'readme';
+  readonly cap: number;
+}
+
 /**
  * 一趟扫描的**唯一**累加器：两个 walker 都只经它记账。
  *
@@ -84,16 +107,35 @@ export async function parseMetadata(
  */
 class MetadataScanner {
   private readonly files: { path: string; bytes: number }[] = [];
+  /** README 的原始字节；`null` = 到扫描结束都没遇到过 README。 */
+  private readme: Buffer | null = null;
 
   /** 遇到一个**文件**条目（walker 已排除目录）。 */
   addFile(path: string, bytes: number): void {
     this.files.push({ path, bytes });
   }
 
+  /**
+   * 这个条目的内容要不要读？返回 `null` = 一个字节都不读。
+   *
+   * 调用时机是**条目开始处**，且两个 walker 都是**顺序**处理的（读完上一条才处理下一条），
+   * 因此这里的判断与 `take` 之间不会插进别的条目。
+   */
+  need(path: string): ContentRequest | null {
+    // 「第一个匹配」按**归档顺序**：先到先得，后面的 README 一律不再读。
+    if (this.readme === null && isReadmePath(path)) return { kind: 'readme', cap: README_READ_BYTES };
+    return null;
+  }
+
+  /** 条目内容到手（**可能被截断到 `request.cap`**）。 */
+  take(request: ContentRequest, content: Buffer): void {
+    if (request.kind === 'readme') this.readme = content;
+  }
+
   /** 装配结果。 */
   result(): ParsedMetadata {
     return {
-      readmeExcerpt: null,
+      readmeExcerpt: this.readme === null ? null : excerptOf(this.readme),
       fileTree: this.files,
       languages: [],
       dependencies: [],
@@ -101,6 +143,27 @@ class MetadataScanner {
       fileTreeTruncated: false,
     };
   }
+}
+
+/** 路径的最后一段（`a/b/c.md` → `c.md`）。 */
+function baseNameOf(path: string): string {
+  const cut = path.lastIndexOf('/');
+  return cut === -1 ? path : path.slice(cut + 1);
+}
+
+/**
+ * 是不是 README（设计 D9 写的是 `README*`）。
+ *
+ * 判据是**路径最后一段**以 `readme` 开头、大小写不敏感：`README` / `README.md` /
+ * `ReadMe.txt` / `readme_zh.md` 都算，`docs/Notes.md` 不算。目录条目在 walker 里已被排除。
+ */
+function isReadmePath(path: string): boolean {
+  return /^readme/i.test(baseNameOf(path));
+}
+
+/** README 字节 → 摘录（UTF-8 解码 + 按**字符**截断，见 `README_EXCERPT_CHARS`）。 */
+function excerptOf(content: Buffer): string {
+  return content.toString('utf8').slice(0, README_EXCERPT_CHARS);
 }
 
 /** zip：只读中央目录 + 按需解压**限长**的条目内容。 */
@@ -124,13 +187,59 @@ function scanZip(reader: RandomAccessReader, totalSize: number, scanner: Metadat
       zipfile = opened;
       opened.on('entry', (entry: Entry) => {
         // 目录条目（名字以 `/` 结尾）不是文件：不进文件树、不参与语言分布与文件数。
-        if (!entry.fileName.endsWith('/')) scanner.addFile(entry.fileName, entry.uncompressedSize);
-        advance(opened);
+        if (entry.fileName.endsWith('/')) {
+          advance(opened);
+          return;
+        }
+        scanner.addFile(entry.fileName, entry.uncompressedSize);
+        const request = scanner.need(entry.fileName);
+        if (request === null) {
+          advance(opened);
+          return;
+        }
+        opened.openReadStream(entry, (streamError, stream) => {
+          if (streamError !== null || stream === undefined) {
+            finish(streamError ?? new Error(`zip 条目 ${entry.fileName} 打不开`));
+            return;
+          }
+          void collectUpTo(stream, request.cap).then(
+            (content) => {
+              scanner.take(request, content);
+              advance(opened);
+            },
+            (error: unknown) => finish(error instanceof Error ? error : new Error(String(error))),
+          );
+        });
       });
       opened.on('end', () => finish());
       opened.on('error', (zipError: Error) => finish(zipError));
       advance(opened);
     });
+  });
+}
+
+/**
+ * 收一个 zip 条目流的前 `cap` 字节，**读够就销毁**（剩下的字节连解压都不必做）。
+ *
+ * 一处据实记载：zlib 是按块吐的（实测 16 KiB 一块），因此实际收进内存的是
+ * `cap` 向上取整到下一个块边界的量——上界是 `cap + 16 KiB`，不是 `cap`。
+ */
+async function collectUpTo(stream: Readable, cap: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  return await new Promise<Buffer>((resolve, reject) => {
+    const done = (): void => resolve(Buffer.concat(chunks));
+    stream.on('data', (chunk: Buffer) => {
+      const remaining = cap - total;
+      if (remaining <= 0) return;
+      const slice = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+      chunks.push(slice);
+      total += slice.length;
+      if (total >= cap) stream.destroy();
+    });
+    stream.on('end', done);
+    stream.on('close', done); // 提前 destroy 之后走的是这一条
+    stream.on('error', reject);
   });
 }
 
@@ -162,9 +271,22 @@ function scanTarGz(reader: RandomAccessReader, archiveBytes: number, scanner: Me
 
     parser.on('entry', (entry: ReadEntry) => {
       const isDirectory = entry.header.typeKey === '5' || entry.path.endsWith('/');
-      if (!isDirectory) scanner.addFile(entry.path, entry.size ?? 0);
       // 不 resume 解析器就不前进（D8 的背压形态）；目录也要 drain 掉。
-      entry.resume();
+      if (isDirectory) {
+        entry.resume();
+        return;
+      }
+      const bytes = entry.size ?? 0;
+      scanner.addFile(entry.path, bytes);
+      const request = scanner.need(entry.path);
+      if (request === null) {
+        entry.resume();
+        return;
+      }
+      void collectEntry(entry, request.cap).then(
+        (content) => scanner.take(request, content),
+        (error: unknown) => finish(error instanceof Error ? error : new Error(String(error))),
+      );
     });
     parser.on('end', () => finish());
     parser.on('error', (error: Error) => finish(error));
@@ -176,5 +298,29 @@ function scanTarGz(reader: RandomAccessReader, archiveBytes: number, scanner: Me
     source.on('error', (error: Error) => finish(error));
 
     source.pipe(gunzip).pipe(parser);
+  });
+}
+
+/**
+ * 收一个 tar 条目的前 `cap` 字节。
+ *
+ * **不能像 zip 那样 `destroy()` 早退**：tar 是一条前向流，条目流被销毁会让解析器卡住
+ * （D8 的背压形态）。因此这里收够 `cap` 之后**继续排水但不再留存**——
+ * 内存有界，而解压量与归档本身同阶（这一条在文件头写着，不假装两种容器一样省）。
+ */
+async function collectEntry(entry: ReadEntry, cap: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  return await new Promise<Buffer>((resolve, reject) => {
+    entry.on('data', (chunk: Buffer) => {
+      const remaining = cap - total;
+      if (remaining <= 0) return;
+      const slice = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+      chunks.push(slice);
+      total += slice.length;
+    });
+    entry.on('end', () => resolve(Buffer.concat(chunks)));
+    entry.on('error', (error: unknown) => reject(error instanceof Error ? error : new Error(String(error))));
+    entry.resume();
   });
 }
