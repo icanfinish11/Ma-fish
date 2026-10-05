@@ -26,6 +26,9 @@ const VALID = {
   GITHUB_CALLBACK_URL: 'http://localhost:3000/auth/github/callback',
   MAIL_FROM: 'no-reply@example.com',
   SMTP_URL: 'smtp://127.0.0.1:1025',
+  // P1 / Task 1 新增（见 tests/helpers/env.ts 的 K9 清单）
+  ARTIFACT_STORE_DIR: 'C:\\Temp\\vca-artifacts-fixture',
+  ARTIFACT_MAX_UPLOAD_BYTES: '4194304',
 } as unknown as NodeJS.ProcessEnv;
 
 describe('nonPlaceholder 的使用边界（只作用于密钥字段）', () => {

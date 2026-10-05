@@ -12,6 +12,7 @@ import { CsrfGuard } from './common/security/csrf.guard.js';
 import { CsrfMiddleware } from './common/security/csrf.middleware.js';
 import { SecurityModule } from './common/security/security.module.js';
 import { AuditModule } from './modules/audit/audit.module.js';
+import { AssetModule } from './modules/asset/asset.module.js';
 import { AuthModule } from './modules/auth/auth.module.js';
 import { SessionMiddleware } from './modules/auth/session.middleware.js';
 import { HealthModule } from './modules/health/health.module.js';
@@ -109,6 +110,7 @@ import { HealthModule } from './modules/health/health.module.js';
     SecurityModule,
     AuditModule,
     AuthModule,
+    AssetModule,
     HealthModule,
   ],
   providers: [

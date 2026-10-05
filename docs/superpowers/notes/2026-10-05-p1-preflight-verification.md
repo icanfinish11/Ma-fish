@@ -94,7 +94,8 @@ zip 的中央目录在文件**末尾**，因此**单趟前向流无法校验 zip
 
 ## 4. 仍未预检的项（计划中标注、实现时先验）
 
-- **上传路径**：NestJS 12 / Express 5 下的 multipart 流式接入与硬性大小上限（`multer` 2.4.0 的存储引擎选择）。**这是 P1 最大的未验证面**。
+- ~~**上传路径**：NestJS 12 / Express 5 下的 multipart 流式接入与硬性大小上限（`multer` 2.4.0 的存储引擎选择）。**这是 P1 最大的未验证面**。~~
+  **已由 Task 1 预检并回填，见 §6**。结论一句话：自定义 storage engine 可以真流式（不落临时文件、不整份进内存），`limits.fileSize` 回 413，但**报错前 multer 会把整个请求体读完**。
 - **签名下载 URL**：HMAC + ≤5 分钟 TTL + 单次使用（Redis）。机制常规，风险低。
 - **元数据解析**：README/文件树/语言分布/依赖，纯静态、绝不执行（C2）。风险低。
 
@@ -108,3 +109,49 @@ zip 的中央目录在文件**末尾**，因此**单趟前向流无法校验 zip
 4. tar 流式读取用 `'entry'` 事件 + 显式 settle-once + 销毁上游。
 5. 加密读取器**必须校验块序号与位置一致**，并有一个「调换两条记录必须被拒」的用例。
 6. 内存上界断言用未完成字节数，不用 RSS。
+
+---
+
+## 6. 上传路径预检（P1 Task 1 回填，2026-10-05）
+
+**探针**：`apps/api/.probe-t1/`（一次性，验完即删；脚本副本 `.superpowers/sdd/2026-10-05-p1-asset-artifact/evidence/t1-probe-*.mjs`，
+**必须在 `apps/api/` 下运行**——`@nestjs/*` 要从 `apps/api/node_modules` 解析）。
+**输出**：同目录 `t1-probe-*.txt`（三个探针 + 一个事件序列探针）。
+
+### 6.1 multipart 接入的真实形态（`t1-probe-multipart.txt` / `t1-probe-memory.txt`）
+
+| 问题 | 实测 |
+|---|---|
+| `FileInterceptor('file')` 默认（multer `memoryStorage`）| handler 拿到的 `file.buffer.length` **等于整份文件**（16 MiB 上传 ⇒ 16,777,216）；`arrayBuffers` 峰值增量是 body 的 **1.49–2.00 倍**。1 GB 上传在这条路径上不可能 |
+| 自定义 storage engine | `_handleFile(req, file, cb)` 拿到 busboy 的 part 流 `file.stream`；engine 在客户端**发出后 44ms** 就收到第一块（此时客户端仍在发送），落盘字节数 = 文件字节数 |
+| 未完成字节数（已发出 − 已落盘）峰值 | 1 MiB / 4 MiB / 16 MiB 三种输入分别为 129,940 / 0 / 0 字节 —— **不随输入增长**（`arrayBuffers` 读数受 GC 时机影响，同一探针里给出 1.000 / 0.937 / 0.016 三档，**不可用作判据**；验收口径必须是未完成字节数） |
+| 有没有临时文件 | 全程只有目标对象一个文件（探针直接在 engine 的 `_handleFile` 里落盘，没有中间文件） |
+
+**结论**：`memoryStorage` 会整份缓冲 ⇒ **不能**用它做 1 GB 上传；自定义 storage engine 是可用且正确的形态，**不需要自己解析 multipart**。
+
+### 6.2 硬性大小上限（`t1-probe-cap.txt` / `t1-probe-cap-sequence.txt`）
+
+| 问题 | 实测 |
+|---|---|
+| 触发的是哪种错误 | `MulterError: LIMIT_FILE_SIZE`（`limits.fileSize`） |
+| 能不能映射成 413 | **能**：Nest `FileInterceptor` 的 `transformException` 把它翻成 `PayloadTooLargeException`，实测响应 `{"statusCode":413,...}`；**handler 不被调用** |
+| 超限时引擎收到多少字节 | 恰好 `limit + 1` 字节（multer 给 busboy 传的是 `fileSize + 1`），且引擎回调**报告成功** —— 盘上是一份**被截断的对象** |
+| 谁负责清理 | multer **会**调 `_removeFile`（带上引擎返回的键）；探针里把 `_removeFile` 写成空操作 ⇒ **残留**（`residue=["obj-0.bin"]`）。引擎自己报错时 multer **不再**调 `_removeFile`（事件序列探针实测），清理责任回到写入端 |
+| 报错前是否读完请求体 | **是**。413 到达客户端时，客户端已确认写出**全部** 524,422 字节（`done(err)` 里先 `drainStream(req)` + `req.resume()` 再 `next(err)`，为避免 EPIPE） |
+| 只留存储层上限（去掉 `limits.fileSize`） | 客户端拿到的是 **500**，不是 413：存储层中止会 destroy 上游 part 流，`process.nextTick` 上的流错误先于 promise 链到达 multer，`errorOccured` 已被置位，后续的 `HttpException` 被忽略 ⇒ **「把 ArtifactTooLargeError 翻成 413」是一段不可达代码**（Task 1 写了又删，变异探针 IMP2a/IMP2b 为证） |
+
+### 6.3 busboy 自解析（**未取得可复现测量**，据实记载）
+
+`busboy@1.6.0` 的 API 与 §6.1 相符（`Busboy({ headers, limits })`、`'file'`/`'limit'` 事件），
+自解析**机制上**可以避免 6.2 的 drain（自己决定何时响应、何时停止读入）。
+探针 `t1-probe-busboy-vs-multer.mjs` 的 multer 对照组复现了 drain（524,422 / 524,422），
+但 busboy 组在服务器提前结束连接时**反复卡住**（客户端 `ECONNRESET` / 响应未达，探针超时），
+**没有拿到可复现的数字**。因此本计划**不**以「自解析能省带宽」为依据；要采用它必须先补一个能稳定跑完的探针。
+
+### 6.4 由预检得出的、必须写进实现的约束（Task 1 已落地）
+
+1. 上传走**自定义 storage engine** + `putStream`（边收边写），**绝不** `memoryStorage`、**绝不**临时文件（C21 结构性成立）。
+2. HTTP 层 `limits.fileSize` 与存储层 `maxBytes` 取**同一个**配置值；413 只能由 HTTP 层产生。
+3. 超限/中止**两条清理路径都要实现**（写入端自己删 + `_removeFile` 按键删），「无残留」不得依赖任何一条单独成立。
+4. `limits.fileSize` 的**代价是带宽**：超限上传仍会被完整读入（6.2 第 5 行）。真正的第一层限制在 Nginx（§3.1），应用层这道只保证「不落库、不残留」。
+5. **P0 骨架的一个缺口（Task 1 暴露并修复）**：`packages/shared` 当时只导出 `./src/index.ts`，Node 22 的类型剥离会加载它、却解析不了其中的 `./ids.js` ⇒ 任何**构建产物**里的 `import '@vca/shared'` 都让进程崩在 `ERR_MODULE_NOT_FOUND`（实测：`tests/unit/bootstrap.test.ts` 的子进程用例）。修法：shared 补 `build`，exports 改成 `types/node/default` 三档（与 `apps/api` 同款），`apps/api` 的 build 先构建 shared。**P1 后续任务凡在运行期用到 shared 的值，都依赖这一步。**

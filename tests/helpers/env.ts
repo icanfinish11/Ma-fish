@@ -16,14 +16,20 @@
  * **应用侧只有这一处**：不要再往 `vitest.config.ts` 内联字面量、也不要各测试文件自行 set：
  * 那样会散成多份互相看不出关系的副本，遗漏时排查成本极高。
  *
- * **但「Task 3–9 新增必填变量只改这一处」是不准确的**，据实记载：另有两处**手写的完整
- * 合法环境**，它们刻意不 import 本文件（一处要构造非法变体、一处要显式覆写 `NODE_ENV`）：
+ * **但「新增必填变量只改这一处」是不准确的**，据实记载：另有**四处**手写的完整
+ * 合法环境（它们刻意不 import 本文件：有的要构造非法变体、有的只取 schema 做局部断言），
+ * 外加一份「必填清单」。**P1 Task 1 逐个核对过**（此前文件里写的是「另有两处」，不准）：
  *
- * - `tests/unit/config/env.schema.test.ts` 的 `VALID`
- * - `tests/unit/config/placeholder-boundary.test.ts` 的 `VALID`
+ * 1. `tests/unit/config/env.schema.test.ts` 的 `VALID`（要构造缺字段/非法值的变体）
+ * 2. `tests/unit/config/placeholder-boundary.test.ts` 的 `VALID`（显式 `production`）
+ * 3. `tests/unit/config/placeholder-rejection.test.ts` 的 `ENV_EXAMPLE_PLACEHOLDERS`
+ *    （逐字取自 `.env.example`，含 `production` 与占位密钥）
+ * 4. `tests/security/trust-proxy.test.ts` 里 `envSchema.parse({...})` 的内联对象
+ *    （只验 `TRUST_PROXY` 的默认值与单一来源）
+ * 5. `tests/unit/config/bootstrap-guard.test.ts` 的 `REQUIRED_KEYS`
+ *    （缺任意一个都必须让引导期拒绝启动，因此**新必填变量必须加进那份清单**）
  *
- * 新增必填变量时**这三处都要改**；漏改的表现是那两个文件里的断言变红（快速失败，
- * 不会静默放行）。
+ * 新增必填变量时这五处都要改；漏改的表现是那些文件里的断言变红（快速失败，不会静默放行）。
  *
  * ## 为什么这不削弱 fail-fast（C10）
  *
@@ -69,6 +75,13 @@
  * 读取，从不进入应用进程，登记了反而会让「运行期拿到了属主连接串」这种事看起来合法
  * ——那正是 C7 要防的。
  */
+// 命名空间导入而不是 `import { join } from 'node:path'`：本文件会被 Vite **内联进
+// `vitest.config.ts` 的打包产物**，而那份配置自己也有一个 `path` 绑定——实测两者同名时
+// 打包产物里会留下一个未绑定的 `path`，启动直接报 `ReferenceError: path is not defined`
+// （配置连加载都失败，全部 project 都跑不起来）。用一个不会撞名的绑定即可。
+import { tmpdir } from 'node:os';
+import * as nodePath from 'node:path';
+
 // `as const` 只给**编译期**只读类型，运行期照样可写；`Object.freeze` 才把它真正钉死，
 // 免得某个测试顺手改写这份「唯一登记处」而污染同进程的其他用例（vitest 的 `env` 是共享的）。
 export const testEnv = Object.freeze({
@@ -84,4 +97,13 @@ export const testEnv = Object.freeze({
   GITHUB_CALLBACK_URL: 'http://localhost:3000/auth/github/callback',
   MAIL_FROM: 'no-reply@example.com',
   SMTP_URL: 'smtp://127.0.0.1:1025',
+  // ── P1 / Task 1 起 ────────────────────────────────────────────────────────────
+  // 制品卷放在系统临时目录下：测试进程对仓库目录没有写权限的机器上也能跑，
+  // 且 `pnpm test` 不会在仓库里留下制品（`storage/` 虽已 gitignore，但测试不该依赖它）。
+  //
+  // 上限取 **4 MiB** 而不是生产默认的 1 GiB：任务 1 的验收里有一条「超限上传中止后无残留」，
+  // 它必须**真的**触发 `limits.fileSize`，而用 1 GiB 触发意味着每个用例都要传 >1 GiB。
+  // 这是刻意的测试期取值，不是把生产上限改小（生产的 `.env.example` 是 1 GiB）。
+  ARTIFACT_STORE_DIR: nodePath.join(tmpdir(), 'vca-test-artifacts'),
+  ARTIFACT_MAX_UPLOAD_BYTES: '4194304',
 } as const satisfies Partial<NodeJS.ProcessEnv>);

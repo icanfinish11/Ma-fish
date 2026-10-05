@@ -85,6 +85,9 @@ describe('引导期 fail-fast 接线（app.module → ConfigModule → validate�
     'GITHUB_CALLBACK_URL',
     'SMTP_URL',
     'MAIL_FROM',
+    // P1 / Task 1：制品卷与上传上限都是必填（无默认值），缺一个也不许启动。
+    'ARTIFACT_STORE_DIR',
+    'ARTIFACT_MAX_UPLOAD_BYTES',
   ] as const;
 
   it('必填密钥全部缺失时，求值 app.module 会拒绝启动', async () => {

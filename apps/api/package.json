@@ -16,7 +16,7 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "pnpm --filter @vca/shared build && tsc -p tsconfig.json",
     "pretypecheck": "pnpm db:generate",
     "typecheck": "tsc --noEmit",
     "start": "node dist/main.js",

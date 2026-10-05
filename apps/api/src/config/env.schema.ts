@@ -106,6 +106,26 @@ export const envSchema = z.object({
 
   SMTP_URL: z.string().min(1),
   MAIL_FROM: z.string().email(),
+
+  /**
+   * 制品本地存储卷的根目录（P1 / Task 1）。
+   *
+   * **必填、无默认值**：一个「没配就用某个相对路径」的默认值会把制品写进进程的当前工作目录
+   * （开发机上是 `apps/api/`，容器里可能是 `/`），而那正是备份、磁盘配额与权限三件事
+   * 全都失控的形态。目录**不要求预先存在**（存储实现按需 `mkdir -p`），这样引导期不碰文件系统。
+   */
+  ARTIFACT_STORE_DIR: z.string().min(1),
+
+  /**
+   * 单次上传的**硬上限**（字节），同时是 HTTP 层（multipart 解析）与存储层
+   * （`ArtifactStore.putStream`）的同一个上限值。
+   *
+   * **必填、无默认值**：它是安全参数（威胁 #2 的资源滥用面），一个「悄悄生效」的默认上限
+   * 等于一次没人做过的部署决定。设计文档 §威胁 #2 的累计未压缩上限是 1 GiB，
+   * 上传上限必须 ≥ 它（压缩包本身小于解压后总量），但具体取值属于部署决定，
+   * 因此这里只校验形状（正整数字节数），不替运维选数。
+   */
+  ARTIFACT_MAX_UPLOAD_BYTES: z.coerce.number().int().positive(),
 });
 
 export type Env = z.infer<typeof envSchema>;

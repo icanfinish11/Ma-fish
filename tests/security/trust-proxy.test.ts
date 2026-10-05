@@ -38,6 +38,9 @@ describe('trust proxy 的取值解析（I-6：IP 维度限流的信任边界）'
       GITHUB_CALLBACK_URL: 'http://localhost:3000/auth/github/callback',
       MAIL_FROM: 'no-reply@example.com',
       SMTP_URL: 'smtp://127.0.0.1:1025',
+      // P1 / Task 1 新增（见 tests/helpers/env.ts 的 K9 清单）
+      ARTIFACT_STORE_DIR: 'C:\\Temp\\vca-artifacts-fixture',
+      ARTIFACT_MAX_UPLOAD_BYTES: '4194304',
     });
     expect(parsed.TRUST_PROXY).toBe(DEFAULT_TRUST_PROXY);
     expect(parseTrustProxy(parsed.TRUST_PROXY)).toEqual(parseTrustProxy(undefined));

@@ -34,6 +34,10 @@ const ENV_EXAMPLE_PLACEHOLDERS = {
   GITHUB_CALLBACK_URL: 'http://localhost:3000/auth/github/callback',
   MAIL_FROM: 'no-reply@example.com',
   SMTP_URL: 'smtp://127.0.0.1:1025',
+  // P1 / Task 1 新增（见 tests/helpers/env.ts 的 K9 清单）。
+  // 这两个字段**不是**密钥，因此刻意也**不**受占位层约束——它们在这里只为凑出「完整 env」。
+  ARTIFACT_STORE_DIR: 'C:\\Temp\\vca-artifacts-fixture',
+  ARTIFACT_MAX_UPLOAD_BYTES: '4194304',
 };
 
 describe('占位值拒绝规则（C10 / 威胁 #15）', () => {
