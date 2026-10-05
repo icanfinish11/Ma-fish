@@ -40,22 +40,25 @@ import {
  * 1. **物理排布**：`[头][块数据][索引][尾部]`，尾部恒为最后 24 字节（R3）。
  *    头里**只有**流结束前已知的字段；两个总量字段在尾部。
  * 2. **头布局**：`magic(4) | formatVersion(2) | keyIdLen(1) | keyId(N) | fileId(16) |
- *    chunkSize(4) | noncePrefix(4)`，定长部分 **31** 字节。
+ *    chunkSize(4) | noncePrefix(8)`，定长部分 **35** 字节（I3 把 noncePrefix 由 4 加宽到 8）。
  * 3. **索引记录**：`offset(8) | ciphertextLength(4) | 自称序号(8) | 保留(4)`，
  *    每块 24 字节；自称序号**只用于比对**（R2）。
- * 4. **nonce 推导**：`noncePrefix(4) || 块序号(8, 大端)`。序号写的是 **64 位**——
- *    只写低 32 位在 position < 2^32 时完全看不出来（那是 8 TiB 以内的每一个真实文件），
- *    所以此处专门用 2^32+1 这种序号把宽度钉死。
+ * 4. **nonce 推导**：`noncePrefix(8) || 块序号(4, 大端)`。序号只写 **4 字节**——
+ *    因此 `position ≥ 2^32` 必须**响亮拒绝**，绝不能静默截断成低 32 位
+ *    （那会让两个不同的块拿到同一个 nonce）。上限 2^32 是 D6 合法制品块数（128）的 2^24 倍以上。
  * 5. **AAD 推导**：`` `${fileId 十六进制}:${position}:${isLast ? 'last' : 'more'}` ``（UTF-8）。
  *    末块标记是 Task 3 截断检测的依据，因此 `more`/`last` 两个值都要逐字断言。
  *
- * ## 定长头的两次搬家（据实记载，别按旧稿读）
+ * ## 定长头的三次搬家（据实记载，别按旧稿读）
  *
  * 初稿 brief 写「定长 **48** + keyId」，而它同段列出的字段宽度之和是 **47**
  * （`4+2+1+16+4+8+8+4`）⇒ 48 是笔误，实现按 47 走（这是 R1）。
  * 修复轮 1 的 R3 又把 `plaintextLength` / `chunkCount` 移入尾部，
- * 于是头里只剩 `4+2+1+16+4+4 = 31`。**本文件是 31 的看守者**：
- * `HEADER_FIXED_BYTES`、`headerByteLength(2) === 33`、以及那条黄金十六进制串。
+ * 于是头里只剩 `4+2+1+16+4+4 = 31`。
+ * 最终全分支审查的 **I3** 把 `noncePrefix` 从 4 字节加宽到 8 字节（跨文件生日界），
+ * 于是定长部分是 `4+2+1+16+4+8 = 35`，`formatVersion` 同时 1 → 2。
+ * **本文件是 35 的看守者**：`HEADER_FIXED_BYTES`、`headerByteLength(2) === 37`、
+ * 以及那条黄金十六进制串。
  */
 describe('制品头编解码（字节级契约）', () => {
   /** 用于黄金用例的头：每个字段的宽度都取一个「一眼能看出错位」的值。 */
@@ -64,24 +67,24 @@ describe('制品头编解码（字节级契约）', () => {
     keyId: 'v1',
     fileId: Buffer.from('000102030405060708090a0b0c0d0e0f', 'hex'),
     chunkSize: CHUNK_SIZE,
-    noncePrefix: Buffer.from('deadbeef', 'hex'),
+    noncePrefix: Buffer.from('deadbeefcafebabe', 'hex'),
   };
 
-  it('编码结果逐字节等于手算的期望值（含定长 31 + keyId）', () => {
+  it('编码结果逐字节等于手算的期望值（含定长 35 + keyId）', () => {
     const encoded = encodeHeader(sample);
 
     expect(encoded.toString('hex')).toBe(
-      // magic          版本    idLen keyId  fileId(16)                        chunkSize(0x00800000)  noncePrefix
-      '564341310001' + '02' + '7631' + '000102030405060708090a0b0c0d0e0f' + '00800000' + 'deadbeef',
+      // magic          版本    idLen keyId  fileId(16)                        chunkSize(0x00800000)  noncePrefix(8)
+      '564341310002' + '02' + '7631' + '000102030405060708090a0b0c0d0e0f' + '00800000' + 'deadbeefcafebabe',
     );
-    expect(encoded).toHaveLength(33);
+    expect(encoded).toHaveLength(37);
     expect(encoded).toHaveLength(headerByteLength(2));
   });
 
-  it('定长部分是 31 字节：4+2+1+16+4+4（总量字段已在尾部，见 R3）', () => {
-    expect(HEADER_FIXED_BYTES).toBe(31);
-    expect(headerByteLength(0)).toBe(31);
-    expect(headerByteLength(255)).toBe(286);
+  it('定长部分是 35 字节：4+2+1+16+4+8（总量字段已在尾部、noncePrefix 已按 I3 加宽）', () => {
+    expect(HEADER_FIXED_BYTES).toBe(35);
+    expect(headerByteLength(0)).toBe(35);
+    expect(headerByteLength(255)).toBe(290);
   });
 
   it('块数据区紧随头：起点只依赖 keyId 长度', () => {
@@ -140,25 +143,25 @@ describe('制品头编解码（字节级契约）', () => {
      * 没校验**整颗头**装得下，于是漏到 `readUInt32BE` 抛出一句
      * `The value of "offset" is out of range … Received 73`）。
      *
-     * 几何（R3 之后定长头变短，区间随之改变）：keyId 从第 7 字节开始、定长部分 31 字节
-     * ⇒ offset 7 之后至少有 24 字节，因此 keyIdLen ≤ 24 时任何「长度 ≥ 31」的缓冲都容得下 keyId。
-     * 要进那条分支必须 keyIdLen > 24 且 `31 + keyIdLen > buf.length`。
+     * 几何（R3 之后定长头变短、I3 之后又加宽到 35）：keyId 从第 7 字节开始、定长部分 35 字节
+     * ⇒ offset 7 之后至少有 28 字节，因此 keyIdLen ≤ 28 时任何「长度 ≥ 35」的缓冲都容得下 keyId。
+     * 要进那条分支必须 keyIdLen > 28 且 `35 + keyIdLen > buf.length`。
      */
     const longKeyId = encodeHeader({ ...sample, keyId: 'v'.repeat(50) });
     expect(longKeyId).toHaveLength(HEADER_FIXED_BYTES + 50);
-    expect(longKeyId).toHaveLength(81);
+    expect(longKeyId).toHaveLength(85);
     expect(() => decodeHeader(longKeyId.subarray(0, 40))).toThrow(/keyId/);
 
     /**
      * 上面那条还不够：`subarray(0, 40)` 在**两种判据**下都会抛。
      * 判据是「keyId 装得下」还是「**整颗头**装得下」，只有缓冲长度落在
-     * `[7 + keyIdLen, 31 + keyIdLen)` 时才区分得出来——此时 keyId 完整、而定长字段已越界。
-     * keyIdLen = 50 ⇒ 取 60 字节（57 ≤ 60 < 81）：错误实现会让 `readUInt32BE` 抛出一句
+     * `[7 + keyIdLen, 35 + keyIdLen)` 时才区分得出来——此时 keyId 完整、而定长字段已越界。
+     * keyIdLen = 50 ⇒ 取 62 字节（57 ≤ 62 < 85）：错误实现会让 `readUInt32BE` 抛出一句
      * `The value of "offset" is out of range`，那句话里没有 `keyId`，用例因此变红。
      * **变异实测（MP24）**：删掉这一条，把判据换回「只看 keyId」，用例会全绿
      * ——即那条回归当时无人看守（`evidence/t2-mutation-mp24-header-completeness-narrow-red.txt`）。
      */
-    expect(() => decodeHeader(longKeyId.subarray(0, 60))).toThrow(/keyId/);
+    expect(() => decodeHeader(longKeyId.subarray(0, 62))).toThrow(/keyId/);
   });
 
   it('拒绝自相矛盾的字段：keyIdLen=0、chunkSize=0、fileId / noncePrefix 长度不对', () => {
@@ -173,7 +176,9 @@ describe('制品头编解码（字节级契约）', () => {
 
     expect(() => encodeHeader({ ...sample, fileId: Buffer.alloc(15) })).toThrow(/fileId/);
     expect(() => encodeHeader({ ...sample, fileId: Buffer.alloc(17) })).toThrow(/fileId/);
-    expect(() => encodeHeader({ ...sample, noncePrefix: Buffer.alloc(3) })).toThrow(/noncePrefix/);
+    // noncePrefix 是 8 字节（I3）：两侧各差一个字节都要响亮（写短了会让 nonce 复用前缀）
+    expect(() => encodeHeader({ ...sample, noncePrefix: Buffer.alloc(NONCE_PREFIX_BYTES - 1) })).toThrow(/noncePrefix/);
+    expect(() => encodeHeader({ ...sample, noncePrefix: Buffer.alloc(NONCE_PREFIX_BYTES + 1) })).toThrow(/noncePrefix/);
 
     // keyId 的字节不是合法 UTF-8：解出来的字符串 re-encode 长度对不上 ⇒ 必须拒绝。
     // （放行它等于承认一个「不可能对应任何真实密钥」的 keyId 是合法的。）
@@ -195,9 +200,11 @@ describe('制品头编解码（字节级契约）', () => {
   it('包级常量就是设计文档的数值（单一来源）', () => {
     expect(CHUNK_SIZE).toBe(8 * 1024 * 1024);
     expect(ARTIFACT_MAGIC).toBe('VCA1');
-    expect(FORMAT_VERSION).toBe(1);
+    // I3：nonce 拆分改成 8 随机 + BE32 计数器 ⇒ 版本递增（旧制品得到「不支持的版本」而不是
+    // 被按新拆分解密后报「密文被篡改」）。
+    expect(FORMAT_VERSION).toBe(2);
     expect(TAG_BYTES).toBe(16);
-    expect(NONCE_PREFIX_BYTES).toBe(4);
+    expect(NONCE_PREFIX_BYTES).toBe(8);
     expect(NONCE_BYTES).toBe(12);
     expect(INDEX_ENTRY_SIZE).toBe(24);
     expect(FOOTER_BYTES).toBe(24);
@@ -352,43 +359,48 @@ describe('块索引编解码（每块定长 24 字节）', () => {
   });
 });
 
-describe('nonce 推导：noncePrefix(4) || 块序号(8, 大端)', () => {
-  const prefix = Buffer.from('deadbeef', 'hex');
+describe('nonce 推导：noncePrefix(8) || 块序号(4, 大端)', () => {
+  const prefix = Buffer.from('deadbeefcafebabe', 'hex');
 
-  it('前 4 字节等于前缀，后 8 字节是大端序号', () => {
-    expect(deriveNonce(prefix, 0).toString('hex')).toBe('deadbeef0000000000000000');
-    expect(deriveNonce(prefix, 1).toString('hex')).toBe('deadbeef0000000000000001');
-    expect(deriveNonce(prefix, 0x0102030405).toString('hex')).toBe('deadbeef0000000102030405');
+  it('前 8 字节等于前缀，后 4 字节是大端序号', () => {
+    expect(deriveNonce(prefix, 0).toString('hex')).toBe('deadbeefcafebabe00000000');
+    expect(deriveNonce(prefix, 1).toString('hex')).toBe('deadbeefcafebabe00000001');
+    expect(deriveNonce(prefix, 0x01020304).toString('hex')).toBe('deadbeefcafebabe01020304');
   });
 
-  it('序号写满 64 位：第 33 位（2^32）不是「看不见的高位」', () => {
-    // 只写低 32 位的实现在 position < 2^32 上完全正确（= 8 TiB 以内的每个真实文件），
-    // 因此必须用超过 2^32 的序号才能把宽度钉死。
-    expect(deriveNonce(prefix, 0x1_0000_0001).toString('hex')).toBe('deadbeef0000000100000001');
-    expect(deriveNonce(prefix, Number.MAX_SAFE_INTEGER).toString('hex')).toBe('deadbeef001fffffffffffff');
+  it('计数器只有 4 字节：position ≥ 2^32 必须**响亮拒绝**，绝不静默截断成低 32 位', () => {
+    // 静默截断的失效形态：position 2^32 与 position 0 会拿到**同一个** nonce
+    // ——GCM 下 nonce 重用不只泄露明文异或，还会暴露认证子密钥。
+    // 因此上限（2^32-1）本身就是判据：它是 D6 合法制品块数上限（128）的 2^24 倍以上。
+    expect(deriveNonce(prefix, 0xffff_ffff).toString('hex')).toBe('deadbeefcafebabeffffffff');
+    expect(() => deriveNonce(prefix, 0x1_0000_0000)).toThrow(/position/);
+    // 同一原因：AAD 里的位置与 nonce 里的计数器同宽，两处不能一个接受一个拒绝。
+    expect(() => buildAad(Buffer.alloc(16), 0x1_0000_0000, false)).toThrow(/position/);
   });
 
   it('总是 12 字节；同文件不同 position 互不相同', () => {
-    const nonces = [0, 1, 2, 255, 256, 0xffff, 0x1_0000_0000].map((p) => deriveNonce(prefix, p));
+    const nonces = [0, 1, 2, 255, 256, 0xffff, 0xffff_ffff].map((p) => deriveNonce(prefix, p));
 
     expect(nonces.every((n) => n.length === NONCE_BYTES)).toBe(true);
     expect(new Set(nonces.map((n) => n.toString('hex'))).size).toBe(nonces.length);
   });
 
   it('跨文件（不同随机前缀）在相同 position 上不碰撞', () => {
-    const other = Buffer.from('cafebabe', 'hex');
+    const other = Buffer.from('cafebabe01234567', 'hex');
 
     expect(deriveNonce(prefix, 0).equals(deriveNonce(other, 0))).toBe(false);
     // 前缀是唯一的区分手段：序号部分必然相同，碰撞只可能来自前缀相同
-    expect(deriveNonce(prefix, 0).subarray(4)).toEqual(deriveNonce(other, 0).subarray(4));
+    expect(deriveNonce(prefix, 0).subarray(8)).toEqual(deriveNonce(other, 0).subarray(8));
+    // 8 字节前缀（I3）：跨文件生日界因此从 2^32 推到 2^64 的量级
+    expect(prefix).toHaveLength(NONCE_PREFIX_BYTES);
   });
 
   it('拒绝非法的 position 与前缀长度', () => {
     expect(() => deriveNonce(prefix, -1)).toThrow(/position/);
     expect(() => deriveNonce(prefix, 1.5)).toThrow(/position/);
     expect(() => deriveNonce(prefix, Number.MAX_SAFE_INTEGER + 1)).toThrow(/position/);
-    expect(() => deriveNonce(Buffer.alloc(5), 0)).toThrow(/noncePrefix/);
-    expect(() => deriveNonce(Buffer.alloc(3), 0)).toThrow(/noncePrefix/);
+    expect(() => deriveNonce(Buffer.alloc(NONCE_PREFIX_BYTES - 1), 0)).toThrow(/noncePrefix/);
+    expect(() => deriveNonce(Buffer.alloc(NONCE_PREFIX_BYTES + 1), 0)).toThrow(/noncePrefix/);
   });
 });
 

@@ -4,11 +4,11 @@
  * 纯函数、无 I/O、无随机数：本文件只描述「字节长什么样」。
  * Task 3 的读取器按这里的布局解析，因此**任何一处改动都是跨模块改动**。
  *
- * ## 布局（逐字取自计划 Task 2 的契约段 + 控制器裁定 R3）
+ * ## 布局（逐字取自计划 Task 2 的契约段 + 控制器裁定 R3 + 最终审查的 I3）
  *
  * ```
- * [ 文件头 31+N ]  magic(4)="VCA1" | formatVersion(2)=1 | keyIdLen(1) | keyId(N) |
- *                  fileId(16) | chunkSize(4) | noncePrefix(4)
+ * [ 文件头 35+N ]  magic(4)="VCA1" | formatVersion(2)=2 | keyIdLen(1) | keyId(N) |
+ *                  fileId(16) | chunkSize(4) | noncePrefix(8)
  * [ 块数据 ... ]   逐块 ciphertext || tag(16)，顺序追加
  * [ 块索引 ... ]   每块定长 24 字节：
  *                  offset(8, **文件绝对偏移**) | ciphertextLength(4, **不含 tag**) |
@@ -49,12 +49,36 @@
  * 5. **尾部恒为文件最后 24 字节**（{@link FOOTER_BYTES}）。`indexOffset` 指向索引起点，
  *    索引长度 = `chunkCount * INDEX_ENTRY_SIZE`；读取器的第一步是读最后 24 字节。
  *
- * ### 与初稿 brief 的一处算术不一致：定长头是 31，不是 47、更不是 48
+ * ### 与初稿 brief 的一处算术不一致：定长头是 35，不是 47、更不是 48
  *
  * 初稿的字段清单（`4+2+1+16+4+8+8+4`）相加是 **47**，初稿文字却写「定长 48」⇒ 48 是笔误。
  * R3 把 `plaintextLength` / `chunkCount` 移入尾部后，头里只剩流结束前已知的字段：
- * `4+2+1+16+4+4 = 31`，即 {@link HEADER_FIXED_BYTES}。**若将来要让定长头变宽，
- * 那是一次格式版本变更（`formatVersion` 递增），不是把某个字段悄悄加宽。**
+ * `4+2+1+16+4+4 = 31`。
+ * **I3（最终全分支审查）把 `noncePrefix` 由 4 字节加宽到 8 字节**（理由见下），
+ * 于是定长头是 `4+2+1+16+4+8 = 35`，即 {@link HEADER_FIXED_BYTES}。
+ * **若将来要让定长头再变宽，那是一次格式版本变更（`formatVersion` 递增），
+ * 不是把某个字段悄悄加宽。**
+ *
+ * ### 为什么 nonce 是 `8 随机 ‖ BE32(序号)`（I3：规格级裁定，已回填规格 D4）
+ *
+ * 上一版是 `noncePrefix(4) ‖ BE64(块序号)`。**文件内**唯一成立，但**跨文件在同一把密钥下
+ * 生日界生效**：4 字节前缀 ⇒ 约 9.3k 份制品就有约 1% 的概率出现**至少一次前缀碰撞**，
+ * 约 65k 份 ⇒ 约 39%。而 GCM 下 nonce 重用不只是「两份明文异或」——**它还会暴露认证子密钥，
+ * 也就是在那把密钥下的可伪造性**。P1 里没有任何东西强制或触发密钥轮换，因此那条界就是
+ * 当时的保密性上限。
+ *
+ * 把拆分改成 `8 随机字节 ‖ BE32(块序号)`（**总长仍是 12**）之后：
+ *
+ * - 前缀空间 2^64 ⇒ 生日界推到不可达的量级（按 9.3k 份制品算，碰撞概率 ≈ 2^-33 量级）；
+ * - 4 字节计数器（上限 2^32-1）仍是 D6 合法制品块数上限（`1 GiB / 8 MiB = 128`）的 2^24 倍以上
+ *   ⇒ 这个收窄**不改变任何合法制品的表达能力**，只把「静默截断」这条路堵死
+ *   （见 {@link deriveNonce} 对 `position ≥ 2^32` 的拒绝：截断会让两个块拿到同一个 nonce）。
+ *
+ * **`formatVersion` 因此从 1 递增到 2**（{@link FORMAT_VERSION}）：nonce 的拆分方式是格式契约的
+ * 一部分（它不写在制品字节里，只能由版本推出来）。不递增的话，一份 v1 制品会被按新拆分
+ * 解密 ⇒ 认证失败，而报出来的是「密文被篡改」——一个**指错了原因**的错。
+ * 代价：定长头 31 → 35（`noncePrefix` 是唯一变宽的字段），一份 v1 制品现在会得到
+ * 「不支持的 formatVersion」这句正确的拒绝。
  *
  * ### 为什么索引里的「自称序号」不叫 `nonceSuffix`
  *
@@ -69,16 +93,35 @@ export const CHUNK_SIZE = 8 * 1024 * 1024;
 /** 文件头 magic：4 字节 ASCII，用来在解析前拒掉「这根本不是我们的制品」。 */
 export const ARTIFACT_MAGIC = 'VCA1';
 
-/** 格式版本。读取器遇到不认识的版本必须拒绝，而不是尽力解析。 */
-export const FORMAT_VERSION = 1;
+/**
+ * 格式版本。读取器遇到不认识的版本必须拒绝，而不是尽力解析。
+ *
+ * **I3 把它从 1 递增到 2**：nonce 的拆分由 `noncePrefix(4) ‖ BE64` 改成
+ * `noncePrefix(8) ‖ BE32`，而拆分方式不写在制品字节里、只能由版本推出来。
+ * 不递增的话，旧制品会被按新拆分解密 ⇒ 报「密文被篡改」（指错了原因）。
+ */
+export const FORMAT_VERSION = 2;
 
 /** 每块密文尾部的 GCM tag 长度。 */
 export const TAG_BYTES = 16;
 
-/** noncePrefix：每文件随机的 4 字节（跨文件 nonce 唯一性靠它）。 */
-export const NONCE_PREFIX_BYTES = 4;
+/**
+ * noncePrefix：每文件随机的 **8** 字节。
+ *
+ * 跨文件的 nonce 唯一性**只**靠它（同一次加密里同一 position 只会出现一次）。
+ * I3 之前是 4 字节 ⇒ 2^32 的前缀空间在「同一把密钥下的制品总数」上生日界生效。
+ */
+export const NONCE_PREFIX_BYTES = 8;
 
-/** AES-256-GCM 的 nonce 长度：4 字节前缀 + 8 字节块序号。 */
+/**
+ * 块序号那一段的宽度：**4** 字节大端（`noncePrefix` 之后的第 8..11 字节）。
+ *
+ * 上限 2^32-1 是 D6 合法制品块数上限（128）的 2^24 倍以上，因此这个宽度**不是**容量取舍，
+ * 而是「不许静默截断」的判据：`position` 超过它必须抛错（见 {@link deriveNonce}）。
+ */
+export const NONCE_COUNTER_BYTES = 4;
+
+/** AES-256-GCM 的 nonce 长度：8 字节前缀 + 4 字节块序号（I3 之后仍是 12）。 */
 export const NONCE_BYTES = 12;
 
 /** fileId：每文件随机 16 字节，AAD 里以十六进制表示。 */
@@ -127,12 +170,12 @@ export const KEY_ID_MAX_BYTES = 255;
 
 /**
  * 文件头**定长部分**的字节数：magic(4) + formatVersion(2) + keyIdLen(1) +
- * fileId(16) + chunkSize(4) + noncePrefix(4) = **31**。
+ * fileId(16) + chunkSize(4) + noncePrefix(8) = **35**。
  *
  * 导出成常量而不是散落的字面量：它是「块数据从第几个字节开始」的唯一来源
- * （见 {@link blockDataOffset}）。
+ * （见 {@link blockDataOffset}）。31 → 35 的唯一来源是 I3（`noncePrefix` 4 → 8）。
  */
-export const HEADER_FIXED_BYTES = 31;
+export const HEADER_FIXED_BYTES = 35;
 
 /** 尾部定长：`indexOffset(8) | chunkCount(8) | plaintextLength(8)` = **24**。 */
 export const FOOTER_BYTES = 24;
@@ -319,21 +362,22 @@ export function decodeFooter(buf: Buffer): ArtifactFooter {
 }
 
 /**
- * 推导某一块的 nonce：`noncePrefix(4) || 块序号(8, 大端)`（规格 D4）。
+ * 推导某一块的 nonce：`noncePrefix(8) || 块序号(4, 大端)`（规格 D4；I3 裁定）。
  *
  * **序号必须来自读取位置**，绝不能来自记录里自称的序号（C20 / R2）。跨文件唯一性靠
- * 每文件随机的 4 字节前缀——「固定前缀 + 从 0 开始的计数器」在 GCM 下会因 nonce 重用
- * 泄露明文异或，是明确禁止的方案。
+ * 每文件随机的 **8** 字节前缀——「固定前缀 + 从 0 开始的计数器」在 GCM 下会因 nonce 重用
+ * 泄露明文异或（**并暴露认证子密钥**），是明确禁止的方案；而 4 字节前缀的生日界
+ * 在同一把密钥下的制品数量上会变得现实（I3）。
  *
- * 序号写满 64 位：只写低 32 位在 8 TiB 以内的每个真实文件上都**看不出区别**，
- * 因此这里不做「够用就行」的宽窄取舍。
+ * 序号只写 **4 字节**：`position ≥ 2^32` 因此**抛错**而不是截断。截断的失效形态是
+ * 两个不同的块拿到**同一个 nonce**——那正是上面禁止的那种事，只是更隐蔽。
  */
 export function deriveNonce(prefix: Buffer, position: number): Buffer {
   assertBufferLength(prefix, NONCE_PREFIX_BYTES, 'noncePrefix');
   assertPosition(position);
   const nonce = Buffer.alloc(NONCE_BYTES);
   prefix.copy(nonce, 0);
-  nonce.writeBigUInt64BE(BigInt(position), NONCE_PREFIX_BYTES);
+  nonce.writeUInt32BE(position, NONCE_PREFIX_BYTES);
   return nonce;
 }
 
@@ -410,10 +454,30 @@ export function decodeIndex(buf: Buffer): IndexEntry[] {
   return entries;
 }
 
-/** `position` 必须是非负安全整数：它要按 8 字节大端写进 nonce 与 AAD。 */
+/**
+ * 块序号（= nonce 的计数器那一段）的上限：与 {@link NONCE_COUNTER_BYTES} **同宽**。
+ *
+ * 两处用同一个上界是刻意的：nonce 里的计数器与 AAD 里的位置必须是**同一个数**，
+ * 一个接受、另一个拒绝只会在边界上制造「同一块有两个身份」的缝隙。
+ */
+const MAX_POSITION = 2 ** (8 * NONCE_COUNTER_BYTES) - 1;
+
+/**
+ * `position` 必须是非负安全整数，且**装得进 4 字节计数器**。
+ *
+ * 上限那条不是容量限制而是**拒绝静默截断**：`writeUInt32BE(2^32)` 自己也会抛，
+ * 但那句话是 `The value of "value" is out of range`——看不出这是制品的位置、
+ * 也看不出「截断会让两个块共用 nonce」这件事。
+ */
 function assertPosition(position: number): void {
   if (!Number.isSafeInteger(position) || position < 0) {
     throw new RangeError(`position 必须是非负安全整数：${position}`);
+  }
+  if (position > MAX_POSITION) {
+    throw new RangeError(
+      `position 超出 ${NONCE_COUNTER_BYTES} 字节计数器（上限 ${MAX_POSITION}）：${position}` +
+        '——静默截断会让两个不同的块拿到同一个 nonce（GCM 下 nonce 重用会暴露认证子密钥）',
+    );
   }
 }
 

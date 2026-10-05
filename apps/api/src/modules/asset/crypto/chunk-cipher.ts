@@ -133,7 +133,9 @@ export class ChunkEncryptor {
     // 失效形态是「新制品头里写着 v1、实际用 v2 加密」，且没有任何一层会报错。
     this.key = keyRing.keyFor(this.keyId);
     this.fileId = randomBytes(FILE_ID_BYTES);
-    // 每文件随机的 4 字节前缀：跨文件 nonce 唯一性**只**靠它（规格 D4）。
+    // 每文件随机的 **8** 字节前缀：跨文件 nonce 唯一性**只**靠它（规格 D4）。
+    // I3 之前是 4 字节——那时「同一把密钥下的制品数」上生日界生效（GCM 的 nonce 重用
+    // 还会暴露认证子密钥），理由与代价见 `artifact-format.ts` 的 NONCE_PREFIX_BYTES。
     this.noncePrefix = randomBytes(NONCE_PREFIX_BYTES);
   }
 

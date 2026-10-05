@@ -6,6 +6,7 @@ import {
   CHUNK_SIZE,
   FOOTER_BYTES,
   INDEX_ENTRY_SIZE,
+  NONCE_PREFIX_BYTES,
   TAG_BYTES,
   blockDataOffset,
   decodeFooter,
@@ -27,7 +28,7 @@ import { createKeyRing, type KeyRing } from '@vca/api/modules/asset/crypto/key-r
  * ## 物理排布是本题最容易被写反的一件事（R3）
  *
  * ```
- * [ header 31+N ][ 块数据 = transform() 的整段输出 ][ index ][ footer 24 ]
+ * [ header 35+N ][ 块数据 = transform() 的整段输出 ][ index ][ footer 24 ]
  * ```
  *
  * 初稿是 `[头][索引][数据]`。**那个排布单趟前向写不出来**（头里含流结束后才知道的总量，
@@ -50,7 +51,7 @@ import { createKeyRing, type KeyRing } from '@vca/api/modules/asset/crypto/key-r
  * ## 判据为什么是「独立解密器」而不是「往返」
  *
  * 用同一套 `deriveNonce`/`buildAad` 去解密只能证明「自己跟自己一致」。这里的解密器
- * 按**契约字面**重写 nonce 与 AAD 的拼装（`noncePrefix(4) || BE64(position)`、
+ * 按**契约字面**重写 nonce 与 AAD 的拼装（`noncePrefix(8) || BE32(position)`、
  * `` `${fileId 十六进制}:${position}:${last|more}` ``），并且**不 import** 那两个函数：
  * 写入端与判据端各自独立地实现契约，任一侧理解错了都会红。
  *
@@ -79,7 +80,7 @@ function pattern(bytes: number, seed = 0): Buffer {
 }
 
 /**
- * 测试内的独立解密器。**只接受 4 字节前缀**：前缀长度错了必须响亮，
+ * 测试内的独立解密器。**只接受 8 字节前缀**：前缀长度错了必须响亮，
  * 否则 `prefix.copy(nonce, 0)` 会静默截断/留零，把判据本身变成假的。
  */
 function decryptBlock(
@@ -90,10 +91,10 @@ function decryptBlock(
   ciphertext: Buffer,
   tag: Buffer,
 ): Buffer {
-  if (header.noncePrefix.length !== 4) throw new Error('测试判据要求 4 字节 noncePrefix');
+  if (header.noncePrefix.length !== 8) throw new Error('测试判据要求 8 字节 noncePrefix');
   const nonce = Buffer.alloc(12);
   header.noncePrefix.copy(nonce, 0);
-  nonce.writeBigUInt64BE(BigInt(position), 4);
+  nonce.writeUInt32BE(position, 8);
   const aad = Buffer.from(`${header.fileId.toString('hex')}:${position}:${isLast ? 'last' : 'more'}`, 'utf8');
 
   const decipher = createDecipheriv('aes-256-gcm', key, nonce);
@@ -460,7 +461,7 @@ describe('写入端产出的字节能被独立解密器读懂（契约级判据�
       decryptBlock(KEY_BYTES, forgedHeader, 0, false, recordAt(records, 0).ciphertext, recordAt(records, 0).tag),
     ).toThrow();
 
-    const forgedPrefix: ArtifactHeader = { ...encrypted.header, noncePrefix: randomBytes(4) };
+    const forgedPrefix: ArtifactHeader = { ...encrypted.header, noncePrefix: randomBytes(NONCE_PREFIX_BYTES) };
     expect(() =>
       decryptBlock(KEY_BYTES, forgedPrefix, 0, false, recordAt(records, 0).ciphertext, recordAt(records, 0).tag),
     ).toThrow();
@@ -530,14 +531,14 @@ describe('nonce 唯一性（同文件 + 跨文件）', () => {
     const nonceOf = (header: ArtifactHeader, position: number): string => {
       const nonce = Buffer.alloc(12);
       header.noncePrefix.copy(nonce, 0);
-      nonce.writeBigUInt64BE(BigInt(position), 4);
+      nonce.writeUInt32BE(position, 8);
       return nonce.toString('hex');
     };
 
     expect(nonceOf(first.header, 0)).not.toBe(nonceOf(second.header, 0));
-    // 前缀长度与随机性：4 字节，且两次加密不相等（碰撞概率 2^-32，据实记载）
-    expect(first.header.noncePrefix).toHaveLength(4);
-    expect(second.header.noncePrefix).toHaveLength(4);
+    // 前缀长度与随机性：8 字节（I3），且两次加密不相等（碰撞概率 2^-64，据实记载）
+    expect(first.header.noncePrefix).toHaveLength(NONCE_PREFIX_BYTES);
+    expect(second.header.noncePrefix).toHaveLength(NONCE_PREFIX_BYTES);
   });
 
   it('同一文件内各 position 的 nonce 互不相同', async () => {
@@ -546,7 +547,7 @@ describe('nonce 唯一性（同文件 + 跨文件）', () => {
     for (let position = 0; position < Number(encrypted.footerFields.chunkCount); position++) {
       const nonce = Buffer.alloc(12);
       encrypted.header.noncePrefix.copy(nonce, 0);
-      nonce.writeBigUInt64BE(BigInt(position), 4);
+      nonce.writeUInt32BE(position, 8);
       nonces.add(nonce.toString('hex'));
     }
 

@@ -82,7 +82,7 @@ interface EncryptedArtifact {
  * 跑一遍生产加密器并**按 R3 的顺序**拼出完整制品：`[头][块数据][索引][尾部]`。
  *
  * 索引里的 `offset` 是**制品内的绝对偏移**，所以记录必须从拼好的制品上切，
- * 而不是从 `transform()` 的输出上切（后者缺了头部那 31+N 字节的位移）。
+ * 而不是从 `transform()` 的输出上切（后者缺了头部那 35+N 字节的位移）。
  */
 async function encryptArtifact(
   plaintext: Buffer,

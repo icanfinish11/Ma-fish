@@ -9,7 +9,7 @@ import type { KeyRing } from './key-ring.js';
  *
  * `position` 由**调用方按读取顺序**给出，绝不取自记录里自称的序号：
  *
- * - nonce = `noncePrefix(4) || BE64(position)`（规格 D4）；
+ * - nonce = `noncePrefix(8) || BE32(position)`（规格 D4；I3 把拆分由 `4+8` 改成 `8+4`）；
  * - AAD = `` `${fileId 十六进制}:${position}:${last|more}` ``（规格 D4）；
  * - `isLast` 由读取端判定为 `position === 索引条数 - 1`。
  *
