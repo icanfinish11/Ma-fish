@@ -93,6 +93,25 @@ const README_READ_BYTES = 8 * 1024;
 /** README 摘录的字符上限（设计 D9「截断到上限」）。 */
 const README_EXCERPT_CHARS = 2000;
 
+/**
+ * 文件树的深度上限（路径段数）。
+ *
+ * 8 段的来历：本仓库最深的一条路径是 `apps/api/src/modules/asset/crypto/chunk-cipher.ts`
+ * （7 段），而 `node_modules/<scope>/<pkg>/dist/esm/<…>` 动辄十几段——预览资料要看的是
+ * 「这个项目长什么样」，不是把 vendored 依赖的目录树也铺出来。
+ */
+const MAX_TREE_DEPTH = 8;
+
+/**
+ * 文件树的条目数上限。
+ *
+ * 500 的来历：设计 §6.2 的「文件数在 10–5000 之间」说明正常项目可以到 5000 个文件，
+ * 而预览资料里逐条列出 5000 行没有可读性；500 条足以看清结构，同时把
+ * `AssetMetadata` 里的这一列限制在几十 KB 量级（**与归档大小无关**）。
+ * 超限只影响这棵**树**：文件总数与语言分布仍然按全量统计（它们只是计数，不是列表）。
+ */
+const MAX_TREE_ENTRIES = 500;
+
 /** 一个条目需要读内容时给出的请求（`cap` 是允许读进内存的字节数）。 */
 interface ContentRequest {
   readonly kind: 'readme';
@@ -106,13 +125,23 @@ interface ContentRequest {
  * 与 Task 4 把两份判据收进 `limits.ts` 是同一个理由。
  */
 class MetadataScanner {
-  private readonly files: { path: string; bytes: number }[] = [];
+  /** 受限的文件树（只有文件；深度与条目数见 `MAX_TREE_DEPTH` / `MAX_TREE_ENTRIES`）。 */
+  private readonly tree: { path: string; bytes: number }[] = [];
+  /** 归档里**全部**文件条目的个数（不受深度与条目数上限影响——那两条只管列表）。 */
+  private fileCount = 0;
+  /** 是否**真的**丢掉了文件（恰好等于上限不算截断）。 */
+  private treeTruncated = false;
   /** README 的原始字节；`null` = 到扫描结束都没遇到过 README。 */
   private readme: Buffer | null = null;
 
   /** 遇到一个**文件**条目（walker 已排除目录）。 */
   addFile(path: string, bytes: number): void {
-    this.files.push({ path, bytes });
+    this.fileCount += 1;
+    if (depthOf(path) > MAX_TREE_DEPTH || this.tree.length >= MAX_TREE_ENTRIES) {
+      this.treeTruncated = true;
+      return;
+    }
+    this.tree.push({ path, bytes });
   }
 
   /**
@@ -136,11 +165,11 @@ class MetadataScanner {
   result(): ParsedMetadata {
     return {
       readmeExcerpt: this.readme === null ? null : excerptOf(this.readme),
-      fileTree: this.files,
+      fileTree: this.tree,
       languages: [],
       dependencies: [],
       completeness: 0,
-      fileTreeTruncated: false,
+      fileTreeTruncated: this.treeTruncated,
     };
   }
 }
@@ -149,6 +178,11 @@ class MetadataScanner {
 function baseNameOf(path: string): string {
   const cut = path.lastIndexOf('/');
   return cut === -1 ? path : path.slice(cut + 1);
+}
+
+/** 路径的段数（`a/b/c.md` → 3；空段不计，因此 `a//b` 与 `a/b` 同深）。 */
+function depthOf(path: string): number {
+  return path.split('/').filter((segment) => segment.length > 0).length;
 }
 
 /**

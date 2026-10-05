@@ -304,4 +304,73 @@ describe('Task 6 · 元数据解析', () => {
       expect((await parseOf(bytes, 'zip')).readmeExcerpt).toBeNull();
     });
   });
+
+  describe('Step 3：文件树摘要（深度与条目数都受限，超限要**标记**）', () => {
+    /** 第 `segments` 段路径：`d0/d1/…/f.txt`。段数就是深度。 */
+    const deepPath = (segments: number): string =>
+      [...Array.from({ length: segments - 1 }, (_unused, index) => `d${index}`), 'f.txt'].join('/');
+
+    it('深度上限 8：恰好 8 段进树，9 段不进，且标记为截断', async () => {
+      const bytes = buildZip([
+        { name: deepPath(8), data: Buffer.from('ok\n') },
+        { name: deepPath(9), data: Buffer.from('too deep\n') },
+      ]);
+      const metadata = await parseOf(bytes, 'zip');
+      expect(metadata.fileTree.map((file) => file.path)).toEqual([deepPath(8)]);
+      expect(metadata.fileTreeTruncated).toBe(true);
+    });
+
+    it('深度恰好等于上限、条目数也恰好等于上限 ⇒ **不**标记截断', async () => {
+      const bytes = buildZip([{ name: deepPath(8), data: Buffer.from('ok\n') }]);
+      const metadata = await parseOf(bytes, 'zip');
+      expect(metadata.fileTreeTruncated).toBe(false);
+    });
+
+    it('恰好 500 个文件 ⇒ 全部进树且不标记截断', async () => {
+      const bytes = buildZip(
+        Array.from({ length: 500 }, (_unused, index) => ({ name: `f${index}.txt`, data: Buffer.from('x') })),
+      );
+      const metadata = await parseOf(bytes, 'zip');
+      expect(metadata.fileTree).toHaveLength(500);
+      expect(metadata.fileTreeTruncated).toBe(false);
+    });
+
+    it('501 个文件 ⇒ 只留**归档顺序**的前 500 个，并标记截断', async () => {
+      const bytes = buildZip(
+        Array.from({ length: 501 }, (_unused, index) => ({ name: `f${index}.txt`, data: Buffer.from('x') })),
+      );
+      const metadata = await parseOf(bytes, 'zip');
+      expect(metadata.fileTree).toHaveLength(500);
+      expect(metadata.fileTree[0]?.path).toBe('f0.txt');
+      expect(metadata.fileTree[499]?.path).toBe('f499.txt');
+      expect(metadata.fileTreeTruncated).toBe(true);
+    });
+
+    it('字节数取自中央目录声明的未压缩大小（不是压缩后大小）', async () => {
+      const body = 'q'.repeat(4096);
+      const bytes = buildZip([{ name: 'src/index.ts', data: Buffer.from(body), method: 8 }]);
+      const metadata = await parseOf(bytes, 'zip');
+      expect(metadata.fileTree).toEqual([{ path: 'src/index.ts', bytes: 4096 }]);
+    });
+
+    it('目录条目不进文件树', async () => {
+      const bytes = buildZip([
+        { name: 'src/', data: Buffer.alloc(0) },
+        { name: 'src/index.ts', data: Buffer.from('export const x = 1;\n') },
+      ]);
+      const metadata = await parseOf(bytes, 'zip');
+      expect(metadata.fileTree.map((file) => file.path)).toEqual(['src/index.ts']);
+    });
+
+    it('tar.gz 侧同一判据：9 段不进树、标记截断、目录条目不算文件', async () => {
+      const bytes = buildTarGz([
+        { name: 'src/', typeflag: '5' },
+        { name: deepPath(8), data: Buffer.from('ok\n') },
+        { name: deepPath(9), data: Buffer.from('too deep\n') },
+      ]);
+      const metadata = await parseOf(bytes, 'tar.gz');
+      expect(metadata.fileTree.map((file) => file.path)).toEqual([deepPath(8)]);
+      expect(metadata.fileTreeTruncated).toBe(true);
+    });
+  });
 });
