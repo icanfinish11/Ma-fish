@@ -112,6 +112,77 @@ const MAX_TREE_DEPTH = 8;
  */
 const MAX_TREE_ENTRIES = 500;
 
+/**
+ * 扩展名 → 语言名（设计 D9「按扩展名归类」；未列出的归 `other`）。
+ *
+ * 这张表**刻意是有限的**：它要覆盖的是本平台用户会传的项目（Web / 脚本 / 主流系统语言），
+ * 不是一份完整的语言清单。多一个扩展名只影响「分布里多一行」，少一个则落到 `other`
+ * ——两侧都不会让任何控制失效，因此这里**不做**完整语言学映射。
+ *
+ * 同名语言合并（`ts` / `tsx` / `mts` / `cts` 都是 TypeScript），因为分布是**按语言**看占比。
+ */
+const LANGUAGE_BY_EXTENSION: Readonly<Record<string, string>> = Object.freeze({
+  ts: 'TypeScript',
+  tsx: 'TypeScript',
+  mts: 'TypeScript',
+  cts: 'TypeScript',
+  js: 'JavaScript',
+  jsx: 'JavaScript',
+  mjs: 'JavaScript',
+  cjs: 'JavaScript',
+  json: 'JSON',
+  md: 'Markdown',
+  markdown: 'Markdown',
+  css: 'CSS',
+  scss: 'Sass',
+  sass: 'Sass',
+  less: 'Less',
+  html: 'HTML',
+  htm: 'HTML',
+  vue: 'Vue',
+  svelte: 'Svelte',
+  py: 'Python',
+  go: 'Go',
+  rs: 'Rust',
+  java: 'Java',
+  kt: 'Kotlin',
+  kts: 'Kotlin',
+  rb: 'Ruby',
+  php: 'PHP',
+  c: 'C',
+  h: 'C',
+  cpp: 'C++',
+  cc: 'C++',
+  cxx: 'C++',
+  hpp: 'C++',
+  cs: 'C#',
+  swift: 'Swift',
+  dart: 'Dart',
+  lua: 'Lua',
+  r: 'R',
+  scala: 'Scala',
+  ex: 'Elixir',
+  exs: 'Elixir',
+  hs: 'Haskell',
+  clj: 'Clojure',
+  jl: 'Julia',
+  pl: 'Perl',
+  sh: 'Shell',
+  bash: 'Shell',
+  sql: 'SQL',
+  yml: 'YAML',
+  yaml: 'YAML',
+  toml: 'TOML',
+  xml: 'XML',
+  tf: 'Terraform',
+  proto: 'Protocol Buffers',
+  graphql: 'GraphQL',
+  gql: 'GraphQL',
+});
+
+/** 未归类语言的桶名（设计 D9：「未知归 `other`」）。 */
+const OTHER_LANGUAGE = 'other';
+
 /** 一个条目需要读内容时给出的请求（`cap` 是允许读进内存的字节数）。 */
 interface ContentRequest {
   readonly kind: 'readme';
@@ -131,12 +202,20 @@ class MetadataScanner {
   private fileCount = 0;
   /** 是否**真的**丢掉了文件（恰好等于上限不算截断）。 */
   private treeTruncated = false;
+  /** 语言 → 字节合计（全量累计，见 `addFile`）。 */
+  private readonly languageBytes = new Map<string, number>();
   /** README 的原始字节；`null` = 到扫描结束都没遇到过 README。 */
   private readme: Buffer | null = null;
 
   /** 遇到一个**文件**条目（walker 已排除目录）。 */
   addFile(path: string, bytes: number): void {
     this.fileCount += 1;
+    // 语言分布按**全量**累计（不受树的两条上限影响：它是聚合量，不是列表）。
+    // 0 字节文件不进分布：它对「按字节的占比」没有任何贡献，建一个 0 字节的桶只会多一行噪音。
+    if (bytes > 0) {
+      const language = languageOf(path);
+      this.languageBytes.set(language, (this.languageBytes.get(language) ?? 0) + bytes);
+    }
     if (depthOf(path) > MAX_TREE_DEPTH || this.tree.length >= MAX_TREE_ENTRIES) {
       this.treeTruncated = true;
       return;
@@ -166,12 +245,37 @@ class MetadataScanner {
     return {
       readmeExcerpt: this.readme === null ? null : excerptOf(this.readme),
       fileTree: this.tree,
-      languages: [],
+      languages: this.languageDistribution(),
       dependencies: [],
       completeness: 0,
       fileTreeTruncated: this.treeTruncated,
     };
   }
+
+  /**
+   * 语言分布：字节降序，同字节按语言名升序（**与归档顺序无关**，因此两次解析同一份归档
+   * 逐字节一致）。占比的分母是**全部文件**的字节合计。
+   */
+  private languageDistribution(): { name: string; bytes: number; ratio: number }[] {
+    const entries = [...this.languageBytes.entries()].map(([name, bytes]) => ({ name, bytes }));
+    const total = entries.reduce((sum, entry) => sum + entry.bytes, 0);
+    entries.sort((left, right) => (right.bytes === left.bytes ? compareNames(left.name, right.name) : right.bytes - left.bytes));
+    return entries.map((entry) => ({ ...entry, ratio: entry.bytes / total }));
+  }
+}
+
+/** 语言名比较（不用 `localeCompare`：分布的顺序不该随宿主 locale 变）。 */
+function compareNames(left: string, right: string): number {
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
+/** 路径 → 语言名（扩展名小写后查表；没有扩展名或点开头的文件归 `other`）。 */
+function languageOf(path: string): string {
+  const base = baseNameOf(path);
+  const dot = base.lastIndexOf('.');
+  if (dot <= 0) return OTHER_LANGUAGE; // `Makefile`（无点）与 `.gitignore`（点在开头）都归 other
+  return LANGUAGE_BY_EXTENSION[base.slice(dot + 1).toLowerCase()] ?? OTHER_LANGUAGE;
 }
 
 /** 路径的最后一段（`a/b/c.md` → `c.md`）。 */

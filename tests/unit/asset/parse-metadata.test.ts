@@ -373,4 +373,93 @@ describe('Task 6 · 元数据解析', () => {
       expect(metadata.fileTreeTruncated).toBe(true);
     });
   });
+
+  describe('Step 4：语言分布（按扩展名归类、按字节占比）', () => {
+    const bytesOf = (size: number): Buffer => Buffer.alloc(size, 0x61);
+
+    it('按扩展名归类，占比的分母是全部文件的字节合计', async () => {
+      const bytes = buildZip([
+        { name: 'src/a.ts', data: bytesOf(100) },
+        { name: 'src/b.js', data: bytesOf(300) },
+      ]);
+      const metadata = await parseOf(bytes, 'zip');
+      expect(metadata.languages).toEqual([
+        { name: 'JavaScript', bytes: 300, ratio: 0.75 },
+        { name: 'TypeScript', bytes: 100, ratio: 0.25 },
+      ]);
+    });
+
+    it('未知扩展名归 other；没有扩展名与点开头的文件也归 other', async () => {
+      const bytes = buildZip([
+        { name: 'Makefile', data: bytesOf(10) },
+        { name: '.gitignore', data: bytesOf(20) },
+        { name: 'data.weird', data: bytesOf(30) },
+        { name: 'src/a.ts', data: bytesOf(40) },
+      ]);
+      const metadata = await parseOf(bytes, 'zip');
+      expect(metadata.languages).toEqual([
+        { name: 'other', bytes: 60, ratio: 0.6 },
+        { name: 'TypeScript', bytes: 40, ratio: 0.4 },
+      ]);
+    });
+
+    it('扩展名大小写不敏感（`.TS` 与 `.ts` 同一个桶）', async () => {
+      const bytes = buildZip([
+        { name: 'a.TS', data: bytesOf(10) },
+        { name: 'b.ts', data: bytesOf(30) },
+      ]);
+      expect((await parseOf(bytes, 'zip')).languages).toEqual([{ name: 'TypeScript', bytes: 40, ratio: 1 }]);
+    });
+
+    it('0 字节文件不进分布（不建 0 字节的桶）；全是 0 字节时分布是空的', async () => {
+      const bytes = buildZip([
+        { name: 'a.ts', data: Buffer.alloc(0) },
+        { name: 'b.js', data: bytesOf(20) },
+      ]);
+      expect((await parseOf(bytes, 'zip')).languages).toEqual([{ name: 'JavaScript', bytes: 20, ratio: 1 }]);
+
+      const allEmpty = buildZip([{ name: 'a.ts', data: Buffer.alloc(0) }]);
+      expect((await parseOf(allEmpty, 'zip')).languages).toEqual([]);
+    });
+
+    it('排序：字节降序；字节相同时按语言名升序（与归档顺序无关）', async () => {
+      const bytes = buildZip([
+        { name: 'z.go', data: bytesOf(50) },
+        { name: 'a.json', data: bytesOf(50) },
+        { name: 'm.md', data: bytesOf(50) },
+        { name: 'big.py', data: bytesOf(200) },
+      ]);
+      expect((await parseOf(bytes, 'zip')).languages.map((language) => language.name)).toEqual([
+        'Python',
+        'Go',
+        'JSON',
+        'Markdown',
+      ]);
+    });
+
+    it('超出树深度的文件仍然计入语言分布（**树受限、聚合不受限**）', async () => {
+      const deep = `${Array.from({ length: 12 }, (_unused, index) => `d${index}`).join('/')}/deep.ts`;
+      const bytes = buildZip([
+        { name: 'shallow.js', data: bytesOf(100) },
+        { name: deep, data: bytesOf(300) },
+      ]);
+      const metadata = await parseOf(bytes, 'zip');
+      expect(metadata.fileTreeTruncated).toBe(true); // 深的那份没进树
+      expect(metadata.languages).toEqual([
+        { name: 'TypeScript', bytes: 300, ratio: 0.75 },
+        { name: 'JavaScript', bytes: 100, ratio: 0.25 },
+      ]);
+    });
+
+    it('tar.gz 侧同一判据', async () => {
+      const bytes = buildTarGz([
+        { name: 'main.go', data: bytesOf(300) },
+        { name: 'README.md', data: bytesOf(100) },
+      ]);
+      expect((await parseOf(bytes, 'tar.gz')).languages).toEqual([
+        { name: 'Go', bytes: 300, ratio: 0.75 },
+        { name: 'Markdown', bytes: 100, ratio: 0.25 },
+      ]);
+    });
+  });
 });
