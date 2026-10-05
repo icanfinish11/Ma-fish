@@ -438,7 +438,8 @@ export function parseMetadata(reader: RandomAccessReader, kind: 'zip' | 'tar.gz'
 
 **数据模型（沿用设计文档 §5.1/§5.3）：**
 - `Asset`（永久实体）：`id` UUIDv7、`ownerId`、`createdAt`
-- `AssetVersion`：`assetId`、`sha256`、`plaintextBytes`、`keyId`、`fileId`、`uploadedById`、`createdAt`
+- `AssetVersion`：`assetId`、`sha256`、**`storageKey`（制品对象键——下载路径必须靠它取对象；原字段清单漏了它，Task 5 指出）**、`plaintextBytes`、`keyId`、`fileId`、`uploadedById`、`createdAt`
+  - **`plaintextBytes` 是强制列，不是可选元数据。** 格式里**没有任何字段认证「制品有多长」**，它是制品**自称**值；接入期由 Task 5 用写入侧计量器数出并核对。**Task 7 必须把它落库；Task 8 必须在下载路径把它作为 `expectedPlaintextLength` 传回读取器** —— 否则这条核对**只在接入期有效**，下载路径上「更短、完全自洽」的制品会被当成合法的。Task 5 的探针 m6 实测：不传带外长度 ⇒ 一份更短的合法形状制品被**接受（201）**；带上 ⇒ 422。
 - `AssetMetadata`：`assetVersionId`、上面 `ParsedMetadata` 各字段
 - `OwnershipHistory`：`assetId`、`fromUserId`、`toUserId`、`reason`、`createdAt` — **append-only**
 
@@ -446,6 +447,7 @@ export function parseMetadata(reader: RandomAccessReader, kind: 'zip' | 'tar.gz'
 
 **Steps:**
 - [ ] **Step 1:** schema + 迁移。**迁移必须能在已迁移的库上干净落地**（P0 期间踩过一次：迁移再生成会与已迁移的本地卷冲突）——在全新库与已有库上各验一次。
+- [ ] **Step 1b（Task 5 移交的强制义务）:** `AssetVersion` 必须含 **`storageKey`**（下载路径取对象用）与 **`plaintextBytes`**，且 `plaintextBytes` **由 Task 5 的写入侧计量器数出**、不是从密文长度或上传元数据推导。两者都要有用例断言其确实落库。
 - [ ] **Step 2:** `infra/db/apply-grants.sql` 增加 `asset.ownership_history` 的 `REVOKE UPDATE, DELETE`（C7）。
 - [ ] **Step 3:** 扩展 append-only 集成测试覆盖 `OwnershipHistory`：**运行时角色**下 `UPDATE`/`DELETE` 被真实拒绝（沿用 P0 的双角色断言方式）。
 - [ ] **Step 4:** `ownership.service.ts`：转让 = `Asset.ownerId` 变更 + `OwnershipHistory` 追加一行，**不解密、不复制制品**（§5.2 第 2 条）。在同一事务内。
@@ -477,6 +479,8 @@ export function verifyTicket(t: DownloadTicket, secret: string, now: number): bo
 export async function consumeNonce(nonce: string, ttlSeconds: number): Promise<boolean>;  // Redis SET NX
 ```
 TTL **≤ 300 秒**（威胁 #3）。`nonce` 首次使用即消费；重复使用 ⇒ 拒绝。
+
+> **Task 5 移交的强制义务（下载路径）**：下载时必须把 `AssetVersion.plaintextBytes` 作为 **`expectedPlaintextLength`** 传给读取器并**认证末块**。理由同 Task 5：格式里没有字段认证制品总长，不传带外长度 ⇒ **「更短、完全自洽」的截断制品会被当成合法的**（Task 5 探针 m6 实测：不传 ⇒ 201 接受，传 ⇒ 422）。**这条核对若只在接入期成立、下载期失效，等于没有。**
 
 **Steps:**
 - [ ] **Step 1:** 签名单元测试：正确签名通过；**篡改任一字段**（载荷、过期时间、用户）⇒ 拒绝；过期 ⇒ 拒绝；签名长度或编码畸形 ⇒ 拒绝（不抛未捕获异常）。
