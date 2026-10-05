@@ -6,7 +6,7 @@ import { pipeline } from 'node:stream/promises';
 import type { Env } from '../../config/env.schema.js';
 import { AuditService } from '../audit/index.js';
 import type { ArchiveKind } from './archive/sniff.js';
-import { validateArchive } from './archive/validate-archive.js';
+import { validateArchive, type ArchiveVerdict } from './archive/validate-archive.js';
 import {
   CHUNK_SIZE,
   FOOTER_BYTES,
@@ -192,8 +192,22 @@ export class AssetService {
     /**
      * 带外长度核对 + 末块认证 + 嗅探 + 分发，全在 `validateArchive` 里（Task 4）。
      * 这里只做两件事：把**写入侧数的明文长度**交给它，以及按结论决定删不删对象。
+     *
+     * **它也可能抛错**：`sniffArchive` 在读制品失败时会把错误抛出来（它自己的注释写明了
+     * 「读制品本身失败属于存储/解密层的问题」，不吞）。典型形态是**非末块**被篡改：
+     * 末块认证会放行（末块没被动过），而嗅探一读第一块就认证失败。处置与 `open` 失败相同
+     * ——读不出来的制品没有任何用途 ⇒ 删掉 + 归成「制品读不回来」。
+     * **不许**让它冒到框架层：那是一个没有代号的 500，外加一条无上下文的堆栈日志
+     * （变异探针 `m7` 实测过这个形态）。
      */
-    const verdict = await validateArchive(reader, { expectedPlaintextLength: upload.receipt.plaintextBytes });
+    let verdict: ArchiveVerdict;
+    try {
+      verdict = await validateArchive(reader, { expectedPlaintextLength: upload.receipt.plaintextBytes });
+    } catch (error) {
+      await this.delete(upload.key);
+      throw new ArtifactUnreadableError(upload.key, error instanceof Error ? error.message : String(error));
+    }
+
     if (!verdict.ok) {
       await this.delete(upload.key);
       throw new ArchiveRejectedError(verdict.kind, verdict.reason);

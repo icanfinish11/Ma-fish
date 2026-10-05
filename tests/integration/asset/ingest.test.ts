@@ -17,7 +17,7 @@ import { SESSION_COOKIE } from '@vca/api/common/http/cookie.js';
 import { CSRF_COOKIE, CSRF_HEADER } from '@vca/api/common/security/csrf.middleware.js';
 import { SessionService } from '@vca/api/modules/auth/session.service.js';
 import { ARTIFACT_STORE, ArtifactTooLargeError, type ArtifactStore } from '@vca/api/modules/asset/store/artifact-store.port.js';
-import { ArchiveRejectedError, AssetService } from '@vca/api/modules/asset/asset.service.js';
+import { ArchiveRejectedError, ArtifactUnreadableError, AssetService } from '@vca/api/modules/asset/asset.service.js';
 import {
   FOOTER_BYTES,
   decodeFooter,
@@ -236,7 +236,6 @@ describe('加密即入库（D1）：上传流 → 加密写制品库 → 校验 
     const onDisk = await store.stat(upload.key);
     expect(onDisk.bytes).toBe(upload.bytes);
     expect(onDisk.bytes).toBeGreaterThan(plaintext.length);
-
     // 明文长度来自写入侧计数，**不是**制品的字节数（两者必须不同，否则下面那条断言是空话）
     expect(upload.receipt.plaintextBytes).toBe(plaintext.length);
     expect(upload.receipt.plaintextBytes).not.toBe(upload.bytes);
@@ -244,6 +243,8 @@ describe('加密即入库（D1）：上传流 → 加密写制品库 → 校验 
 
     // keyId 来自环境的**活动**键（不是写死的默认键），fileId 与制品头里的那一份一致
     const artifact = await store.getRange(upload.key, 0, onDisk.bytes - 1);
+    // 直接的内容判据：整份明文**不在**对象里（大小关系只是弱信号，密文里不该出现明文）
+    expect(artifact.includes(plaintext), '制品对象里出现了明文').toBe(false);
     const { header } = decodeHeader(artifact);
     expect(header.keyId).toBe(testEnv.ARTIFACT_ACTIVE_KEY_ID);
     expect(upload.receipt.keyId).toBe(header.keyId);
@@ -672,8 +673,7 @@ describe('加密即入库（D1）：上传流 → 加密写制品库 → 校验 
       await expect(storedObjects()).resolves.toEqual([]);
     });
 
-    it('尾部被改坏（open 阶段就失败）：删对象 + 500，制品库零残留', async () => {
-      tampering.mutate = (artifact) => {
+    it('尾部被改坏（open 阶段就失败）：删对象 + 500，制品库零残留', async () => {      tampering.mutate = (artifact) => {
         // 把索引起点改到头部之前：几何校验立刻不成立（连索引区都不会去读）
         const forged = Buffer.from(artifact);
         encodeFooter({
@@ -689,6 +689,34 @@ describe('加密即入库（D1）：上传流 → 加密写制品库 → 校验 
       expect(res.status, `响应体=${res.text}`).toBe(500);
       expect((res.body as { code?: string }).code).toBe('ASSET_ARTIFACT_UNREADABLE');
       // 读不回来的制品没有任何用途 ⇒ 同样要被删掉（否则制品库里会攒下永远下不来的孤儿）
+      await expect(storedObjects()).resolves.toEqual([]);
+    });
+
+    it('**中间**块被篡改（末块完好）：嗅探一读就认证失败 ⇒ 删对象 + 制品读不回来（不是未处理异常）', async () => {
+      /**
+       * 这一条盯的是**非末块**的篡改：末块认证会**放行**（末块没被动过），坏在下一次读上——
+       * `sniffArchive` 读制品开头时认证失败并**把错误抛出来**（它的注释写明了「读制品本身
+       * 失败属于存储/解密层的问题，不吞」）。于是**接入层必须接住它**：读不出来的制品
+       * 没有任何用途 ⇒ 删掉 + 归类成「制品读不回来」（500 + 代号），而不是让一个未处理异常
+       * 冒到框架层（那会变成没有代号的 500，还会在日志里留下无上下文的堆栈）。
+       *
+       * 需要**两块**制品才能构造出「被篡改的不是末块」：生产块大小 8 MiB，因此这里用
+       * 9 MiB 的合法 zip（stored 条目，不可压缩）。这条用例只走服务边界（HTTP 层的
+       * 上传上限是 4 MiB，9 MiB 会被 multer 先拦下——那测不到本路径）。
+       */
+      const plaintext = buildZip([{ name: 'big.bin', data: randomBytes(9 * 1024 * 1024) }]);
+      const upload = await assets.putStream(Readable.from([plaintext]), { maxBytes: 16 * 1024 * 1024 });
+      // 翻掉**第一块**密文里的一个字节（制品头之后就是块数据区，偏移 40 必在第一块内）
+      await rewriteObject(upload.key, (artifact) => {
+        const forged = Buffer.from(artifact);
+        forged[40] = forged[40]! ^ 0xff;
+        return forged;
+      });
+
+      const error = await assets.finalize(upload, { uploadedById: null }).catch((thrown: unknown) => thrown);
+
+      expect(error).toBeInstanceOf(ArtifactUnreadableError);
+      expect((error as ArtifactUnreadableError).detail).toContain('认证失败');
       await expect(storedObjects()).resolves.toEqual([]);
     });
   });
