@@ -34,6 +34,21 @@ import { buildZip } from '../../fixtures/archives/generate.js';
  * **小于 2 × CHUNK_SIZE**。押后发射让这条上界**与载荷大小无关**：
  * 实测 17 / 24 / 32 MiB 三个载荷的峰值都是 `16,842,844`（见任务报告 §修复轮 1 的探针矩阵）。
  *
+ * ### I4：判据口径改过一次（把与主机相关的项从判据里去掉，而不是藏起来）
+ *
+ * 上面那个量（`acked − onDisk`）里必然含**在途字节**：内核 socket 发送/接收缓冲、
+ * multipart 分帧、采样时间差。实测那部分是 `65,628` 字节（24 MiB 载荷），
+ * **随主机与调度运气变化，而不随实现变化**——把它写进判据的余量里就等于把主机行为
+ * 混进一条关于实现性质的判据。
+ *
+ * 因此本文件现在的**主判据**是 `peakPersistedWhileSending`：
+ * 「客户端**还在发送**期间，盘上出现过的最大制品字节数 ≥ 载荷 − 2 × CHUNK_SIZE」。
+ * 它只数**已落盘**的字节 ⇒ 判据里一个在途字节都没有；而它钉住的是同一件事
+ * （「攒够再写」的实现在发送期间盘上恒为 0）。
+ * 含在途项的那条上界**保留**为第二条判据（它约束「流水线里未落盘的明文」，
+ * 拦截「攒两块以上再写」的形态），它的在途项与判别间隔的比较写在
+ * `PIPELINE_SLACK_BYTES` 的注释里。
+ *
  * ### 为什么必须 ≥ 2 × CHUNK_SIZE 才能判别（这是本文件存在的全部理由）
  *
  * 「未完成字节数」这个量在载荷小于 `2 × CHUNK_SIZE` 时**恒等于载荷本身**——不是因为实现攒了
@@ -82,19 +97,55 @@ const PRODUCTION_CHUNK_SIZE = 8 * 1024 * 1024;
  * 那是判据漂移，不是判据。写死之后，改 `CHUNK_SIZE` 会让这条用例要么红、要么需要一次
  * 有意识的修改。
  *
- * 余量为什么要写出来（而不是把上界调宽一点了事）：这个量是「客户端已交出的明文 −
- * 已落盘的制品字节」，它除了加密器手里那两块，还必然包含**上游在途的字节**——
- * 客户端 socket 的发送缓冲、multipart 的分帧字节，以及「第一块被放行」与「采样器看到
- * 那一块落盘」之间的时间差。实测这个差值只有**几百字节**（24 MiB 载荷：峰值
- * `16,777,409`，即 `2 × CHUNK_SIZE` + 193），但它是**结构上必然非零**的，
- * 因此上界必须显式留出它，否则这条断言会以「差了 193 字节」的形式偶发变红。
+ * ## 这个余量到底是多少（据实记载：上一版的凭据是**编造**的，I4）
  *
- * `256 KiB` 是实测松弛量的约 1300 倍，同时只有载荷（24 MiB）的约 1%：
- * 留得足够宽，不至于把实现的一点抖动判成缺陷；又远小于任何一个「攒整份」的实现
- * （那会停在**载荷大小**上，本用例里是 24 MiB）。
+ * 这个量是「客户端已交出的明文 − 已落盘的制品字节」。上一版注释写「实测这个差值只有
+ * **几百字节**（24 MiB 载荷：峰值 `16,777,409`，即 `2 × CHUNK_SIZE` + 193），
+ * `256 KiB` 是它的约 1300 倍」——**那是错的**，而且同一个文件里就记着正确的数：
+ * 24 MiB 载荷的实测峰值是 **`16,842,844` = `2 × CHUNK_SIZE` + `65,628`**
+ * （见下面用例里的三载荷矩阵）。按真实数字，`256 KiB` 是实测松弛量的约 **4 倍**，
+ * 不是 1300 倍。一条把 4× 写成 1300× 的判据，离被当成产品缺陷重新审理只差一个糟糕的 CI 日。
+ *
+ * ## 那 65,628 字节是什么（它是**与主机相关**的项，这一点必须写明）
+ *
+ * 它是「客户端已确认写出」与「服务端已落盘」之间的**在途量**，由三部分组成：
+ * 内核 socket 发送/接收缓冲（随主机的自动调优与负载变化）、multipart 的分帧字节、
+ * 以及两次采样之间的时间差。**它不随实现变化**——所以它既不能被当成实现的性质，
+ * 也不能被藏起来。三次测量的差值本身就说明了这一点：
+ *
+ * | 来源 | 24 MiB 载荷下的峰值 | 相对 `2 × CHUNK_SIZE` 的松弛 |
+ * |---|---|---|
+ * | Task 5 的探针矩阵（17 MiB 载荷） | `16,777,409` | 193 B |
+ * | Task 5 的探针矩阵（24 / 32 MiB 载荷） | `16,842,844` | **65,628 B** |
+ * | I4 复测（本机，同一载荷） | **`16,777,309`** | 93 B |
+ *
+ * 同一个实现、同一份载荷，松弛量在 93 B 与 65,628 B 之间跳了两个数量级 ⇒ 它是**主机的**性质。
+ *
+ * - 上界仍然保留它（`2 × CHUNK_SIZE + 256 KiB` = 实测最大值的约 4 倍），
+ *   因为「在途量必然非零」是结构性的；
+ * - 但**主判据已经换成与主机无关的那一条**（下面 `peakPersistedWhileSending`：
+ *   只数**已落盘**的字节，一个在途字节都不进判据）。
+ *
+ * 为什么留着这个含在途项的上界：它直接约束「流水线里未落盘的明文」，
+ * 而那是「攒整份再写」的另一种形态（攒了两块以上）。它的**判别间隔**远大于余量：
+ * 攒整份的实现停在**载荷大小**上（24 MiB 载荷实测 `25,166,088`），
+ * 与上界 `17,039,360` 差 8 MiB 以上——是余量的 30 倍以上，因此主机抖动不会改变结论。
  */
 const PIPELINE_SLACK_BYTES = 256 * 1024;
 const UNFINISHED_BOUND = 2 * PRODUCTION_CHUNK_SIZE + PIPELINE_SLACK_BYTES;
+
+/**
+ * **主判据**（I4：把依赖主机的项从判据里去掉，而不是藏起来）。
+ *
+ * 「客户端还在发送期间，盘上已经出现了多少制品字节」——只数**已落盘**的字节，
+ * 因此不含任何内核缓冲、也不含 multipart 分帧（那些量只出现在「已确认写出」那一侧）。
+ *
+ * 阈值 = `载荷 − 2 × CHUNK_SIZE`：加密器最多押后**两块**（`held` + 正在填的那块），
+ * 其余全部已经发射并落盘，所以流式实现必然越过它；而「攒够再写」的实现在**发送期间**
+ * 盘上是 **0**，差一个数量级。两块这个数来自 `chunk-cipher.ts` 的押后语义，
+ * 它是本仓已实测并复审过的结构性质（§2 的 `2 × CHUNK_SIZE + 源块`）。
+ */
+const PERSISTED_FLOOR_BYTES = (plaintextBytes: number): number => plaintextBytes - 2 * PRODUCTION_CHUNK_SIZE;
 
 /** 本用例的载荷：3 个生产块（24 MiB），即 `2 × CHUNK_SIZE` 的 1.5 倍。 */
 const PAYLOAD_BYTES = 24 * 1024 * 1024;
@@ -141,9 +192,16 @@ async function collect(stream: Readable): Promise<Buffer> {
 interface UploadObservation {
   /** 采样次数（采样器真的跑起来了；0 会让下面每一条断言都变成恒真）。 */
   samples: number;
+  /** 其中「客户端还在发送」期间采到的次数（主判据不能建立在一个空集合上）。 */
+  samplesWhileSending: number;
   /** 请求进行中，制品库里**出现过**「有字节但还不完整」的对象。 */
   sawPartial: boolean;
-  /** **本用例的判据**：已发出的明文 − 已落盘的制品字节，全程峰值。 */
+  /**
+   * **主判据（I4）**：客户端仍在发送期间，盘上出现过的**最大**制品字节数。
+   * 只数已落盘的字节 ⇒ 不含内核 socket 缓冲与 multipart 分帧（那些只在 `acked` 一侧）。
+   */
+  peakPersistedWhileSending: number;
+  /** 已发出的明文 − 已落盘的制品字节，全程峰值（含在途项，见 `PIPELINE_SLACK_BYTES`）。 */
   peakUnfinished: number;
   /** 制品库里的最大文件数（>1 说明出现过临时副本，C21）。 */
   maxFiles: number;
@@ -181,14 +239,34 @@ function uploadLarge(
   const total = parts.reduce((n, part) => n + part.length, 0);
 
   return new Promise((resolve, reject) => {
-    const observed: UploadObservation = { samples: 0, sawPartial: false, peakUnfinished: 0, maxFiles: 0 };
+    const observed: UploadObservation = {
+      samples: 0,
+      samplesWhileSending: 0,
+      sawPartial: false,
+      peakPersistedWhileSending: 0,
+      peakUnfinished: 0,
+      maxFiles: 0,
+    };
     let acked = 0;
+    /**
+     * 客户端是否还在写 body。
+     *
+     * 它在**采样开始那一刻**取值（而不是在 `.then` 里）：采样是异步的（readdir + stat），
+     * 若在采样**完成**时才判断，最后几次采样会把「发送结束之后才落盘」的字节也算进来——
+     * 那正是主判据要排除的东西（它问的是「边收边写」，不是「写完了盘上有多少」）。
+     */
+    let sending = true;
     const timer = setInterval(() => {
+      const duringSend = sending;
       void storedObjects()
         .then((files) => {
           observed.samples += 1;
           observed.maxFiles = Math.max(observed.maxFiles, files.length);
           const onDisk = files.reduce((n, f) => n + f.size, 0);
+          if (duringSend) {
+            observed.samplesWhileSending += 1;
+            observed.peakPersistedWhileSending = Math.max(observed.peakPersistedWhileSending, onDisk);
+          }
           if (onDisk > 0 && onDisk < bytes.length) observed.sawPartial = true;
           observed.peakUnfinished = Math.max(observed.peakUnfinished, acked - onDisk);
         })
@@ -224,6 +302,8 @@ function uploadLarge(
     let index = 0;
     const next = (): void => {
       if (index >= parts.length) {
+        // 发送到此结束：主判据只统计这之前的采样（见 `sending` 的注释）。
+        sending = false;
         request.end();
         return;
       }
@@ -349,16 +429,43 @@ describe('完整制品（≥ 2 × CHUNK_SIZE）走 HTTP：内存上界与「HTTP
     // 采样器必须真的跑起来了：0 个采样会让下面两条断言变成恒真。
     expect(response.observed.samples, '采样器一次都没采到——下面的断言会因此恒真').toBeGreaterThan(50);
     /**
-     * **本用例的判据（规格验收判据 13）**：未完成字节数的峰值有界，且**与载荷大小无关**。
+     * **主判据（规格验收判据 13；I4 之后的口径）**：客户端**还在发送**期间，
+     * 盘上已经出现了至少「载荷 − 2 × CHUNK_SIZE」的制品字节。
+     *
+     * 为什么这个口径比「已发出的明文 − 已落盘」更好：它只数**已落盘**的字节，
+     * 一个在途字节都不进判据 ⇒ **与主机的 socket 缓冲、multipart 分帧、调度运气无关**。
+     * 而它仍然钉住同一件事——「攒够再写」的实现在发送期间盘上是 **0**。
+     */
+    expect(
+      response.observed.samplesWhileSending,
+      '「发送期间」的采样一次都没有——主判据会因此恒真',
+    ).toBeGreaterThan(50);
+    expect(
+      response.observed.peakPersistedWhileSending,
+      `发送期间已落盘峰值=${String(response.observed.peakPersistedWhileSending)}（载荷 ${String(plaintext.length)}，` +
+        `下限 ${String(PERSISTED_FLOOR_BYTES(plaintext.length))}）——低于下限说明这一趟**不是边收边写**：` +
+        '把整份攒起来再落盘的实现在发送期间盘上恒为 0。' +
+        `（同一次观测的未完成字节数峰值=${String(response.observed.peakUnfinished)}，上界 ${String(UNFINISHED_BOUND)}）`,
+    ).toBeGreaterThanOrEqual(PERSISTED_FLOOR_BYTES(plaintext.length));
+    /**
+     * **第二条（保留的上界，含与主机相关的在途项）**：未完成字节数的峰值有界，
+     * 且**与载荷大小无关**。
      *
      * 上界取 `2 × CHUNK_SIZE`（加密器同时持有的两块：押后的那块 + 正在填的那块），
      * 也就是设计文档里「内存与输入大小无关」的那个数。实测（同一份探针、三种载荷）：
-     * 17 MiB ⇒ 16,777,308；24 MiB ⇒ 16,842,844；32 MiB ⇒ 16,842,844 —— **不随载荷增长**。
+     * 17 MiB ⇒ 16,777,308；24 MiB ⇒ **16,842,844**；32 MiB ⇒ 16,842,844 —— **不随载荷增长**。
+     * 那 16,842,844 就是 `2 × CHUNK_SIZE + 65,628`，而 65,628 是**在途量**
+     * （内核 socket 缓冲 + multipart 分帧，见 `PIPELINE_SLACK_BYTES` 的注释）；
+     * I4 复测同一条用例得到 `16,777,309`（松弛 93）——**同一个实现在同一份载荷上
+     * 松弛量差了两个数量级**，这正是它不能当主判据的原因。
+     * 判据的判别间隔（8 MiB 以上）是余量的 30 倍以上，因此主机抖动不会改变结论。
      */
     expect(
       response.observed.peakUnfinished,
       `未完成字节数峰值=${String(response.observed.peakUnfinished)}（载荷 ${String(plaintext.length)}，` +
-        `上界 ${String(UNFINISHED_BOUND)}）——超过上界说明链路某一层把整份攒进了内存`,
+        `上界 ${String(UNFINISHED_BOUND)}）——超过上界说明链路某一层把整份攒进了内存。` +
+        `（同一次观测的发送期间已落盘峰值=${String(response.observed.peakPersistedWhileSending)}，` +
+        `下限 ${String(PERSISTED_FLOOR_BYTES(plaintext.length))}）`,
     ).toBeLessThan(UNFINISHED_BOUND);
     // 请求进行中就有字节落盘（否则「已落盘」恒为 0，上面的差会退化成「已发出的明文」）
     expect(response.observed.sawPartial, '整段上传期间制品库里的对象一直是空的').toBe(true);
