@@ -640,8 +640,10 @@ function hasEntryOrBuildSignal(record: Record<string, unknown>): boolean {
 /**
  * `requirements.txt`：逐行文本解析（PEP 508 的**常用子集**）。
  *
- * 处理：`#` 注释、空行、以 `-` 开头的选项行（`-r` / `-e` / `--index-url`）、
- * `name[extras]` 的 extras、环境标记（`;` 之后的部分丢弃）、版本符原样保留。
+ * 处理：`#` 注释、空行、`name[extras]` 的 extras、环境标记（`;` 之后的部分丢弃）、
+ * 版本符原样保留。选项行（`-r` / `-e` / `--index-url`）**由正则天然排除**：正则要求第一个
+ * 字符是字母或数字，因此 `-` 开头的行一律不匹配。这里**没有**再写一条 `startsWith('-')`
+ * ——探针实测那两行改与不改行为完全一致，是一行证明不了的死代码（C16）。
  * **不处理**：行继续符（末尾 `\`）、`--hash`、`-e <vcs url>` 里的包名——
  * 这几类在产物里都落到「跳过」或「版本为空」，不会让解析失败（据实记载）。
  */
@@ -649,7 +651,7 @@ function parseRequirements(text: string): { name: string; version: string }[] {
   const dependencies: { name: string; version: string }[] = [];
   for (const rawLine of text.split('\n')) {
     const line = (rawLine.split('#')[0] ?? '').trim();
-    if (line.length === 0 || line.startsWith('-')) continue;
+    if (line.length === 0) continue;
     const match = /^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*(.*)$/.exec(line);
     if (match === null) continue;
     const name = match[1];

@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { gunzipSync } from 'node:zlib';
+import { gunzipSync, deflateRawSync } from 'node:zlib';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ChildProcess, spawn, spawnSync } from 'node:child_process';
 import { EncryptedArtifactReader } from '@vca/api/modules/asset/store/random-access-reader.js';
@@ -869,6 +869,93 @@ describe('Task 6 · 元数据解析', () => {
         ...Array.from({ length: 5 }, (_unused, index) => ({ name: `docs/d${index}.txt`, data: Buffer.from('x') })),
       ];
       expect((await parseOf(buildTarGz(entries), 'tar.gz')).completeness).toBe(100);
+    });
+  });
+
+  describe('Step 7：只读需要的块 / 结果有界（验收判据 13 在元数据这一侧的见证）', () => {
+    /**
+     * 判据 13 说的是「内存上界与文件大小无关」，而 Task 5 给的量是
+     * **未完成字节数**（客户端已交出的明文 − 已落盘的制品字节）。那个量在本任务里
+     * **没有定义**：解析的输入是一份**已经完整落盘**的制品，链路里没有任何「边收边写」，
+     * 因此不存在「未完成」的字节。这里能观测、且与判据 13 同义的量是
+     * **从制品库读回了多少字节**——它就是「这次解析把多少块解密进了内存」。
+     */
+    const CHUNK_BYTES = 64 * 1024; // 与 openReader 的 chunkSize 一致
+    const PAYLOAD_BYTES = 24 * 1024 * 1024;
+
+    /** 24 MiB 不可压缩负载（stored 条目，压缩比 1:1）。 */
+    function incompressible(size: number, seed = 5): Buffer {
+      const buffer = Buffer.alloc(size);
+      for (let index = 0; index < size; index += 1) buffer[index] = (seed + index * 31) % 251;
+      return buffer;
+    }
+
+    it('zip：24 MiB 归档里，解析只读回与归档大小**无关**的少数几块', async () => {
+      const big = incompressible(PAYLOAD_BYTES);
+      const bytes = buildZip([
+        { name: 'README.md', data: Buffer.from('# 大项目\n' + 'r'.repeat(1500)) },
+        { name: 'package.json', data: Buffer.from('{"dependencies":{"only":"1.0.0"}}') },
+        { name: 'src/index.ts', data: Buffer.from('export const x = 1;\n') },
+        { name: 'data/dump.bin', data: big },
+      ]);
+      const { store, reader } = await openReader(bytes);
+
+      const metadata = await parseMetadata(reader, 'zip');
+
+      // 解析确实读到了东西（否则下面的上界是恒真的）。
+      expect(metadata.readmeExcerpt).toContain('# 大项目');
+      expect(metadata.dependencies).toEqual([{ ecosystem: 'npm', name: 'only', version: '1.0.0' }]);
+
+      /**
+       * 上界**从制品几何推出来**，不是照着实测值写的：中央目录（1 块）+ 被读内容的
+       * 那几个小文件（README / package.json / src/index.ts 各 1 块，可能并块）
+       * + yauzl 逐个 `openReadStream` 时的本地头，再留一倍余量 ⇒ 16 块。
+       * 制品本身是 `24 MiB / 64 KiB = 384` 块 ⇒ 这条上界比「全读一遍」低两个数量级。
+       */
+      const TOUCHED_BLOCKS_BOUND = 16;
+      expect(store.bytesRequested()).toBeLessThan(TOUCHED_BLOCKS_BOUND * (CHUNK_BYTES + 16));
+      // 同一件事的相对口径：读回的字节不到归档的 1/16。
+      expect(store.bytesRequested() * 16).toBeLessThan(reader.plaintextLength);
+    });
+
+    it('zip：结果本身的规模有界（摘录 ≤ 2000 字符、文件树 ≤ 500 条），与归档大小无关', async () => {
+      const bytes = buildZip([
+        { name: 'README.md', data: Buffer.from('r'.repeat(200 * 1024)) },
+        ...Array.from({ length: 600 }, (_unused, index) => ({
+          name: `src/f${String(index).padStart(3, '0')}.txt`,
+          data: Buffer.from('x'),
+        })),
+      ]);
+      const metadata = await parseOf(bytes, 'zip');
+      expect(metadata.readmeExcerpt).toHaveLength(2000);
+      expect(metadata.fileTree).toHaveLength(500);
+      expect(metadata.fileTreeTruncated).toBe(true);
+    });
+
+    it('tar.gz：**顺序流**下解压量与归档同阶（据实记载），有界的是**结果**与内容留存', async () => {
+      const bytes = buildTarGz([
+        { name: 'README.md', data: Buffer.from('r'.repeat(200 * 1024)) },
+        { name: 'data/dump.bin', data: incompressible(4 * 1024 * 1024) },
+      ]);
+      const { store, reader } = await openReader(bytes);
+      const metadata = await parseMetadata(reader, 'tar.gz');
+
+      // 据实记载：tar.gz 没有中央目录，枚举条目必须把整条流解压一遍
+      // ⇒ 读回的字节与制品同阶（这里只断言「确实读满了」，不假装它是省的那一侧）。
+      expect(store.bytesRequested()).toBeGreaterThanOrEqual(reader.plaintextLength);
+      // 有界的是结果：摘录截断、内容不累积。
+      expect(metadata.readmeExcerpt).toHaveLength(2000);
+      expect(metadata.fileTree.map((file) => file.path)).toEqual(['README.md', 'data/dump.bin']);
+    });
+
+    it('条目内容读不出来 ⇒ **抛错**，而不是伪造一份「看起来正常」的元数据', async () => {
+      const data = Buffer.from('x'.repeat(5000));
+      // 声明的压缩长度比真实载荷少 10 字节 ⇒ 解压输入被截断 ⇒ 读这个条目必然失败。
+      const truncated = deflateRawSync(data).length - 10;
+      const bytes = buildZip([
+        { name: 'README.md', data, method: 8, declaredCompressedSize: truncated },
+      ]);
+      await expect(parseOf(bytes, 'zip')).rejects.toThrow();
     });
   });
 });
