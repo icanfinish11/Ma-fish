@@ -251,6 +251,31 @@ export class ChunkEncryptor {
   }
 
   /**
+   * 制品**文件头**（不含块数据、索引与尾部）。
+   *
+   * ## 为什么需要它：写入方的单趟组装（Task 5）
+   *
+   * 制品的字节序是 `header ‖ 块数据 ‖ index ‖ footer`（R3），头必须**最先写**。
+   * 而从 Task 2 起 `result()` 只在流**成功结束之后**才给结果——它是**尾部**的性质
+   * （`plaintextLength` / `chunkCount` 要等流结束）。头里**没有**这两个字段：
+   * `formatVersion` / `keyId` / `fileId` / `chunkSize` / `noncePrefix` 全部在**构造期**
+   * 就已确定，因此头可以在一个字节都没喂之前就交出去。
+   *
+   * `result()` 里那份头就是本方法的返回值（单一来源）——两处各拼一次迟早会漂移，
+   * 而漂移的失效形态是「制品里的 fileId/noncePrefix 与实际加密时用的不是同一份」，
+   * 表现为整份制品解不开。
+   */
+  header(): ArtifactHeader {
+    return {
+      formatVersion: FORMAT_VERSION,
+      keyId: this.keyId,
+      fileId: this.fileId,
+      chunkSize: this.chunkSize,
+      noncePrefix: this.noncePrefix,
+    };
+  }
+
+  /**
    * 流**成功结束之后**的最终结果：文件头、块索引、尾部，以及块数据的绝对起点。
    *
    * 未结束（或流以错误结束）时**抛错**：此时 `plaintextLength` / `chunkCount` 都不是最终值，
@@ -267,13 +292,7 @@ export class ChunkEncryptor {
       );
     }
     if (this.cached === undefined) {
-      const header: ArtifactHeader = {
-        formatVersion: FORMAT_VERSION,
-        keyId: this.keyId,
-        fileId: this.fileId,
-        chunkSize: this.chunkSize,
-        noncePrefix: this.noncePrefix,
-      };
+      const header = this.header();
       // 索引排在**所有块数据之后**（R3）：它的起点 = 块数据区起点 + 已发射字节数。
       // 两个加数都在发射期就成真，所以这里没有任何「按最终块数倒推」的假设。
       const indexOffset = BigInt(this.blockDataOffset() + this.state.emittedBytes);

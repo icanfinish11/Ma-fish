@@ -478,6 +478,35 @@ describe('写入端产出的字节能被独立解密器读懂（契约级判据�
     expect(encrypted.footerFields.chunkCount).toBe(3n);
     expect(decodeHeader(assemble(encrypted)).header).toEqual(encrypted.header);
   });
+
+  it('header()：流结束**之前**就能给出文件头，且与 result() 是同一份事实（Task 5 的单趟组装路径）', async () => {
+    const encryptor = new ChunkEncryptor(fakeRing(), { chunkSize: 100 });
+    // 一个字节都还没喂时取头：总量字段在**尾部**（R3），因此此刻它已经是最终值。
+    // 写入方（Task 5）要按 `header ‖ 块数据 ‖ index ‖ footer` 单趟写出，头必须最先写。
+    const beforeStream = encryptor.header();
+
+    const collected: Buffer[] = [];
+    const sink = new Writable({
+      write(chunk: Buffer, _encoding, callback): void {
+        collected.push(Buffer.from(chunk));
+        callback();
+      },
+    });
+    await pipeline(Readable.from([pattern(300, 21)]), encryptor.transform(), sink);
+    const result = encryptor.result();
+
+    // ① 流结束后头没变（不是「流结束时才知道」的东西）
+    expect(encryptor.header()).toEqual(beforeStream);
+    // ② 与 result() 的头一致（同一份事实，不是两处各拼一次）
+    expect(result.header).toEqual(beforeStream);
+    // ③ 按 header() 先写出去的那份头，解码回来就是 result() 的头
+    const artifact = Buffer.concat([encodeHeader(beforeStream), Buffer.concat(collected), result.index, result.footer]);
+    expect(decodeHeader(artifact).header).toEqual(result.header);
+    // ④ 头里的字段确实来自环与构造选项（否则上面三条在「头是空对象」时也成立）
+    expect(beforeStream.keyId).toBe('v1');
+    expect(beforeStream.chunkSize).toBe(100);
+    expect(encodeHeader(beforeStream)).toHaveLength(headerByteLength('v1'.length));
+  });
 });
 
 describe('nonce 唯一性（同文件 + 跨文件）', () => {
