@@ -224,7 +224,36 @@ No difference detected.
 | 探针 | 预期 |
 |---|---|
 | 在受管 schema 里 `DROP` 一张已建模的表 | **红**（④ 实测：`Added tables - probe_entries`，退出码非零） |
-| 往库里加一个**未建模**的 schema / 表 / 函数 / 触发器 / CHECK | **绿**（② ③ 实测）——这是**已知边界**，不是缺陷，但必须写在注释里，否则会被当成「门证明的东西比它实际证明的多」 |
+| 往库里加一个**未建模的 schema**（不在 `datasource.schemas` 里，连同它里面的表） | **绿**（② 实测；Task 4 在真 `ledger` 上复测，见 §8） |
+| 往库里加**未建模的函数 / 约束触发器 / CHECK**（挂在已建模的表上） | **绿**（③ 实测；Task 4 在真 `ledger` 上复测，见 §8）——这是**已知边界**，不是缺陷，但必须写在注释里，否则会被当成「门证明的东西比它实际证明的多」 |
+| 往**受管** schema 里加一张**未建模的表** | **红**（Task 4 实测，见 §8）——**与本节原预测相反**：表属于建模面，「额外的表」就是漂移，门会要求把它删掉。原文把「表」与「函数/触发器/CHECK」并列成同一行，是从 ②③ 两次探针过度外推出来的，已被证伪 |
+
+---
+
+## 8. Task 4 落地时的复测与一处更正（2026-10-06）
+
+Task 4（`ledger` schema、迁移、授权、数据库强制点）在**真 `ledger` schema 上**把 §6.1 的
+四条探针各跑了一次（一次性库 `p2_t4_probe`，四个迁移全部应用，逐字输出见
+`.superpowers/sdd/2026-10-06-p2-ledger/evidence/t4-drift-gate-probes-separated.txt`）：
+
+| # | 动作 | 实测 |
+|---|---|---|
+| 0 | 基线（库 = 四个迁移后的状态） | `No difference detected.` 退出码 **0** |
+| ①a | 给 `ledger.entries` 挂上手写 plpgsql 函数 + `DEFERRABLE INITIALLY DEFERRED` 约束触发器，并给 `ledger.entries` 加一条 `CHECK (amount <> 1)` | `No difference detected.` 退出码 **0** —— §3 的结论在**真实账本表**上复现 |
+| ①b | 在受管 schema 内加一张**未建模的表** `ledger.probe_unmodeled` | **红**：`[-] Removed tables - probe_unmodeled`，经 pnpm 退出码 **1**（prisma 原为 2，§4.1 复现） |
+| ①c | 加一个**未受管 schema** `probe_unmanaged` 与它的一张表 | **绿**（`No difference detected.`，退出码 0） |
+| E | `DROP TABLE ledger.entries CASCADE` | **红**：`[+] Added tables - entries`（外加索引与外键的重建要求），退出码 1 |
+
+**更正**：§6.1 原表把「未建模的 schema / **表** / 函数 / 触发器 / CHECK」写在同一行、
+预期一律为「绿」。①b 实测**证伪**了其中的「表」：受管 schema 内的**额外表**是漂移，
+门会红。原文的「绿」只对两种情况成立——(a) 对象所在的 **schema 不受管**（结构性失明），
+(b) 对象是 Prisma **不建模的那类**（函数 / 触发器 / CHECK）。这两条边界都必须留在注释里，
+而「未建模的表也绿」这句**必须删掉**：它会把一条其实有判别力的性质说成没有，
+下一个人据此以为「加表不会被发现」。
+
+⇒ Task 4 的 `migration.sql` 头部注释与 CI 那一步的注释按**修正后**的表述写
+（「门守的是建模面别掉，不是手写面还在」，且没有声称未建模的表不可见）。
+
 
 ---
 
