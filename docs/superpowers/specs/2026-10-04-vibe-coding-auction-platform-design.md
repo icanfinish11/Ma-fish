@@ -393,6 +393,8 @@ DRAFT → SCHEDULED → LIVE ⇄ EXTENDED
 - 出价与结算在 `SERIALIZABLE` 事务内，对拍卖行加 `SELECT ... FOR UPDATE` 行锁。
 - `RELEASED`（交换）与 `SETTLEMENT`（竞拍）各自在单一事务内完成。
 
+> **P2 的实现裁定（2026-10-06，控制器批准）**：本节第二行「出价与结算在 `SERIALIZABLE` 事务内，对拍卖行加 `SELECT … FOR UPDATE` 行锁」约束的是**拍卖行**（`auction` 实体；§7.3 的状态机属 P4）上的竞态。**P2 的账本没有拍卖行可锁**，因此 P2 的余额扣减采用另一套**已实测**的机制：条件 `updateMany(where balance >= x)` + **受影响行数**作并发权威 + 应用侧显式平衡断言（见 `docs/superpowers/plans/2026-10-06-p2-ledger.md` 的 D8 与 Task 6）。**这不是对 §8.5 的违背**：预检 §G.4「>2 并发下的 SERIALIZABLE 重试风暴」尚未验证，而在一个未验证的假设上选 `SERIALIZABLE`，正是本项目反复惩罚过的那种未测量的赌注。P4 在自己的 schema 内施加本节那条规则时，可以与账本的条件更新共存于同一个事务——隔离级别是事务级的，账本不介意。
+
 ### 8.6 数据库角色模型（append-only 生效的前提，已实测）
 
 不变式 #5 要求「在数据库层撤销 `UPDATE`/`DELETE`」。**实测发现：若应用与迁移使用同一角色，该撤销完全无效** —— 因为该角色是表属主，而 PostgreSQL 的属主始终保有全部权限。
