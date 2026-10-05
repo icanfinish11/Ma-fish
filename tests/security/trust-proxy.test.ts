@@ -32,7 +32,10 @@ describe('trust proxy 的取值解析（I-6：IP 维度限流的信任边界）'
     const parsed = envSchema.parse({
       DATABASE_URL: 'postgresql://app_user:pw@127.0.0.1:5432/vca',
       REDIS_URL: 'redis://127.0.0.1:6379',
-      MASTER_ENCRYPTION_KEY: 'a'.repeat(64),
+      // `MASTER_ENCRYPTION_KEY` 曾在这一行。**已删除**（修复轮 1 / R6）：它被校验却全仓无读取方。
+      // 注意从这里删掉它**不会**让本用例变红，因为 zod 的对象 schema 对多余键静默忽略——
+      // 也就是说「删掉一个已废弃变量的登记」这件事**没有测试能替你做**，只能靠全仓 grep
+      // （`grep -rn MASTER_ENCRYPTION_KEY .env.example apps tests`）。记在这里以示它是有意为之。
       GITHUB_CLIENT_ID: 'cid',
       GITHUB_CLIENT_SECRET: 'csecret',
       GITHUB_CALLBACK_URL: 'http://localhost:3000/auth/github/callback',
@@ -41,8 +44,9 @@ describe('trust proxy 的取值解析（I-6：IP 维度限流的信任边界）'
       // P1 / Task 1 新增（见 tests/helpers/env.ts 的 K9 清单）
       ARTIFACT_STORE_DIR: 'C:\\Temp\\vca-artifacts-fixture',
       ARTIFACT_MAX_UPLOAD_BYTES: '4194304',
-      // P1 / Task 2 新增（同上清单）
-      ARTIFACT_MASTER_KEY: 'a'.repeat(64),
+      // P1 / Task 2 新增（同上清单）。修复轮 1 起环境面是**密钥环** `ARTIFACT_KEYS`
+      // （JSON `{keyId: base64(32 字节)}`），不再是单个 `ARTIFACT_MASTER_KEY`。
+      ARTIFACT_KEYS: '{"v1":"q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s="}',
       ARTIFACT_ACTIVE_KEY_ID: 'v1',
     });
     expect(parsed.TRUST_PROXY).toBe(DEFAULT_TRUST_PROXY);

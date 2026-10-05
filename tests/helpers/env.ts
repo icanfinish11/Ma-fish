@@ -31,6 +31,13 @@
  *
  * 新增必填变量时这五处都要改；漏改的表现是那些文件里的断言变红（快速失败，不会静默放行）。
  *
+ * **修复轮 1 的 K9 复核（R5/R6，据实记载）**：这一轮改动的不是「新增」而是**替换**——
+ * `MASTER_ENCRYPTION_KEY` 与 `ARTIFACT_MASTER_KEY` **被删除**，改成一个 `ARTIFACT_KEYS`
+ * （JSON 映射）。上面五处**逐一改过**，并且额外核对了「删掉一个变量」这种方向：
+ * 只要五处里漏掉一处，那一处的用例会立刻变红（例如 `bootstrap-guard.test.ts` 的
+ * `REQUIRED_KEYS` 里若留着已删除的键名，那条「缺任意一个都不许启动」的用例就会失败）。
+ * 「删变量」比「加变量」更容易漏，因为它不会在**本文件**里露出来，只会让别的套件红。
+ *
  * ## 为什么这不削弱 fail-fast（C10）
  *
  * 这里只影响**测试进程**的输入；开发/生产引导期照旧拒绝缺失与占位密钥。
@@ -127,7 +134,11 @@ export const testEnv = Object.freeze({
   NODE_ENV: 'test',
   DATABASE_URL: 'postgresql://app_user:test_pw@127.0.0.1:5432/vca_test',
   REDIS_URL: 'redis://127.0.0.1:6379',
-  MASTER_ENCRYPTION_KEY: 'ab'.repeat(32),
+  // `MASTER_ENCRYPTION_KEY` 曾在这里（`'ab'.repeat(32)`）。**已删除**（修复轮 1 / R6）：
+  // 它被校验却全仓无读取方。删掉它的证据不只是「schema 里没有了」，还包括**这里也删了**——
+  // zod 的对象 schema 对多余键**静默忽略**，因此留着一行已删除的变量**不会让任何用例变红**，
+  // 只会让「本文件 = 一份完整合法 env」这句话变得不准确（它多了一个不起作用的变量）。
+  // 这类「无害的残留」正是本文件开头 K9 那段要防的东西。
   // `TRUST_PROXY` 有默认值（`loopback`），登记在这里是为了让「一份完整合法 env」这件事
   // 在三处夹具里保持一致（见文件头 K9；生产引导读的也是同一个变量）。
   TRUST_PROXY: 'loopback',
@@ -149,9 +160,16 @@ export const testEnv = Object.freeze({
   ARTIFACT_STORE_DIR: artifactRoot,
   ARTIFACT_MAX_UPLOAD_BYTES: '4194304',
   // ── P1 / Task 2 起 ────────────────────────────────────────────────────────────
-  // 制品主密钥与写入 keyId。**一次性的测试值，绝不是密钥**（本文件按定义是公开的）。
-  // MASTER_ENCRYPTION_KEY 用的是 `'ab'.repeat(32)`，这里刻意换一个前缀，
-  // 免得「把两个密钥弄混」这种错误在测试里看不出来。
-  ARTIFACT_MASTER_KEY: 'cd'.repeat(32),
-  ARTIFACT_ACTIVE_KEY_ID: 'v1',
+  // 制品密钥环与写入 keyId。**一次性的测试值，绝不是密钥**（本文件按定义是公开的）。
+  //
+  // 形状由修复轮 1 的 R5 改成**映射**：`{keyId: base64(32 字节)}`。上一版是单个
+  // `ARTIFACT_MASTER_KEY`（hex），它让环里只能装一个键 ⇒ 轮换在部署层不可达。
+  // 这里刻意放**两把**：`v1`（已退役）与 `v2`（活动），于是「已退役但仍在环中的 keyId
+  // 依然可读」这条路径在测试里天然可达——Task 3 的轮换用例正需要它。
+  //
+  // 注意 `ARTIFACT_KEYS` 是 **JSON 文本**，`as const` 只是类型层面的只读，运行期仍是字符串。
+  // 这两把密钥与上一版的两个 hex 值没有继承关系（形状变了，逐字改 hex 没有意义），
+  // 因此这里用的是 `'ab'.repeat(32)` / `'cd'.repeat(32)` 这两个可辨认的字节模式的 base64。
+  ARTIFACT_KEYS: '{"v1":"q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=","v2":"zc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0="}',
+  ARTIFACT_ACTIVE_KEY_ID: 'v2',
 } as const satisfies Partial<NodeJS.ProcessEnv>);

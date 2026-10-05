@@ -158,12 +158,25 @@ nonce           12 字节 = noncePrefix(4, 每文件随机) || 块序号(8, 大�
                 **禁止**「固定前缀 + 从 0 开始计数器」跨文件复用（GCM 下 nonce 重用泄露明文异或）
 AAD             `${fileId}:${position}:${isLast ? 'last' : 'more'}`（UTF-8）
                 fileId 为 16 字节随机，十六进制表示
-文件头（定长 48 + keyId）
-  magic(4)="VCA1" | formatVersion(2)=1 | keyIdLen(1) | keyId(N) |
-  fileId(16) | chunkSize(4) | plaintextLength(8) | chunkCount(8) | noncePrefix(4)
-块索引（每块定长 24 字节，紧随头部）
-  offset(8) | ciphertextLength(4) | tagOffset 由 ciphertextLength 推出 | 保留(12)
+
+物理排布（**必须可单趟顺序写出**，Task 1 的 putStream 只能从 0 追加）
+  [ 文件头 47 字节 ]   只放流结束**之前**就已知的字段：
+                       magic(4)="VCA1" | formatVersion(2)=1 | keyIdLen(1) | keyId(N) |
+                       fileId(16) | chunkSize(4) | noncePrefix(4)
+  [ 块数据 ... ]       逐块 ciphertext||tag(16)，顺序追加
+  [ 块索引 ... ]       每块 24 字节：
+                       offset(8, **文件绝对偏移**) | ciphertextLength(4, **不含 tag**) |
+                       记录自称序号(8, 大端) | 保留(4, 全零)
+  [ 尾部 24 字节 ]     indexOffset(8) | chunkCount(8) | plaintextLength(8)  ← 恒为文件最后 24 字节
 ```
+
+> **R3 裁定（2026-10-05）**：原计划的 `[头][索引][数据]` **物理上不可产出**——头里含流结束后才知道的总量，而索引排在数据之前。故 `plaintextLength`/`chunkCount` 移入尾部，索引移到数据之后，读取端先读最后 24 字节定位索引。这同时让「只解密尾部若干块」（Task 3）与 zip 中央目录读取（Task 4）更自然。
+>
+> **R2 裁定**：索引里的**记录自称序号**仅供**比对**，**绝不用于推导 nonce 或 AAD**（那正是预检发现的重排漏洞）。没有这个字段，C20 的校验、Task 3 的错误信息与变异探针都没有数据来源。
+>
+> **R1**：头部定长是 **47** 字节（4+2+1+16+4+8+8+4 的相加是错的旧稿；新布局下为 4+2+1+N+16+4+4 = 31+N）。
+> **R4**：0 字节输入 ⇒ `chunkCount = 0`、`plaintextLength = 0`。
+> **R5**：环境面为**键环** `ARTIFACT_KEYS`（JSON `{keyId: base64(32B)}`）+ `ARTIFACT_ACTIVE_KEY_ID`，且引导期校验 active ∈ keys。**R6**：删除无读取方的 `MASTER_ENCRYPTION_KEY`。
 
 **Interfaces:**
 ```ts
@@ -232,10 +245,18 @@ export class ChunkDecipher {
   - [ ] 篡改第 N 块密文 → 抛错且**点名 chunk N**。
   - [ ] **调换两条记录（含各自的 nonce 与 tag）→ 必须被拒**，错误信息点出「位置 P 处的记录自称序号 Q」。
   - [ ] 截断末块 → 被拒（末块 `isLast` 标记使然）。
-  - [ ] 未知 `keyId` → 抛错且**不回退**。
+  - [ ] 未知 `keyId` → 抛错且**不回退**；**已退役但仍在环中的 keyId → 能正常解密**（R5 的轮换路径）。
+- [ ] **Step 3b: 三条完整性校验（**Task 2 复审认定的必要充分条件，缺一不可**）**
+  头部的总量字段**不在任何 AAD 里**，因此「改小 `chunkCount` + 删掉末尾整块」这类截断只能靠读取端校验发现。`isLast` 只挡「不满的末块」那一类。
+  - [ ] `chunkCount === 索引中实际存在的记录数`
+  - [ ] `chunkCount === ceil(plaintextLength / chunkSize)`
+  - [ ] `Σ ciphertextLength === plaintextLength`
+
+  > ⚠️ **前两条合起来仍不充分**：3 块的制品截成 2 块、并把 `chunkCount` 改成 2、`plaintextLength` 改成 16 MiB，前两条都满足。**充分性来自第三条**（对实际存在的记录求和）。三条都要有用例。
 - [ ] **Step 4:** 变异探针：把序号改回「取自记录自称」（即去掉位置校验）⇒ **「调换记录」用例必须变红**。若不变红，说明用例没有真正覆盖 C20。
-- [ ] **Step 5:** `random-access-reader.ts` 适配 `yauzl.RandomAccessReader` 的抽象接口（`_readStreamForRange`/`read`/`ref`/`unref`/`close`），只解密所需块；测试覆盖「读尾部 4 字节只解密最后一块」。
-- [ ] **Step 6:** 跑三项门禁。
+- [ ] **Step 5:** `random-access-reader.ts` 适配 `yauzl.RandomAccessReader` 的抽象接口（`_readStreamForRange`/`read`/`ref`/`unref`/`close`），只解密所需块。**读取尾部 24 字节定位索引时，只应解密最后一块**（`getRange(key, size-24, size-1)`）。
+- [ ] **Step 6:** **读取端必须校验索引自身**：`offset` 单调递增、各区间落在 `[0, indexOffset)` 内、且与文件长度自洽（写入端的 `decodeIndex` 有意不做这些检查，它们属于读取端）。
+- [ ] **Step 7:** 跑三项门禁。
 
 **Acceptance:**
 - 四个契约用例全部通过，且 Step 4 的变异能让「调换记录」用例变红。

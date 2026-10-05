@@ -4,33 +4,40 @@ import {
   CHUNK_SIZE,
   FILE_ID_BYTES,
   FORMAT_VERSION,
-  INDEX_ENTRY_SIZE,
   NONCE_PREFIX_BYTES,
-  TAG_BYTES,
+  blockDataOffset,
   buildAad,
   deriveNonce,
+  encodeFooter,
   encodeIndex,
-  headerByteLength,
+  type ArtifactFooter,
   type ArtifactHeader,
   type IndexEntry,
 } from './artifact-format.js';
 import type { KeyRing } from './key-ring.js';
 
 /**
- * 流式分块加密器（P1 / Task 2，规格 D2/D3/D4/D5）。
+ * 流式分块加密器（P1 / Task 2，规格 D2/D3/D4/D5 + 控制器裁定 R2/R3）。
  *
  * ## 它产出什么（跨任务契约，Task 3 与 Task 5 都按这条读）
  *
  * - `transform()` 产出的是**块数据字节流**：逐块 `ciphertext || tag(16)`，
- *   不含文件头、不含块索引；
- * - `result()` 在流**成功结束之后**给出 `{ header, index }`，两者是最终制品里
- *   `[头][索引][块数据]` 的前两段。
+ *   不含文件头、不含块索引、不含尾部；
+ * - `result()` 在流**成功结束之后**给出 `{ header, index, footer, blockDataOffset }`。
  *
- * 因此「把三段拼成一个对象」是**写入方（Task 5）的事**。这不是实现取舍，而是格式的
- * 结构性后果：头里带着 `plaintextLength` / `chunkCount`（流结束才知道），
- * 而格式要求头排在块数据**之前**，所以单趟前向写一个顺序目标流**不可能**同时满足两者。
- * `ArtifactStore.putStream` 今天没有「按偏移改写」或「追加」的能力，Task 5 必须选一条路
- * （预留区 + 回填 / 先写密文再二次过 / 给存储端口加写偏移），已记入报告的 Concerns。
+ * 完整制品的字节序（R3）是：
+ *
+ * ```
+ * [ header ][ 块数据 = transform() 的整段输出 ][ index ][ footer ]
+ * ```
+ *
+ * **写入方（Task 5）的组装顺序因此是 `header ‖ 流 ‖ index ‖ footer`**——`footer` 必须最后写。
+ * 这不是实现取舍，而是格式的结构性后果：`plaintextLength` / `chunkCount` 只在流结束后才知道，
+ * 它们必须排在数据之后（尾部），才能让整份制品**单趟顺序写出**。
+ *
+ * 上一版（初稿排布 `[头][索引][数据]`）做不到这一点：索引排在数据之前，而索引里的 `offset`
+ * 依赖最终块数 ⇒ `result()` 只能**编造**一个「索引排在最前」的偏移，写入方无论怎么写都对不上。
+ * 现在块数据紧随定长头，`offset` 在**发射那一刻**就是真实绝对偏移（见下）。
  *
  * ## 为什么必须「押后一块」（hold-back）
  *
@@ -58,6 +65,9 @@ import type { KeyRing } from './key-ring.js';
  *
  * 本类只写。它不实现解密、不做位置序号校验（C20 是读取端的契约）——但它**承重**：
  * 位置进 nonce、`isLast` 进 AAD、`keyId` 进头部，这三件事写错，读取端无论怎么写都对不上。
+ *
+ * 索引里的**自称序号**（{@link IndexEntry.index}）由本类按**发射位置**填写：它是写给读取端
+ * 比对用的（R2），本类自己从不读它，更不用它推导 nonce/AAD。
  */
 export class ChunkEncryptor {
   private readonly keyId: string;
@@ -79,14 +89,31 @@ export class ChunkEncryptor {
   private readonly state: {
     /** 已喂入的明文总字节数（只有流成功结束之后它才是最终值）。 */
     plaintextLength: bigint;
+    /**
+     * 已发射的块数据字节数（含每块 tag）。它是**索引起点**的事实来源：
+     * 索引排在所有块数据之后，因此 `indexOffset = blockDataOffset() + emittedBytes`。
+     *
+     * 初稿里没有这个量——那时偏移靠「最终块数 × 索引长度」倒推，也就是说
+     * `result()` 必须**假设**索引排在最前。R3 之后索引排在最后，倒推不再成立，
+     * 而发射期累积出的这个数是真的：第一块发射时它的值是 0。
+     */
+    emittedBytes: number;
     /** 每块的**明文**长度，发射顺序。索引里的 `ciphertextLength` 就是它（不含 tag）。 */
     blockLengths: number[];
+    /**
+     * 索引记录，**发射顺序**累积，偏移在发射那一刻就是真实绝对偏移。
+     *
+     * 它与 `blockLengths` 有重叠，但不是同一件事：`blockLengths` 是长度的账，
+     * `entries` 是**格式**的账（带绝对偏移与自称序号）。初稿靠 `result()` 里一次遍历
+     * 把长度换算成偏移，那时偏移依赖最终块数；现在两条账各自在发射期成立。
+     */
+    entries: IndexEntry[];
     /** 流是否**成功**结束。未结束或出错时为 false，`result()` 据此拒绝出结果。 */
     finished: boolean;
-  } = { plaintextLength: 0n, blockLengths: [], finished: false };
+  } = { plaintextLength: 0n, emittedBytes: 0, blockLengths: [], entries: [], finished: false };
 
   private transformTaken = false;
-  private cached?: { header: ArtifactHeader; index: Buffer };
+  private cached?: EncryptedArtifact;
 
   /**
    * @param keyRing 密钥环。构造期就会 `keyFor(activeKeyId())` —— **取不到活动键立刻抛错**，
@@ -108,6 +135,16 @@ export class ChunkEncryptor {
     this.fileId = randomBytes(FILE_ID_BYTES);
     // 每文件随机的 4 字节前缀：跨文件 nonce 唯一性**只**靠它（规格 D4）。
     this.noncePrefix = randomBytes(NONCE_PREFIX_BYTES);
+  }
+
+  /**
+   * 块数据在最终制品里的绝对起始偏移。
+   *
+   * 只依赖 keyId 长度（因为索引与尾部都排在数据**之后**，见 R3），所以构造之后就是确定值，
+   * 不必等流结束——`transform()` 正是靠它给每条索引记录填**真实**绝对偏移。
+   */
+  blockDataOffset(): number {
+    return blockDataOffset(Buffer.byteLength(this.keyId, 'utf8'));
   }
 
   /**
@@ -140,6 +177,7 @@ export class ChunkEncryptor {
     let filling: Buffer = Buffer.allocUnsafe(chunkSize);
     let filled = 0;
     let position = 0;
+    const dataStart = this.blockDataOffset();
 
     /** 加密一块并按记录（密文 + tag）发射。**唯一**决定 nonce/AAD 的地方。 */
     const emit = (out: Transform, block: Buffer, isLast: boolean): void => {
@@ -148,11 +186,21 @@ export class ChunkEncryptor {
       const ciphertext = cipher.update(block);
       cipher.final(); // GCM 的 final() 不产出字节，但 getAuthTag() 必须在它之后调用
       const tag = cipher.getAuthTag();
+      const record = Buffer.concat([ciphertext, tag]);
+      // 索引记录在这里就拿到了三个真实值：**绝对偏移**、不含 tag 的长度、自称序号。
+      // 序号写的是 `position`（发射顺序 = 真实位置），**不是**给本类自己用的：
+      // nonce/AAD 已经在上面用 `position` 算完了，这个字段只留给读取端比对（R2）。
+      state.entries.push({
+        offset: BigInt(dataStart + state.emittedBytes),
+        ciphertextLength: block.length,
+        index: BigInt(position),
+      });
+      state.emittedBytes += record.length;
       state.blockLengths.push(block.length);
       position += 1;
       // 一次 push 一条记录：字节流顺序不变，而「记录边界」对下游可观察
       // （存储层只数字节，但读取器按块读，边界一致更不容易出错）。
-      out.push(Buffer.concat([ciphertext, tag]));
+      out.push(record);
     };
 
     return new Transform({
@@ -203,47 +251,67 @@ export class ChunkEncryptor {
   }
 
   /**
-   * 流**成功结束之后**的最终结果：文件头与块索引。
+   * 流**成功结束之后**的最终结果：文件头、块索引、尾部，以及块数据的绝对起点。
    *
    * 未结束（或流以错误结束）时**抛错**：此时 `plaintextLength` / `chunkCount` 都不是最终值，
-   * 报出去的头会让调用方写下一份「自称 N 块、实际只有 M 块」的制品——那是截断，不是结果。
+   * 报出去的尾部会让调用方写下一份「自称 N 块、实际只有 M 块」的制品——那是截断，不是结果。
    *
    * 头里的 `fileId` / `noncePrefix` 是**本对象持有的那两个**缓冲（重复调用返回同一份）。
    * 这与「不可信输入」无关：它们由本对象生成，而不是从外部读入；
    * `encodeHeader` 会把它们拷进编码结果，因此调用方即使改写也不会污染制品。
    */
-  result(): { header: ArtifactHeader; index: Buffer } {
+  result(): EncryptedArtifact {
     if (!this.state.finished) {
       throw new Error(
         'ChunkEncryptor.result() 在流尚未成功结束前被调用：plaintextLength / chunkCount 此时不是最终值',
       );
     }
     if (this.cached === undefined) {
-      const keyIdBytes = Buffer.byteLength(this.keyId, 'utf8');
-      const blockLengths = this.state.blockLengths;
-      const chunkCount = BigInt(blockLengths.length);
-      // 块数据的起点 = 头 + 整份索引。索引长度**依赖最终的块数**，
-      // 所以 offset 只能在这里算——发射时算不出来（那时还不知道后面有几块）。
-      let offset = BigInt(headerByteLength(keyIdBytes) + blockLengths.length * INDEX_ENTRY_SIZE);
-      const entries: IndexEntry[] = blockLengths.map((plaintextBytes) => {
-        const entry: IndexEntry = { offset, ciphertextLength: plaintextBytes };
-        offset += BigInt(plaintextBytes + TAG_BYTES);
-        return entry;
-      });
+      const header: ArtifactHeader = {
+        formatVersion: FORMAT_VERSION,
+        keyId: this.keyId,
+        fileId: this.fileId,
+        chunkSize: this.chunkSize,
+        noncePrefix: this.noncePrefix,
+      };
+      // 索引排在**所有块数据之后**（R3）：它的起点 = 块数据区起点 + 已发射字节数。
+      // 两个加数都在发射期就成真，所以这里没有任何「按最终块数倒推」的假设。
+      const indexOffset = BigInt(this.blockDataOffset() + this.state.emittedBytes);
+      const footer: ArtifactFooter = {
+        indexOffset,
+        chunkCount: BigInt(this.state.blockLengths.length),
+        plaintextLength: this.state.plaintextLength,
+      };
 
       this.cached = {
-        header: {
-          formatVersion: FORMAT_VERSION,
-          keyId: this.keyId,
-          fileId: this.fileId,
-          chunkSize: this.chunkSize,
-          plaintextLength: this.state.plaintextLength,
-          chunkCount,
-          noncePrefix: this.noncePrefix,
-        },
-        index: encodeIndex(entries),
+        header,
+        index: encodeIndex(this.state.entries),
+        footer: encodeFooter(footer),
+        /**
+         * 尾部的**字段形态**，与 `footer` 是同一份事实的两种表示。
+         *
+         * 为什么两个都给：`footer` 是写入方要 append 的**字节**（它只需要字节），
+         * 而调用方与测试常常要问「这份制品自称多少字节 / 多少块」——为此去
+         * `decodeFooter(footer)` 是绕一圈拿自己刚放进去的东西，且一旦两边不一致
+         * 就会掩盖错误。两个字段都由同一个 `footer` 对象派生，不可能不一致。
+         */
+        footerFields: footer,
+        blockDataOffset: this.blockDataOffset(),
       };
     }
     return this.cached;
   }
+}
+
+/** `result()` 的返回形状（见类注释里的制品字节序）。 */
+export interface EncryptedArtifact {
+  header: ArtifactHeader;
+  /** 块索引：`chunkCount * 24` 字节。要写在**所有块数据之后**。 */
+  index: Buffer;
+  /** 尾部：恒为 **24 字节**，且必须是整份制品的最后 24 字节。 */
+  footer: Buffer;
+  /** 尾部的字段形态（`footer` 解码后的样子）。与 `footer` 由同一个对象派生，不可能不一致。 */
+  footerFields: ArtifactFooter;
+  /** 块数据（= `transform()` 的整段输出）在制品里的绝对起始偏移。 */
+  blockDataOffset: number;
 }
