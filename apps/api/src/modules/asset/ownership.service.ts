@@ -36,9 +36,12 @@ import { PrismaService } from '../../db/prisma.service.js';
  *
  * ## 刻意**没有**做的几件事（都不是遗漏）
  *
- * - **没有「转给自己」的短路**：设计没有规定这个情形。今天的行为是照字面执行
- *   （`ownerId` 写回同一个值 + 追加一行 `X→X`）。要不要拒绝它是一次产品裁定，
- *   不是实现者能替设计决定的——**据实记载**在报告里（Concerns）。
+ * - **「转给自己」在源头被拒**（控制器裁定；修复轮 1 从「据实记载」改成「实现」）。
+ *   照字面执行会写下 `ownerId` 写回同一个值 + 一行 `X→X`，而那一行**永久的**：
+ *   这张表的 `UPDATE`/`DELETE` 在运行时角色下被 `REVOKE`（判据 10），库里没有任何
+ *   清理入口，因此一行 `X→X` 删不掉、也永远不再改变。它承载的信息是零——append-only
+ *   的代价只有在「写进去的每一行都有意义」时才付得起。拒绝的形态是
+ *   {@link SelfTransferRejectedError}（领域错误，与 {@link AssetNotFoundError} 同类）。
  * - **没有权限判定**：`checkAccess` 是 `asset` 模块**唯一**的授权入口（D11），
  *   那是 Task 8 的交付。本服务假定调用方已经判过。
  * - **没有审计**：审计的写入路径有且只有一条（`AuditService`），而「转让要不要写审计」
@@ -55,6 +58,7 @@ export class OwnershipService {
    * 把作品转让给另一个用户：指针变更 + 追加一行所有权史，**同一事务**。
    *
    * @throws {AssetNotFoundError} 作品不存在（**不**创建、**不**追加历史行）。
+   * @throws {SelfTransferRejectedError} 新所有人就是当前所有人（**不**写历史行、**不**改指针）。
    */
   async transferOwnership(input: TransferOwnershipInput): Promise<OwnershipTransferResult> {
     return this.prisma.$transaction(async (tx) => {
@@ -66,6 +70,15 @@ export class OwnershipService {
       const current = locked[0];
       if (current === undefined) throw new AssetNotFoundError(input.assetId);
       const fromUserId = current.owner_id;
+
+      // ①′ 「转给自己」在**任何写之前**被拒。顺序是刻意的：先读行、再判自转。
+      //     反过来（先判自转）会让一条 `assetId` 不存在的调用拿到「转给自己」这个错误，
+      //     而正确的说法是「作品不存在」——而且那样连作品存在与否都不用查就能返回，
+      //     成了一条不需要鉴权的探测口。
+      //     拒绝的后果由用例实测：没有历史行、指针未变（一行 `X→X` 写下去就删不掉了）。
+      if (input.toUserId === fromUserId) {
+        throw new SelfTransferRejectedError(input.assetId, fromUserId);
+      }
 
       // ② 指针变更。用 `update`（不是 `updateMany`）：主键在上一句里已经被锁住，
       //    所以它必然命中一行；命中不了的话那就是「锁读与更新之间被删了」，
@@ -128,5 +141,24 @@ export class AssetNotFoundError extends Error {
   constructor(readonly assetId: string) {
     super(`作品不存在：${assetId}`);
     this.name = 'AssetNotFoundError';
+  }
+}
+
+/**
+ * 「转给自己」被拒（`toUserId` === 当前所有人）。
+ *
+ * 领域错误，与 {@link AssetNotFoundError} 同类但**不同因**：这次不是调用方指错了对象，
+ * 而是这次转让本身不成立——它会在 append-only 的历史里留下一行永远删不掉的 `X→X`。
+ * 分开的理由与 `AssetNotFoundError` 那一段完全相同：HTTP 边界要能分开说清责任方
+ * （404 还是 409/422），而把两种情况混成一个错误类型会让那次翻译只能靠猜。
+ */
+export class SelfTransferRejectedError extends Error {
+  constructor(
+    readonly assetId: string,
+    /** 既是当前所有人、也是被指定的新所有人（那个重复的 UUID）。 */
+    readonly userId: string,
+  ) {
+    super(`拒绝对作品 ${assetId} 的转给自己：${userId} 已经是当前所有人`);
+    this.name = 'SelfTransferRejectedError';
   }
 }

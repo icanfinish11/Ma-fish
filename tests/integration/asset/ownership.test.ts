@@ -13,7 +13,11 @@ import { PrismaService } from '@vca/api/db/prisma.service.js';
 import { AuditService } from '@vca/api/modules/audit/index.js';
 import { AssetService } from '@vca/api/modules/asset/asset.service.js';
 import { AssetVersionService } from '@vca/api/modules/asset/asset-version.service.js';
-import { AssetNotFoundError, OwnershipService } from '@vca/api/modules/asset/ownership.service.js';
+import {
+  AssetNotFoundError,
+  OwnershipService,
+  SelfTransferRejectedError,
+} from '@vca/api/modules/asset/ownership.service.js';
 import { createKeyRing, type KeyRing } from '@vca/api/modules/asset/crypto/key-ring.js';
 import { parseMetadata } from '@vca/api/modules/asset/metadata/parse-metadata.js';
 import { LocalArtifactStore } from '@vca/api/modules/asset/store/local-artifact.store.js';
@@ -474,6 +478,55 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
     expect(thrown).toBeInstanceOf(AssetNotFoundError);
     expect((thrown as AssetNotFoundError).assetId).toBe(ghost);
     await expect(prisma.ownershipHistory.count({ where: { assetId: ghost } })).resolves.toBe(0);
+  });
+
+  /**
+   * **转给自己必须被拒**（控制器裁定；修复轮 1 / Critical 1）。
+   *
+   * ## 为什么必须在**源头**拒，而不是「照字面执行」
+   *
+   * 一次「转给自己」照旧实现会写下一行 `X→X`：`ownerId` 写回同一个值，历史里多一条
+   * 什么都不表示的行。而这张**删不掉**——`UPDATE`/`DELETE` 在运行时角色下被 `REVOKE`
+   * （判据 10），库里也没有任何清理入口。也就是说，一行 `X→X` 是**永久**的，
+   * 而它承载的信息是零。append-only 的代价只有在「写进去的每一行都有意义」时才付得起。
+   *
+   * ## 判据有两半，缺一不可
+   *
+   * 1. 抛出**领域错误**（不是数据库错误、不是静默成功）：`SelfTransferRejectedError`。
+   * 2. **负后果真的没发生**：没有历史行被写下、`ownerId` 一个字都没变。
+   *    只断言「抛错了」是不够的——一个「先写历史再抛错」的实现在那半边照样绿。
+   *
+   * 这条用例在**拒绝分支被拿掉**时必然红（探针 m9 实测）：没有守卫时它会以
+   * 「历史行被写下来了」失败。
+   */
+  it('转给自己 ⇒ SelfTransferRejectedError，且没有写下任何历史行、所有人未变', async () => {
+    const alice = randomUUID();
+    const asset = await prisma.asset.create({ data: { ownerId: alice } });
+
+    let thrown: unknown;
+    try {
+      await ownership.transferOwnership({ assetId: asset.id, toUserId: alice, reason: '转给自己' });
+    } catch (err: unknown) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(SelfTransferRejectedError);
+    expect((thrown as SelfTransferRejectedError).assetId).toBe(asset.id);
+    expect((thrown as SelfTransferRejectedError).userId).toBe(alice);
+    expect((thrown as Error).message).toContain('转给自己');
+
+    // 负后果的两半：没有历史行（那一行删不掉，因此这一条是**永久性**的判据），
+    // 且指针未变（若实现先改指针再抛错，这里会红）。
+    await expect(prisma.ownershipHistory.count({ where: { assetId: asset.id } })).resolves.toBe(0);
+    await expect(prisma.asset.findUniqueOrThrow({ where: { id: asset.id } })).resolves.toMatchObject({
+      ownerId: alice,
+    });
+
+    // 反面对照：同一个作品转让给**别人**照旧成功（否则上面两句在「怎么都抛」的实现上也绿）。
+    const to = randomUUID();
+    const ok = await ownership.transferOwnership({ assetId: asset.id, toUserId: to, reason: '正常转让' });
+    expect(ok.fromUserId).toBe(alice);
+    await expect(prisma.ownershipHistory.count({ where: { assetId: asset.id } })).resolves.toBe(1);
   });
 
   it('同一事务：历史写不进去时指针**也没有变**（不是半个转让）', async () => {
