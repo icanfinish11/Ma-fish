@@ -21,8 +21,24 @@ import { LocalArtifactStore } from '@vca/api/modules/asset/store/local-artifact.
 import { EncryptedArtifactReader } from '@vca/api/modules/asset/store/random-access-reader.js';
 
 /**
- * 文件清单里出现的辅助函数（`ingestVersion` / `objectPath` / `listObjects` / `sha256`）
- * 都定义在本文件上半部分，三节共用。
+ * 作品 / 版本 / 元数据 / 所有权历史（P1 / Task 7；设计决定 D11 + D12）。
+ *
+ * ## 这个文件问的三件事（分三节，各自独立）
+ *
+ * 1. **`asset` schema 的迁移真的落地了吗**——逐列断言形状（C5 的 schema 归属、C6 的
+ *    `timestamptz(3)`、C4 的 UUIDv7 主键）。这一节**不**碰任何业务方法，它只问
+ *    「迁移在真库上造成了什么」，因为那是本任务唯一一件「跑一次就永久生效」的事。
+ * 2. **Task 5 的接入记录真的能落库吗**——`storageKey` 与 `plaintextBytes` 必须由
+ *    `IngestedVersion` 逐字段写进 `asset_versions`（brief 的 Step 1b，Task 5 §12 的移交义务）。
+ *    判据不是「列存在」，而是「**真实接入流程**产出的那个数出现在那一行里」。
+ * 3. **所有权转让**——`Asset.ownerId` 变更 + 一行 `OwnershipHistory`，**同一事务**；
+ *    制品**字节与键完全未变**（§5.2 第 2 条：制品只存一份，转让不解密、不复制）。
+ *
+ * ## 为什么必须真库
+ *
+ * 三节的判据全是 PostgreSQL 自身的语义：列类型与时区精度、Prisma 客户端的 UUIDv7 生成、
+ * 交互式事务的提交/回滚、行锁的排队语义、以及（`tests/integration/db/append-only.test.ts`
+ * 那一半）角色 ACL。替身能证明的只有「我的假对象说了算」。
  */
 
 /** `ok.zip` 的字节（八样本表里那个「合法」样本，见 fixtures/archives/generate.ts）。 */
@@ -250,26 +266,8 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
     await rm(storeDir, { recursive: true, force: true });
   });
 
-  /** 走一遍真实的接入流程，返回**待落库**的那条记录与它的元数据。 */
-  async function ingest(): Promise<{
-    assetId: string;
-    ownerId: string;
-    ingested: Awaited<ReturnType<AssetService['finalize']>>;
-    metadata: Awaited<ReturnType<typeof parseMetadata>>;
-    plaintext: Buffer;
-  }> {
-    const seeded = await ingestVersion(prisma, assets, store);
-    return {
-      assetId: seeded.assetId,
-      ownerId: seeded.ownerId,
-      ingested: seeded.ingested,
-      metadata: seeded.metadata,
-      plaintext: seeded.plaintext,
-    };
-  }
-
   it('storageKey 与 plaintextBytes 逐字段落库，且明文长度是**写入侧量出来**的那个数', async () => {
-    const { assetId, ingested, metadata, plaintext } = await ingest();
+    const { assetId, ingested, metadata, plaintext } = await ingestVersion(prisma, assets, store);
 
     const persisted = await versions.persistIngested({ assetId, ingested, metadata });
 
@@ -299,7 +297,7 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
   });
 
   it('Task 6 的六个元数据字段逐字段落库（JSONB 存的是整份结构）', async () => {
-    const { assetId, ingested, metadata } = await ingest();
+    const { assetId, ingested, metadata } = await ingestVersion(prisma, assets, store);
 
     const persisted = await versions.persistIngested({ assetId, ingested, metadata });
     const row = await prisma.assetMetadata.findUniqueOrThrow({ where: { assetVersionId: persisted.assetVersionId } });
@@ -322,7 +320,7 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
   });
 
   it('版本与元数据**同一事务**：元数据写不进去时版本也不留行', async () => {
-    const { assetId, ingested, metadata } = await ingest();
+    const { assetId, ingested, metadata } = await ingestVersion(prisma, assets, store);
     // 注入一个真实的失败：把运行时角色的 INSERT 权限收掉（属主身份操作，随后恢复）。
     await owner.query(`REVOKE INSERT ON asset.asset_metadata FROM app_user`);
     let thrown: unknown;
