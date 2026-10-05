@@ -70,11 +70,12 @@ import { LocalArtifactStore } from './store/local-artifact.store.js';
           ARTIFACT_ACTIVE_KEY_ID: config.get('ARTIFACT_ACTIVE_KEY_ID', { infer: true }),
         }),
     },
-    // 加密即入库的接入服务：`putStream`（落盘的是密文）+ `finalize`（校验）+ `delete`（清理）。
+    // 加密即入库的接入服务：`putStream`（落盘的是密文）+ `finalize`（校验）+ `delete`（清理），
+    // 以及 **Task 9 起** 的 `ingest`（校验 → 元数据 → 落库的那条完整链路，控制器调的就是它）。
     AssetService,
-    // 接入记录与元数据的落库（Task 7）：`AssetService` 那一半产出**待落库**的记录，
-    // 这一半把它写进 `asset` schema。两者都在本模块里提供，注入方（Task 8 的接入路径）
-    // 因此拿到的必然是同一对实例。
+    // 接入记录与元数据的落库（Task 7）：`AssetService.ingest` 的第三步把它写进 `asset` schema。
+    // 两者都在本模块里提供，注入方因此拿到的必然是同一对实例——`AssetService` 的第四个
+    // 构造参数就是它（Task 9 接上的那一条线）。
     AssetVersionService,
     // 所有权转让（Task 7）：指针 + 一行 append-only 历史，同一事务，**不碰制品**。
     OwnershipService,
