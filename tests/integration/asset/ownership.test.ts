@@ -366,11 +366,17 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
    * （`migration.sql` 的 `"plaintext_bytes" INTEGER NOT NULL`），因此见证也必须落在库里：
    * 这条语句绕过模型，直接问 PostgreSQL 答不答应。
    *
-   * ## 为什么插入在事务里、且断言行数没变
+   * ## 为什么插入在事务里、且断言行数没变（**以及这两句的边界**，修复轮 2 按实测改写）
    *
-   * 判据必须包含「什么都没留下」：**若**在某次改动里这条 `INSERT` 真的成功了（= 约束没了），
-   * 事务结束时回滚，库里不会多出一行没有长度的版本；而计数断言会在那一刻把这件事说清楚
-   * （否则探针红了、库里却留下一行脏数据，下一个用例的失败原因会被带偏）。
+   * 判据要包含「什么都没留下」。**此前这里写的是「事务结束时回滚」——那句话是错的**：
+   * 一条语句**成功**并不会让交互式事务回滚（只有失败或显式回滚才会）。探针 m10 的日志
+   * 就是反证：把迁移里那个 `NOT NULL` 拿掉之后，这条 raw 语句以「返回 1 行」结束，
+   * 也就是一次**真正的提交**，库里确实多了一行没有长度的版本。
+   *
+   * 因此下面两句计数断言的判别力要说清楚：它们见证的是**绿路径**上的回滚
+   * （`INSERT` 抛错 ⇒ 整个交互式事务回滚 ⇒ 一行不留）；而约束真被撤掉时它们**走不到**
+   * ——上面那句 `toBeInstanceOf` 会先红、用例随即中止（m10 的日志正是这个形状）。
+   * 「约束没了会留下脏数据」这件事，因此是由**探针**（返回 1 行）而不是这两句断言的。
    */
   it('未知明文长度的版本行写不进去：plaintext_bytes 的 NOT NULL 由数据库拒绝（23502）', async () => {
     const ownerId = randomUUID();
@@ -415,7 +421,8 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
     const sqlState = raw.meta?.driverAdapterError?.cause?.originalCode;
     if (sqlState !== undefined) expect(sqlState).toBe('23502');
 
-    // 负后果：一行都没有留下（成功的分支已在事务里回滚）。
+    // 负后果：一行都没有留下。**绿路径**上它是回滚的直接见证（那条 `INSERT` 抛错 ⇒
+    // 整个交互式事务回滚）；约束真被撤掉时它走不到（上一句断言先红）——见本用例上面那段。
     await expect(prisma.assetVersion.count()).resolves.toBe(before);
     await expect(prisma.assetVersion.count({ where: { assetId: asset.id } })).resolves.toBe(0);
   });
@@ -625,14 +632,20 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
    * （判据 10），库里也没有任何清理入口。也就是说，一行 `X→X` 是**永久**的，
    * 而它承载的信息是零。append-only 的代价只有在「写进去的每一行都有意义」时才付得起。
    *
-   * ## 判据有两半，缺一不可
+   * ## 判据有两半，但两半的判别力**不相同**（修复轮 2 按实测改写）
    *
-   * 1. 抛出**领域错误**（不是数据库错误、不是静默成功）：`SelfTransferRejectedError`。
-   * 2. **负后果真的没发生**：没有历史行被写下、`ownerId` 一个字都没变。
-   *    只断言「抛错了」是不够的——一个「先写历史再抛错」的实现在那半边照样绿。
+   * 1. **抛出领域错误**（不是数据库错误、不是静默成功）：`SelfTransferRejectedError`。
+   *    这一半是**被计分**的——探针 m9（把守卫整块拿掉）实测 `1 failed | 12 passed`，
+   *    失败信息是 `expected undefined to be an instance of SelfTransferRejectedError`，
+   *    落点就在下面第一句断言上。
+   * 2. **负后果**（没有历史行、`ownerId` 未变）：这一半钉的是守卫的**位置**——
+   *    它在**任何写之前**。据实记载它的可证伪性：事务内的「先写再抛」会整体回滚，
+   *    读起来与「没写」逐字相同，因此**今天没有任何探针**能把它单独打红；
+   *    它防的是另一类改动（某天有人把这次写挪出事务、改成嵌套事务或提前提交），
+   *    那时「没有历史行」会红，而 `ownerId` 那一句仍然不会——见下面 `ownerId` 那条注释。
    *
-   * 这条用例在**拒绝分支被拿掉**时必然红（探针 m9 实测）：没有守卫时它会以
-   * 「历史行被写下来了」失败。
+   * 上一条（大写拼写）与这一条问的**不是**同一件事：这里给的是逐字相同的字符串，
+   * 它在「直接比较字符串」的实现下也绿；那里给的是同一个取值的另一种拼写。
    */
   it('转给自己 ⇒ SelfTransferRejectedError，且没有写下任何历史行、所有人未变', async () => {
     const alice = randomUUID();
@@ -650,18 +663,72 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
     expect((thrown as SelfTransferRejectedError).userId).toBe(alice);
     expect((thrown as Error).message).toContain('转给自己');
 
-    // 负后果的两半：没有历史行（那一行删不掉，因此这一条是**永久性**的判据），
-    // 且指针未变（若实现先改指针再抛错，这里会红）。
+    /**
+     * 负后果的两半。**它们钉的是「守卫在任何写之前」这个位置**，但两句的可证伪性并不相同
+     * （修复轮 2 的据实记载，替换掉此前那句错误的「先改指针再抛错，这里会红」——
+     * 自转写的是**同一个** `ownerId`，写与不写读回来逐字相同，在事务内还是事务外都一样）：
+     *
+     * - **没有历史行**：只有当某次改动让这次写**逃出事务**（换成 `this.prisma`、嵌套事务、
+     *   提前提交）时才可能变红；今天没有探针能把它单独打红。
+     * - **指针未变**：这条对自转路径在**构造上就不可证伪**——同一个取值写回去，读回来
+     *   与没写过完全一致。它是**意图文档**，不是一条被计分的判据；真正承重的是上面那句
+     *   `instanceof`（探针 m9 见证）。
+     */
     await expect(prisma.ownershipHistory.count({ where: { assetId: asset.id } })).resolves.toBe(0);
     await expect(prisma.asset.findUniqueOrThrow({ where: { id: asset.id } })).resolves.toMatchObject({
       ownerId: alice,
     });
 
-    // 反面对照：同一个作品转让给**别人**照旧成功（否则上面两句在「怎么都抛」的实现上也绿）。
+    // 反面对照：同一个作品转让给**别人**照旧成功（否则上面两句在「怎么都抛」的实现上也红）。
     const to = randomUUID();
     const ok = await ownership.transferOwnership({ assetId: asset.id, toUserId: to, reason: '正常转让' });
     expect(ok.fromUserId).toBe(alice);
     await expect(prisma.ownershipHistory.count({ where: { assetId: asset.id } })).resolves.toBe(1);
+  });
+
+  /**
+   * **同一个取值的另一种拼写**：大写 UUID 也必须被自转守卫拦下（修复轮 2 / Critical）。
+   *
+   * ## 为什么这是一条独立的判据（而不是上一条的重复）
+   *
+   * 上一条给的是**逐字相同**的字符串，于是它在两种实现下都绿：一种比较「规范化之后的取值」，
+   * 另一种直接比较两个字符串。而 PostgreSQL 的 `uuid` 列会把取值规范成**小写**存进去，
+   * 从库里读回来的 `owner_id` 因此必然是小写——一个**大写拼写的当前所有人**是
+   * 「同一个取值、不同的字符串」。直接比较字符串的实现会认为这是一次「转给别人」：
+   * 守卫被跳过，`ownerId` 被写回同一个值，历史里落下一行 `X→X`。
+   *
+   * 而那一行是**永久**的（`UPDATE`/`DELETE` 在运行时角色下被 `REVOKE`，判据 10），
+   * 正是这条守卫存在的全部理由——一次合法的输入拼写就足以把它绕过去。
+   *
+   * 判据与上一条同形：领域错误 + 一行历史都没写下。**判别力**由探针 m1 给出
+   * （把 `toLowerCase()` 去掉 ⇒ 本用例红，上一条照旧绿）。
+   */
+  it('转给自己（大写拼写的 UUID）⇒ 同样被拒，且没有写下 X→X 历史行', async () => {
+    const alice = randomUUID();
+    const asset = await prisma.asset.create({ data: { ownerId: alice } });
+
+    const upper = alice.toUpperCase();
+    // 自检：这必须真的是「另一种拼写」。全是数字的 UUID（概率约 1e-7）会让本用例变成
+    // 上一条的复制品——那时这条断言会**响亮地**失败，而不是静默地失去判别力。
+    expect(upper, '大写之后没有变化：本用例没有测到「另一种拼写」').not.toBe(alice);
+    expect(upper.toLowerCase()).toBe(alice);
+
+    let thrown: unknown;
+    try {
+      await ownership.transferOwnership({ assetId: asset.id, toUserId: upper, reason: '转给自己（大写拼写）' });
+    } catch (err: unknown) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(SelfTransferRejectedError);
+    // 错误里带的是**规范化之后**的取值（= 从库里读出来的那个），不是调用方给的那串拼写。
+    expect((thrown as SelfTransferRejectedError).userId).toBe(alice);
+
+    // 负后果：那一行 `X→X` **没有**被写下，指针也没有被写过。
+    await expect(prisma.ownershipHistory.count({ where: { assetId: asset.id } })).resolves.toBe(0);
+    await expect(prisma.asset.findUniqueOrThrow({ where: { id: asset.id } })).resolves.toMatchObject({
+      ownerId: alice,
+    });
   });
 
   it('同一事务：历史写不进去时指针**也没有变**（不是半个转让）', async () => {
