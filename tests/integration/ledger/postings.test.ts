@@ -539,14 +539,16 @@ describe('过账：LedgerService.post（C25 / C26 / C28 / D9 / D10）', () => {
     expect(await prisma.ledgerAccount.count({ where: { kind: ACCOUNT_KINDS.PLATFORM_ESCROW, ownerUserId: null } })).toBe(1);
   });
 
-  it('readBalances：没有账户行 = 余额 0（D2），且 UUID 的大小写不敏感', async () => {
+  it('readBalances：没有账户行 = 余额 0（D2），且大写拼写同样读得到余额', async () => {
     expect(await ledger.readBalances(prisma, uuidv7())).toEqual({ available: 0n, frozen: 0n });
     expect(USER_ACCOUNT_KINDS).toEqual(['USER_AVAILABLE', 'USER_FROZEN']);
     expect(escrow.kind).toBe(ACCOUNT_KINDS.PLATFORM_ESCROW);
 
-    // ★ 大小写这条是 `readBalances` 里 `.toLowerCase()` 的**唯一**见证：
-    //   库里存的是小写，而大写拼写与那一行**不相等**（P1 的 `ownership.service` 在这里踩过），
-    //   于是「余额 10000」会静默变成「余额 0」——一个不会报错、只会算错的缺陷。
+    // ★ 大小写这一条是**契约断言**，不是 `readBalances` 里 `.toLowerCase()` 的见证：
+    //   探针 **p19**（把那句 `.toLowerCase()` 删掉）跑出来**一条都不红**——`owner_user_id`
+    //   的类型是 `uuid`，PostgreSQL 在输入时就把大小写归一化了，`'ABC…'` 与 `'abc…'`
+    //   在库里本来就是同一个值。它钉住的是**对外契约**（大写拼写必须读得到余额，
+    //   而不是静默读成 0），那是调用方真正会遇到的那种错。
     const userId = uuidv7();
     await prisma.$transaction((tx) =>
       ledger.post(tx, {
