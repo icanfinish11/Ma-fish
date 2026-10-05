@@ -31,14 +31,22 @@ describe('每模块独占 schema（C5）', () => {
    * 对一个空 schema 是静默授予零个对象，不报错——所以只能靠这条断言兜住。
    * `public` 里唯一允许存在的是 Prisma 自己的迁移台账 `_prisma_migrations`。
    */
-  it('五张业务表各归其模块 schema，且 public 里没有业务表（C5）', async () => {
+  it('九张业务表各归其模块 schema，且 public 里没有业务表（C5）', async () => {
     const r = await owner.query(
       `SELECT table_schema, table_name
          FROM information_schema.tables
-        WHERE table_schema IN ('auth','audit','notify','public')
+        WHERE table_schema IN ('auth','audit','notify','asset','public')
         ORDER BY table_schema, table_name`,
     );
+    // `asset` 的四张表（P1 Task 7 / D12）与 P0 的五张一起被**精确**断言：新模块的 schema
+    // 归属因此不是「题外话」——把它写进 `public` 或写进 `auth`（Prisma 忘了 `@@schema`）
+    // 会让这里红，而那种失误在引导期**不会**报错（`GRANT ... ON ALL TABLES IN SCHEMA
+    // asset` 对一个空 schema 是静默授予零个对象）。
     expect(r.rows.map((x) => `${x.table_schema}.${x.table_name}`)).toEqual([
+      'asset.asset_metadata',
+      'asset.asset_versions',
+      'asset.assets',
+      'asset.ownership_history',
       'audit.audit_logs',
       'auth.identities',
       'auth.users',
