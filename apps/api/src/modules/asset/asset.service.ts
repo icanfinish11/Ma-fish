@@ -263,8 +263,8 @@ export class AssetService {
     }
 
     const failure = lastError instanceof Error ? lastError : new Error(String(lastError));
-    // 审计里只放**结构化、可检索**的三样：尝试次数、错误名、错误码。
-    // **不**放原始消息：它可能带着制品卷的文件系统路径，而审计行是 append-only 的
+    // 审计里只放**结构化、可检索**的量：尝试次数、错误名、错误码，以及一个**有界的**
+    // 理由分类。**不**放原始消息：它可能带着制品卷的文件系统路径，而审计行是 append-only 的
     // （写进去就删不掉），路径不该因此永久留档（C11 的精神：只记非机密、必要的量）。
     let auditFailure: string | null = null;
     try {
@@ -276,6 +276,9 @@ export class AssetService {
           attempts: CLEANUP_ATTEMPTS,
           errorName: failure.name,
           errorCode: (failure as { code?: unknown }).code ?? null,
+          // 失败的**类别**（有界取值，见 `cleanupFailureClass`）。`errorCode` 只覆盖
+          // 带 `code` 的错误，而「为什么删不掉」正是运维与将来那个清理 worker 要分流的东西。
+          reasonClass: cleanupFailureClass(failure),
         },
       });
     } catch (error) {
@@ -301,6 +304,36 @@ const CLEANUP_ATTEMPTS = 3;
 
 /** 每次重试之间的基准退避（毫秒），按尝试序号线性放大。 */
 const CLEANUP_RETRY_DELAY_MS = 25;
+
+/**
+ * 「这个对象为什么删不掉」的**有界分类**（写进审计行的 `reasonClass`）。
+ *
+ * ## 为什么不是「把错误名记下来就够了」
+ *
+ * 审计行是 append-only 的：写进去就删不掉（`infra/db/apply-grants.sql`）。因此那一列**不能**
+ * 是原始消息（可能带制品卷路径），也不能是**无界**的取值空间——否则「按理由分流」这件事
+ * 会在数据层退化成「一行一个值」。这里给出三个有界取值：
+ *
+ * - 错误对象上的 `code`（`EACCES` / `EBUSY` / `ENOSPC` / `EIO`…）：`node:fs` 的错误都带它，
+ *   而这正是本地卷上「删不掉」的全部现实理由；
+ * - 网络型存储将来会把 HTTP 状态码放在 `status`/`statusCode` 上 ⇒ 归一成 `http:<状态码>`；
+ * - 其余一律 `Error`。**刻意不返回 `error.name`**：那可以是任何自定义名字，取值空间无界，
+ *   而 `errorName` 那一列已经如实地记着它了。
+ *
+ * 今天唯一的调用点是 {@link AssetService.delete} 的失败分支（C16：不提前抽象），
+ * 用例通过「注入带 `code` 的失败」把它钉住（`ingest.test.ts` 的删除失败处置组）。
+ */
+function cleanupFailureClass(error: Error): string {
+  const code = (error as { code?: unknown }).code;
+  if (typeof code === 'string' && /^[A-Za-z0-9_.-]{1,32}$/.test(code)) return code;
+
+  const status = (error as { status?: unknown }).status ?? (error as { statusCode?: unknown }).statusCode;
+  if (typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599) {
+    return `http:${String(status)}`;
+  }
+
+  return 'Error';
+}
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
