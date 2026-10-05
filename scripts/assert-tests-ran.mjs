@@ -73,6 +73,18 @@ const GATES = {
   // 才有「被静默删掉就会红」的性质。下限随之对齐到实际执行数：68 → 85。
   security: 85,
   architecture: 5,
+  // P2 / Task 1：**判决 1 的病根就是这里**——设计 §8.3 的「≥10 万次属性测试」此前
+  // 没有任何执行者：`tests/property/` 不存在、`test:property` 带 `--passWithNoTests`
+  // （空 project 实测 exit 0）、CI 里 `property` 零匹配、本文件的 GATES 只有
+  // security/architecture 两项。于是「资金系统唯一真正可靠的验证方式」是一句
+  // 写在规格里的话。这条下限让它无法再静默停止运行：
+  // 「文件被改名 / 被删空 / project 名写错 / 用例被 skip」都会红。
+  // 数字与当前实际执行条数对齐（本文件的既定规矩）：新增属性用例时必须一起上调。
+  //
+  // 8 = 五条 100k-runs 金额属性 + 一条预算下限断言 + 一条 2^53 用例
+  //     + 一条 `@fast-check/vitest` 接线用例（预检 §G.5）。
+  //     实测值来自 `node scripts/assert-tests-ran.mjs property` 的输出，不是预测。
+  property: 8,
 };
 
 /** vitest 自己的 JS 入口（读它 `package.json` 里声明的 `bin.vitest`，不猜路径）。 */

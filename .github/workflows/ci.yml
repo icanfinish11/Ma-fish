@@ -107,6 +107,30 @@ jobs:
             exit 1
           fi
 
+      # P2 / Task 1：手写 DDL（延迟约束触发器 / 条件化 CHECK）不在 Prisma 的模型里，
+      # 因此「迁移被谁改过」只能靠 migrate diff 的**退出码**看。这一步必须在数据库引导
+      # （migrate deploy + apply-grants）之后——它比的是**库**与**模型**，不是文件。
+      #
+      # ⚠️ 这条门证明的**只有**「Prisma 建模的东西（表/列/索引/外键）与库一致」。
+      # 它**看不见**函数、约束触发器与 CHECK —— Task 1 实测：库里挂着手写的
+      # plpgsql 函数 + DEFERRABLE 约束触发器 + CHECK 时，它照样报 `No difference detected.`
+      # 因此**不要**把它当成手写 DDL 的见证；手写对象的存在性由 Task 4 的真库断言
+      # （`pg_get_constraintdef` / `pg_trigger` 查询 + 行为用例）负责。
+      # 完整实测（含另一条：`ledger` 不在 `datasource.schemas` 里时这条门对它结构性失明）
+      # 见 docs/superpowers/notes/2026-10-06-p2-migration-drift.md。
+      #
+      # 退出码：prisma 的语义是「空=0 / 出错=1 / 非空=2」，但**经 pnpm 调用时 2 被包成 1**
+      # （Task 1 实测：stderr 写着 `Command failed with exit code 2`，而 pnpm 自己退 1）。
+      # 对本步的通过/不通过没有影响，但注释不要写成「非空=2」。
+      #
+      # Task 4 前置条件：`ledger` 必须已经进了 `datasource db` 的 `schemas` 数组
+      # （加三个 model 时本来就要加，否则 Prisma 根本不管理 `ledger`）。两者必须在同一个
+      # 提交里，否则这条门在 ledger 上是绿的**且看不见任何东西**。
+      - name: 迁移零漂移（Prisma 建模面与库一致）
+        env:
+          MIGRATE_DATABASE_URL: postgresql://vca_owner:owner_pw@127.0.0.1:5432/vca
+        run: pnpm --filter @vca/api exec prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
+
       # ── 测试 ──
       #
       # `unit` **必须整跑，不要加 `-t parseEnv` 之类的过滤**。
@@ -121,6 +145,17 @@ jobs:
       # 那条例用**不在** `-t parseEnv` 的匹配范围内，所以这里整跑 unit project。
       - name: 单元测试（含 C10 引导期 fail-fast 接线）
         run: pnpm vitest run --project unit
+
+      # P2 / Task 1（预检判决 1 的修复）：设计 §8.3/§13.3 把「≥10 万次随机操作的属性测试」
+      # 写成验收判据，而此前 CI 里**没有**这一步、`property` project 也**没有任何用例**——
+      # 一条今天没有执行者的验收判据等于不存在。它现在走与 security/architecture 同一条门
+      # （json reporter 读**实际执行条数**并要求不低于登记的下限），因此
+      # 「文件被改名 / 用例被 skip / project 名写错」都会红，而不是静默跳过。
+      #
+      # 为什么不能只写 `pnpm test:property`：那个脚本带 `--passWithNoTests`（为本地开发留的），
+      # 实测**空 project 退出 0**——门在这一刻是空的却报成功。这道区别 Task 1 有双向取证。
+      - name: 属性测试（金额契约 + 五条不变式的预算；≥10 万次随机操作，§8.3/§13.3）
+        run: node scripts/assert-tests-ran.mjs property
 
       # Ruling 3：安全与架构两个 project 必须**自证不是空的**。
       # 直接 `vitest run --project X` 时，一个测试文件都没匹配到会让 vitest 自己失败；
