@@ -304,7 +304,14 @@ describe('架构守护（C5 / 验收 13.4）', () => {
     // `modules/<other>/index.ts`。两个 index 因此成了「平台层与 worker 唯一的合法入口」：
     // 它们若没被巡航到（被 exclude 吃掉、或路径写错），放行条款就无从判断，
     // 而规则会以「到不了任何目标」的形式恒绿——今天必须点名把它们钉住。
-    const named = ['apps/api/src/modules/notify/index.ts', 'apps/api/src/modules/audit/index.ts'];
+    //
+    // Task 8 加入 `asset` 的 index：它是本任务的交付物之一（Step 7：只导出模块与门面），
+    // 而它与前两个同款——被规则**放行**的那个文件必须在场，否则「放行」无从判断。
+    const named = [
+      'apps/api/src/modules/notify/index.ts',
+      'apps/api/src/modules/audit/index.ts',
+      'apps/api/src/modules/asset/index.ts',
+    ];
     const notCruised = named.filter((source) => !sources.includes(source));
     expect(
       notCruised,
@@ -531,6 +538,10 @@ const COMPOSITION_ROOT = 'apps/api/src/app.module.ts';
  */
 const RULE_SCOPE_SUBJECTS: ReadonlyArray<readonly [string, string]> = [
   ['模块之间（modules/<X>/ 的内部文件）', 'apps/api/src/modules/auth/auth.service.ts'],
+  // Task 8 新增：`asset` 模块是第一个**带子目录**的功能模块（download/ / crypto/ / store/ …），
+  // 它必须与别的模块受同一条规则约束。这一行是「`asset` 被规则覆盖」这件事的常驻判据
+  // （任务 brief 的 Step 8 与验收里的「`asset` 模块被规则覆盖」）。
+  ['模块之间（带子目录的模块：asset）', 'apps/api/src/modules/asset/download/download.service.ts'],
   ['平台层（db）', 'apps/api/src/db/redis.module.ts'],
   ['平台层（common）', 'apps/api/src/common/security/security.module.ts'],
   ['apps/api/src 下的顶层文件（组合根那一层）', 'apps/api/src/bootstrap.ts'],

@@ -79,12 +79,23 @@ describe('引导期 fail-fast 接线（app.module → ConfigModule → validate�
   const REQUIRED_KEYS = [
     'DATABASE_URL',
     'REDIS_URL',
-    'MASTER_ENCRYPTION_KEY',
     'GITHUB_CLIENT_ID',
     'GITHUB_CLIENT_SECRET',
     'GITHUB_CALLBACK_URL',
     'SMTP_URL',
     'MAIL_FROM',
+    // P1 / Task 1：制品卷与上传上限都是必填（无默认值），缺一个也不许启动。
+    'ARTIFACT_STORE_DIR',
+    'ARTIFACT_MAX_UPLOAD_BYTES',
+    // P1 / Task 2：制品密钥环与写入 keyId 同样必填（D5：缺当前写入键 ⇒ 拒绝）。
+    // `MASTER_ENCRYPTION_KEY` 与 `ARTIFACT_MASTER_KEY` **已删除**（修复轮 1 的 R6/R5）：
+    // 前者必填却全仓无读取方，后者被 `ARTIFACT_KEYS` 取代。留在这里会让本用例在
+    // 「app.module 求值期报错」那一步就失败——因为删一个不存在的变量之后，
+    // 环境里仍然缺 `ARTIFACT_KEYS`，而下面那条断言要求报错点名 `ARTIFACT_KEYS`。
+    'ARTIFACT_KEYS',
+    'ARTIFACT_ACTIVE_KEY_ID',
+    // P1 / Task 8：下载票据的 HMAC 密钥（D10）。它必填、无默认值 ⇒ 缺它同样不许启动。
+    'DOWNLOAD_URL_SECRET',
   ] as const;
 
   it('必填密钥全部缺失时，求值 app.module 会拒绝启动', async () => {
@@ -123,7 +134,7 @@ describe('引导期 fail-fast 接线（app.module → ConfigModule → validate�
     expect(reason).toBeInstanceOf(Error);
     const message = reason instanceof Error ? reason.message : String(reason);
     expect(message).toContain('环境变量校验失败，服务拒绝启动');
-    for (const key of ['MASTER_ENCRYPTION_KEY', 'GITHUB_CLIENT_SECRET']) {
+    for (const key of ['ARTIFACT_KEYS', 'ARTIFACT_ACTIVE_KEY_ID', 'GITHUB_CLIENT_SECRET']) {
       expect(message).toContain(key);
     }
   });

@@ -55,7 +55,23 @@ const ROOT = path.resolve(import.meta.dirname, '..');
  * 「跑了测试并全绿」这句本身承担，而它们的规模与构成会频繁变化，钉死条数只会制造噪音。
  */
 const GATES = {
-  security: 49,
+  // 修复轮 1（P1 / Task 3）：原先是 **49，而实际执行 53** —— 与上面「数字与当前实际条数对齐」
+  // 那句话不符。低的这 4 条让「静默删掉最多 4 条安全用例」不会红，正是本文件开头那段话
+  // 要防的形状。那一轮把制品完整性控制纳入 security 门
+  // （`tests/security/asset-artifact-integrity.test.ts` 6 条），并把下限**对齐到实际执行数**：49 → 59。
+  //
+  // 修复轮 1（P1 / Task 4，Ruling 3）：归档校验器**就是**设计文档威胁 #2 的控制面，而它的
+  // 八条样本判定此前只住在 `unit`（`tests/unit/asset/validate-archive.test.ts`）⇒ 把
+  // `validateArchive` 删掉、或把六个恶意样本的判据逐条去掉，**这道门照样绿**：它数的是
+  // `tests/security/` 里的用例。这一轮把那九条（八样本 + 零落盘）**搬进** security 门
+  // （`tests/security/validate-archive-samples.test.ts`，复用同一份样本生成器与构造辅助，
+  // 不是复制两份），下限随之对齐到实际执行数：59 → 68。任何删除现在都会红一次。
+  //
+  // P1 / Task 8：越权矩阵（判据 11）落在 `tests/security/asset/authz-matrix.test.ts`——17 条
+  // （4 端点 × 4 角色 + 1 条「矩阵覆盖全部已注册路由」）。**它必须进入被计数的门**：
+  // 「未授权用户拿不到签名 URL」是 P1 的三条判据之一，而这条控制在 security 的账上
+  // 才有「被静默删掉就会红」的性质。下限随之对齐到实际执行数：68 → 85。
+  security: 85,
   architecture: 5,
 };
 

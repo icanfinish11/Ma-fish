@@ -94,7 +94,8 @@ zip 的中央目录在文件**末尾**，因此**单趟前向流无法校验 zip
 
 ## 4. 仍未预检的项（计划中标注、实现时先验）
 
-- **上传路径**：NestJS 12 / Express 5 下的 multipart 流式接入与硬性大小上限（`multer` 2.4.0 的存储引擎选择）。**这是 P1 最大的未验证面**。
+- ~~**上传路径**：NestJS 12 / Express 5 下的 multipart 流式接入与硬性大小上限（`multer` 2.4.0 的存储引擎选择）。**这是 P1 最大的未验证面**。~~
+  **已由 Task 1 预检并回填，见 §6**。结论一句话：自定义 storage engine 可以真流式（不落临时文件、不整份进内存），`limits.fileSize` 回 413，但**报错前 multer 会把整个请求体读完**。
 - **签名下载 URL**：HMAC + ≤5 分钟 TTL + 单次使用（Redis）。机制常规，风险低。
 - **元数据解析**：README/文件树/语言分布/依赖，纯静态、绝不执行（C2）。风险低。
 
@@ -108,3 +109,189 @@ zip 的中央目录在文件**末尾**，因此**单趟前向流无法校验 zip
 4. tar 流式读取用 `'entry'` 事件 + 显式 settle-once + 销毁上游。
 5. 加密读取器**必须校验块序号与位置一致**，并有一个「调换两条记录必须被拒」的用例。
 6. 内存上界断言用未完成字节数，不用 RSS。
+
+---
+
+## 6. 上传路径预检（P1 Task 1 回填，2026-10-05）
+
+**探针**：`apps/api/.probe-t1/`（一次性，验完即删；脚本副本 `.superpowers/sdd/2026-10-05-p1-asset-artifact/evidence/t1-probe-*.mjs`，
+**必须在 `apps/api/` 下运行**——`@nestjs/*` 要从 `apps/api/node_modules` 解析）。
+**输出**：同目录 `t1-probe-*.txt`（三个探针 + 一个事件序列探针）。
+
+### 6.1 multipart 接入的真实形态（`t1-probe-multipart.txt` / `t1-probe-memory.txt`）
+
+| 问题 | 实测 |
+|---|---|
+| `FileInterceptor('file')` 默认（multer `memoryStorage`）| handler 拿到的 `file.buffer.length` **等于整份文件**（16 MiB 上传 ⇒ 16,777,216）；`arrayBuffers` 峰值增量是 body 的 **1.49–2.00 倍**。1 GB 上传在这条路径上不可能 |
+| 自定义 storage engine | `_handleFile(req, file, cb)` 拿到 busboy 的 part 流 `file.stream`；engine 在客户端**发出后 44ms** 就收到第一块（此时客户端仍在发送），落盘字节数 = 文件字节数 |
+| 未完成字节数（已发出 − 已落盘）峰值 | 1 MiB / 4 MiB / 16 MiB 三种输入分别为 129,940 / 0 / 0 字节 —— **不随输入增长**（`arrayBuffers` 读数受 GC 时机影响，同一探针里给出 1.000 / 0.937 / 0.016 三档，**不可用作判据**；验收口径必须是未完成字节数） |
+| 有没有临时文件 | 全程只有目标对象一个文件（探针直接在 engine 的 `_handleFile` 里落盘，没有中间文件） |
+
+**结论**：`memoryStorage` 会整份缓冲 ⇒ **不能**用它做 1 GB 上传；自定义 storage engine 是可用且正确的形态，**不需要自己解析 multipart**。
+
+### 6.2 硬性大小上限（`t1-probe-cap.txt` / `t1-probe-cap-sequence.txt`）
+
+| 问题 | 实测 |
+|---|---|
+| 触发的是哪种错误 | `MulterError: LIMIT_FILE_SIZE`（`limits.fileSize`） |
+| 能不能映射成 413 | **能**：Nest `FileInterceptor` 的 `transformException` 把它翻成 `PayloadTooLargeException`，实测响应 `{"statusCode":413,...}`；**handler 不被调用** |
+| 超限时引擎收到多少字节 | 恰好 `limit + 1` 字节（multer 给 busboy 传的是 `fileSize + 1`），且引擎回调**报告成功** —— 盘上是一份**被截断的对象** |
+| 谁负责清理 | multer **会**调 `_removeFile`（带上引擎返回的键）；探针里把 `_removeFile` 写成空操作 ⇒ **残留**（`residue=["obj-0.bin"]`）。引擎自己报错时 multer **不再**调 `_removeFile`（事件序列探针实测），清理责任回到写入端 |
+| 报错前是否读完请求体 | **是**。413 到达客户端时，客户端已确认写出**全部** 524,422 字节（`done(err)` 里先 `drainStream(req)` + `req.resume()` 再 `next(err)`，为避免 EPIPE） |
+| 只留存储层上限（去掉 `limits.fileSize`） | 客户端拿到的是 **500**，不是 413：存储层中止会 destroy 上游 part 流，`process.nextTick` 上的流错误先于 promise 链到达 multer，`errorOccured` 已被置位，后续的 `HttpException` 被忽略 ⇒ **「把 ArtifactTooLargeError 翻成 413」是一段不可达代码**（Task 1 写了又删，变异探针 IMP2a/IMP2b 为证） |
+
+### 6.3 busboy 自解析（**未取得可复现测量**，据实记载）
+
+`busboy@1.6.0` 的 API 与 §6.1 相符（`Busboy({ headers, limits })`、`'file'`/`'limit'` 事件），
+自解析**机制上**可以避免 6.2 的 drain（自己决定何时响应、何时停止读入）。
+探针 `t1-probe-busboy-vs-multer.mjs` 的 multer 对照组复现了 drain（524,422 / 524,422），
+但 busboy 组在服务器提前结束连接时**反复卡住**（客户端 `ECONNRESET` / 响应未达，探针超时），
+**没有拿到可复现的数字**。因此本计划**不**以「自解析能省带宽」为依据；要采用它必须先补一个能稳定跑完的探针。
+
+### 6.4 由预检得出的、必须写进实现的约束（Task 1 已落地）
+
+1. 上传走**自定义 storage engine** + `putStream`（边收边写），**绝不** `memoryStorage`、**绝不**临时文件（C21 结构性成立）。
+2. HTTP 层 `limits.fileSize` 与存储层 `maxBytes` 取**同一个**配置值；413 只能由 HTTP 层产生。
+3. 超限/中止**两条清理路径都要实现**（写入端自己删 + `_removeFile` 按键删），「无残留」不得依赖任何一条单独成立。
+4. `limits.fileSize` 的**代价是带宽**：超限上传仍会被完整读入（6.2 第 5 行）。真正的第一层限制在 Nginx（§3.1），应用层这道只保证「不落库、不残留」。
+5. **P0 骨架的一个缺口（Task 1 暴露并修复）**：`packages/shared` 当时只导出 `./src/index.ts`，Node 22 的类型剥离会加载它、却解析不了其中的 `./ids.js` ⇒ 任何**构建产物**里的 `import '@vca/shared'` 都让进程崩在 `ERR_MODULE_NOT_FOUND`（实测：`tests/unit/bootstrap.test.ts` 的子进程用例）。修法：shared 补 `build`，exports 改成 `types/node/default` 三档（与 `apps/api` 同款），`apps/api` 的 build 先构建 shared。**P1 后续任务凡在运行期用到 shared 的值，都依赖这一步。**
+
+---
+
+## 7. 8 MiB 真实块大小复验（P1 Task 2 回填，2026-10-05）
+
+**目的**：§2 的全部机制断言是**用 64 KiB 块**跑出来的（为了快速迭代），而生产块大小是 8 MiB。
+「机制与块大小无关」是一个**假设**，本节把它变成实测。结论：**机制成立，但有三处只有提到真实块大小才看得见的差异**。
+
+**探针**：`.superpowers/sdd/2026-10-05-p1-asset-artifact/evidence/t2-probe-crypto-8mib.mjs`（先验，一次性）+ `t2-probe-impl-memory.mjs`（实现完成后的实现级测量）。
+**输出**：同目录 `t2-probe-crypto-8mib.txt`（第二版；第一版 `…-v1.txt` 的采样点写错了，见 7.3）、`t2-probe-impl-memory.txt`。
+
+### 7.1 §2 的机制断言在 8 MiB 下**逐条复现**（`t2-probe-crypto-8mib.txt`）
+
+| 检查 | 8 MiB 块下的实测 |
+|---|---|
+| 往返一致（3 块 + 1234 字节 = 25,167,058 字节） | true，加密 25.4ms |
+| 每块密文长度 = 明文长度 + 16（tag 追加在尾部） | true（末块密文 1234，tag 均 16） |
+| 篡改任一块密文 | 拒绝（`chunk 1 认证失败`） |
+| **重排两块（信任记录自称序号）** | **认证通过=true 且明文被重排=true** —— §2.1 的缺陷在真实块大小下**一样复现** |
+| 重排（序号取自读取位置） | 拒绝（`位置 0 处的记录自称序号 1`） |
+| 截断末块 | 拒绝（`chunk 2 认证失败`） |
+| 每块 nonce 唯一 | 4/4 |
+| 跨文件 nonce 无重用 / 相同明文两次密文不同 | true / true |
+
+### 7.2 三处**只有 8 MiB 才看得见**的差异
+
+1. **攒块写法**：`Buffer.concat([acc, chunk])` 在 8 MiB 块下把 64 MiB 的吞吐从 **284 MiB/s 砍到 39 MiB/s（7.4 倍）**——每来一小块就整体拷贝一次，是 O(n²)；而在 64 KiB 块下两种写法**没有区别**（179 vs 199 MiB/s）。⇒ 实现**必须**预分配块缓冲 + `copy`。**这是「照 64 KiB 的结论写 8 MiB 的代码」会踩的第一个坑。**
+2. **缓冲/背压粒度**：8 MiB 块下每次 `push` 是 **8 MiB + 16 字节**（远超 Node 默认 `highWaterMark` 16 KiB），背压以 **8 MiB** 为粒度；64 KiB 块下是 64 KiB 粒度。⇒ 慢目标（磁盘/网络）的停顿会持续一整块的时间。
+3. **内存口径**：`rss` 在同一段代码上给出 **+32.7 / +8.0 / −33.9 MiB** 三种符号（§2.3 的结论再次确认），而「未完成字节数」稳定为 `2 × CHUNK_SIZE + 64 KiB`。⇒ 判据只能用未完成字节数。
+
+### 7.3 两次测量方法的更正（据实记载，不是「一次就对」）
+
+- **峰值未完成字节的采样点**：探针 v1 只在目标流的 `write()` 里采样，而那恰好是「一块刚被消费完、管线几乎为空」的时刻，于是**无论块多大都读到 65536**（= 源块大小）。v2 在**源每次 push 之后**也采样，才读到真实峰值（`8,454,144`）。⇒ 「内存断言必须测在对的时刻」，否则它测的是别的东西。
+- **未完成字节 vs 输入大小**：实现级测量（`t2-probe-impl-memory.txt`）为 8 / 16 / 64 / 128 MiB 输入分别给出 `8,388,608`（1 块）/ `16,777,216`（2 块）/ `16,842,752` / `16,842,752` 字节 ⇒ 峰值 = `min(块数, 2) × CHUNK_SIZE + 源块`，**从第 2 块起与输入无关**。
+
+### 7.4 §2 未覆盖、由 Task 2 首次实现并实测的六件事
+
+> **本节在 Task 2 修复轮 1（R3）之后改写过**：这里原本写的是「带头部的单趟前向写入在结构上不可能，
+> 所以 `transform()` 只出块数据、`result()` 出头与索引，怎么拼成一个对象留给 Task 5」。
+> **那个推理仍然成立**（下面第 2 条），但控制器随后裁定的 R3 用**尾部**把它解决了——
+> 「待 Task 5 选一条组装路径」这句话已经过期。保留原文的推理、补上裁决与实测，
+> 免得后来人以为问题还挂着。
+
+1. **末块的 `isLast` 标记必须「押后一块」才能打对**。块填满的那一刻无法知道它是不是末块；
+   若立即按 `more` 发射，**明文长度恰好是块大小整数倍**的文件其末块会被标成 `more`，
+   读取端按 `last` 认证必然失败。这不是罕见边界：生产上限 1 GiB **恰好是 8 MiB 的 128 倍**，
+   即每一次顶格上传都落在这类里。实现同时持有两块缓冲，峰值仍是 `2 × CHUNK_SIZE + 源块`。
+2. **「头里带着流结束才知道的总量」与「单趟顺序写」互斥**。初稿把 `plaintextLength` /
+   `chunkCount` 放在头里、索引排在数据之前（`[头][索引][数据]`），而 Task 1 的 `putStream`
+   只能从 0 追加、没有按偏移回填的能力 ⇒ **那个排布物理上产不出来**，而不是「难写」。
+   当时的实现因此只能让 `transform()` 出块数据、`result()` 出头与索引，把「怎么拼成一个对象」
+   留给 Task 5。
+3. **R3 的裁决（2026-10-05）：把总量字段移进尾部，索引移到数据之后。** 最终排布是
+
+   ```
+   [ 头 31+N ][ 块数据 ][ 索引 ][ 尾部 24 ]
+   ```
+
+   > **本小节是当时的实测记录（历史）。** 定长头后来被两件事改过：
+   > R1（47 → 48 是笔误）与 **I3（最终全分支审查：`noncePrefix` 4 → 8，头 31+N → 35+N、
+   > `formatVersion` 1 → 2）**。**现行真值是规格 D2/D4**
+   > （`../specs/2026-10-05-p1-asset-artifact-design.md`）；下面所有 `31` 请按 `35` 读，
+   > `noncePrefix` 的宽度按 8 读。保留本小节是为了留下「为什么是这个方向」的来路。
+
+   尾部**恒为文件最后 24 字节**：`indexOffset(8) | chunkCount(8) | plaintextLength(8)`。
+   于是第 2 条那个矛盾消失了：头里只剩**流开始前就已知**的字段（`fileId` / `chunkSize` /
+   `noncePrefix` 都在构造期就有），写入端是真的一趟顺序写（头 → 逐块密文 → 索引 → 尾），
+   Task 5 **不再需要**在「预留区回填 / 二次过 / 给存储加写偏移」里挑一条。
+   读取端的方向也随之变好：**先读最后 24 字节**定位索引——这正是 Task 3 的随机访问
+   与 Task 4 的 zip 中央目录读取需要的方向。
+   - **代价（据实记载）**：定长头从 47 字节变成 **31** 字节（`4+2+1+16+4+4`）。
+     47 是「48 笔误」更正后的值（§7.5），现在它是历史值；**「47」这个数字在今天的格式里不再出现**。
+   - **实测**：`tests/unit/asset/artifact-format.test.ts` 与 `tests/unit/asset/chunk-cipher.test.ts`
+     的黄金字节与布局用例钉住新排布；把布局改回 `[头][索引][数据]` 时那两条布局用例会立刻红
+     （变异探针见 `evidence/t2-fix1-mutation-*.txt`）。
+4. **`transform()` / `result()` 的分工不变，含义变了**：`transform()` 仍然只出**块数据**；
+   `result()` 现在给出 `{ header, index, footer, footerFields, blockDataOffset }`。
+   写入方的组装顺序是 `header ‖ 流 ‖ index ‖ footer`，**尾部必须最后写**。
+5. **索引里的「记录自称序号」是 R2 补上的**（索引缺口；另一份冲突记录也独立发现了它）。
+   字节 12..19 = 8 字节大端块序号，字节 20..23 保留全零。它**只用于比对**
+   （C20 的 `record.index === position`），**绝不参与** nonce / AAD 推导——后者正是 §2.1
+   那条重排漏洞的修法。没有这个字段，C20 的校验、Task 3 的错误信息
+   （「位置 P 处的记录自称序号 Q」）与它的变异探针**都没有数据来源**。
+6. **`offset` 的新口径是「块数据紧随头部」的直接结果**：第一条记录的 `offset` 恰好等于
+   头长度（`31 + keyIdLen`），也就是 `blockDataOffset()`。它在**发射那一刻**就能算出来
+   （上一版不行：那时 offset 依赖最终块数，只能等流结束倒推）。
+
+### 7.5 与 brief 的一处算术不一致：定长头的两次更正（48 → 47 → 31）
+
+brief 写「文件头（定长 **48** + keyId）」，但它同段列出的字段宽度之和是 **47**
+（`4+2+1+16+4+8+8+4`）⇒ **48 是笔误**，第一次按 **47** 落地。
+
+修复轮 1 的 R3 把 `plaintextLength(8)` 与 `chunkCount(8)` 移入尾部，于是定长头再减 16 字节：
+`4+2+1+16+4+4 = ` **31**。实现把它做成导出常量 `HEADER_FIXED_BYTES`，
+黄金字节用例钉住 `headerByteLength(2) === 33`。
+
+**今天引用「47」的注释与文档都已一并改写**——留着一个不再出现的数字比删掉它更容易误导。
+
+### 7.6 由 Task 2 定死、Task 3 必须沿用的解释（**R3 之后已改写**）
+
+> 下表的「旧值」一列保留下来，是因为**两份冲突记录都按旧排布做过分析**——
+> 读到那些分析时要知道它们对应的是哪一个版本。
+
+| 项 | 定死的含义（R3 之后） | R3 之前的旧值 |
+|---|---|---|
+| 索引 `offset` | **相对制品文件起始**的绝对偏移；因块数据紧随头部，第一条记录 = `headerByteLength(keyIdLen)` | 同（绝对值），但第一条 = 头 + 整份索引长度 |
+| 索引 `ciphertextLength` | **不含** 16 字节 tag ⇒ `tagOffset = offset + ciphertextLength`，整条记录 = `ciphertextLength + 16`；不变式 `Σ ciphertextLength === plaintextLength` | 同 |
+| `chunkCount = 0` | 表示**空文件**（0 块、空索引），不是「一条 0 字节密文」；`chunkCount = ceil(plaintextLength / chunkSize)` | 同 |
+| 两个总量字段的位置 | **尾部**（`indexOffset \| chunkCount \| plaintextLength`，恒为最后 24 字节） | 头部 |
+| 物理排布 | `[头][块数据][索引][尾部]` —— 单趟顺序可写 | `[头][索引][块数据]` —— **单趟写不出来**（§7.4 第 2 条） |
+| 定长头 | **31** 字节（`4+2+1+16+4+4`） | 47 字节（`4+2+1+16+4+8+8+4`） |
+| 索引记录 | `offset(8) \| ciphertextLength(4) \| 自称序号(8) \| 保留(4)` = 24；自称序号**只比对**、不推导 | `offset(8) \| ciphertextLength(4) \| 保留(12)`（无序号字段） |
+| 「谁是末块」的事实来源 | 读取端按**读取顺序**判定（读尾部的 `chunkCount` 与索引条数的自洽性）；记录自称的序号只用来**比对** | 同（但那时没有可比对的字段） |
+
+---
+
+## 8. ⚠️ 更正：这些库**并没有**被安装（P1 Task 3 发现，控制器核实）
+
+**本文与 P1 计划此前都暗示 `yauzl` / `tar` / `file-type` 已可用。这是错的，是控制器自己的错误。**
+
+实测（HEAD `6af3ef7`）：
+- `pnpm-lock.yaml` 中 `yauzl` 匹配数 = **0**；`pnpm why -r yauzl` 为空。
+- `require.resolve('yauzl' | 'file-type' | 'tar' | 'busboy' | 'multer', { paths: ['apps/api/src'] })` **全部 MODULE_NOT_FOUND**。
+- `node_modules/.pnpm/` 下确实有 `yauzl@3.4.0`、`@types+yauzl@3.4.0`、`file-type@22.1.1`、`tar@7.5.22`、`tar-stream@3.2.2` 等目录，但它们是**本预检探针的残留**：探针装在 `.spike-p1/` 下，事后删了该目录并回滚了被污染的 lockfile，**`.pnpm` 存储目录却留了下来**。它们**未被链接**、不在 lockfile 中，`pnpm install --frozen-lockfile` 不会提供它们，也没有任何代码 import 得到。
+
+**教训（写给以后的预检）**：探针残留的 `.pnpm` 目录会让「依赖已安装」看起来为真。判断依赖可用性一律以 **`require.resolve`（从实际使用的包目录出发）** 为准，**不以 `node_modules/` 下存在同名目录为准**；pnpm 的隔离链接意味着**传递依赖不可从应用代码 import**。这正是 K6 类缺陷，而这次踩它的是控制器。
+
+**需要的直接依赖（尚未登记，由对应任务补）**：
+
+| 库 | 版本 | 登记到 | 用于 |
+|---|---|---|---|
+| `yauzl` | 3.4.0 | `apps/api` | zip 中央目录、`fromRandomAccessReader`（Task 3 → 4） |
+| `@types/yauzl` | 3.4.0 | `apps/api`（dev） | 同上。**注意其发布的类型缺少运行期必需的 `ref`/`unref`** |
+| `file-type` | 22.1.1 | `apps/api` | magic bytes 嗅探（Task 4） |
+| `tar` | 7.5.22 | `apps/api` | tar.gz 流式解析（Task 4）。**是 `tar`，不是 `tar-stream`** |
+
+`busboy` 与 `multer` **无需**直接登记：Task 1 经 `@nestjs/platform-express` 的 multer 自定义存储引擎已实现流式接入，并已通过测试。
+
+**控制器裁定（2026-10-05）**：Task 3 自行登记 `yauzl` + `@types/yauzl`，并使用**真实的类型**而非手抄的结构副本——手抄副本没有任何机制发现漂移，而本项目已经为「声明了但未强制」付过多次代价。Task 4 登记 `file-type` 与 `tar`。**Task 4 的 brief 必须包含一步 `pnpm install` 后的 `require.resolve` 校验**，以免同类问题再次静默通过。
+

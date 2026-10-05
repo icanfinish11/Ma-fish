@@ -21,7 +21,7 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  schemas  = ["auth", "audit", "notify"]
+  schemas  = ["auth", "audit", "notify", "asset"]
 }
 
 // ── auth ──────────────────────────────────────────────────────────
@@ -105,4 +105,152 @@ model ProcessedJob {
 
   @@schema("notify")
   @@map("processed_jobs")
+}
+
+// ── asset ── 作品 / 版本 / 元数据 / 所有权历史（P1 Task 7；设计 D11 + D12）──
+//
+// 本 schema 是 `asset` 模块**独占**的（C5）：跨模块不 join、不直写别人的表，
+// 需要别的模块的东西时走显式接口 + DTO。
+//
+// ## 为什么这几张表里**没有**指向 `auth.users` 的外键
+//
+// `owner_id` / `uploaded_by_id` / `from_user_id` / `to_user_id` 都是用户的 UUID，
+// 但它们**刻意不建**跨 schema 外键：那会在数据库层把两个模块钉在一起（删一个用户要
+// 级联到谁的哪张表、迁移顺序被另一个模块的 schema 绑住），而 C5 要的正是相反的
+// 东西——归属由调用方给出的 UUID 表达，跨模块的约束留在接口层。
+// 本 schema **内部**的外键（version → asset、metadata → version、history → asset）
+// 都建了：它们是同一个模块自己的完整性，与 C5 不冲突。
+
+/// 作品（**永久实体**，设计 §5.2 第 1 条）：有版本史与所有权史。
+/// `Asset` ≠ `Listing`（上架是可反复的状态，P2），因此这里没有价格/状态字段（C16）。
+model Asset {
+  id        String   @id @default(uuid(7)) @db.Uuid
+  /// 当前所有人。转让就是改**这一个指针**（§5.2 第 2 条），制品一个字节都不动。
+  ownerId   String   @map("owner_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  versions         AssetVersion[]
+  ownershipHistory OwnershipHistory[]
+
+  // 刻意**没有** `@@index([ownerId])`：今天没有任何查询按所有人过滤
+  // （接入期按 assetId 写、转让按主键更新、`checkAccess` 按主键读），
+  // 建一个没人用的索引是 C16 说的「为不存在的调用方预埋」。
+
+  @@schema("asset")
+  @@map("assets")
+}
+
+/// 一个版本 = 一份加密制品 + 它的身份（设计 §5.1「加密制品包」）。
+model AssetVersion {
+  id      String @id @default(uuid(7)) @db.Uuid
+  assetId String @map("asset_id") @db.Uuid
+
+  /// 明文（上传字节）的 sha256，hex。**不是**制品的摘要。
+  sha256 String
+
+  /// 制品库里的对象键。**下载路径必须靠它取对象**——P1 计划的字段清单里原本漏了它，
+  /// Task 5 发现并移交（Task 5 报告 §12 Concern 2）：没有它，版本记录指向不了任何制品。
+  storageKey String @map("storage_key")
+
+  /// **制品自称的明文长度之外的**那个数：由 Task 5 的**写入侧计量器**在加密那一趟里数出来
+  /// （`ArtifactWriteReceipt.plaintextBytes`），**不是**密文对象的字节数、也不是上传元数据。
+  ///
+  /// 为什么它是承重列而不是可选元数据：制品格式里**没有任何字段认证「制品有多长」**
+  /// （`plaintextLength` 在尾部、不进任何 AAD），所以这条核对只能靠带外的这个数。
+  /// Task 5 的探针 m6 实测：不传带外长度时，一份**更短、完全自洽**的制品被接受（201）；
+  /// 带上它就是 422。**Task 8 必须在下载路径把它作为 `expectedPlaintextLength` 传回读取器**，
+  /// 否则这条核对只在接入期有效，下载路径上「更短、完全自洽」的制品会被当成合法的。
+  ///
+  /// 类型是 `Int`（int4）而不是 `BigInt`：上限由 D6 的 1 GiB 结构性给出（远小于 int4 的
+  /// 2^31-1），且写入侧的来源本身就是一个 JS `number`——用 bigint 只会让每一处边界
+  /// 多一次 `Number()`/`BigInt()` 转换，而那是会丢精度的形状（C16：不为不存在的规模付代价）。
+  plaintextBytes Int @map("plaintext_bytes")
+
+  /// 写入时用的制品密钥 id（= 制品头里的那个）。轮换靠它选键：旧制品按自己的 keyId 仍可读。
+  keyId String @map("key_id")
+
+  /// 制品头里的 fileId（hex）。AAD 绑定它，因此它是「这份制品」的身份的一部分。
+  fileId String @map("file_id")
+
+  /// 上传人。匿名/系统导入为 NULL —— Task 5 的 `IngestedVersion.uploadedById` 就是
+  /// `string | null`，这一列的可空性是照着它来的，不是猜的。
+  uploadedById String? @map("uploaded_by_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  asset    Asset          @relation(fields: [assetId], references: [id])
+  metadata AssetMetadata?
+
+  // 同样**没有** `@@index([assetId])`：今天唯一的读法是「按版本 id 取一份」（下载路径），
+  // 那是主键。列表页出现时再加索引——那时它是被一个真实查询逼出来的。
+
+  @@schema("asset")
+  @@map("asset_versions")
+}
+
+/// 元数据（Task 6 的 `ParsedMetadata`，纯静态解析的产物；D9）。
+///
+/// `asset_version_id` **同时是主键**：一行元数据描述且只描述一个版本（1:1），
+/// 与 P0 的 `ProcessedJob` 用幂等键作主键同一条理由——它的身份就是被描述的那个对象，
+/// 再发一个代理键只会多一个「同一版本两行元数据」的可能。C4 也没有被绕过：
+/// 这个值本身就是 UUIDv7（来自 `asset_versions.id`）。
+model AssetMetadata {
+  assetVersionId String @id @map("asset_version_id") @db.Uuid
+
+  /// README 的截断摘录；没有 README 时是 NULL（「没有」与「空文件」不是同一件事，
+  /// Task 6 §3.1 有用例）。**绝不执行**其中任何内容（C2）。
+  readmeExcerpt String? @map("readme_excerpt")
+
+  /// 文件树摘要 `[{ path, bytes }]`（只有文件；深度与条目数都受限）。
+  fileTree Json @map("file_tree")
+
+  /// 语言分布 `[{ name, bytes, ratio }]`（按字节降序）。
+  languages Json
+
+  /// 依赖清单 `[{ ecosystem, name, version }]`（纯文本解析，绝不为它跑包管理器）。
+  dependencies Json
+
+  /// 完整度评分 0–100（设计 §6.2；权重可配，默认权重合计 100）。
+  completeness Int
+
+  /// 文件树是否**被截断**（深度或条目数上限）。Task 6 明说这是 brief 契约的**超集**：
+  /// 数组本身放不下这个事实，而「截断了却看不出」会让预览资料谎报项目规模。
+  fileTreeTruncated Boolean @map("file_tree_truncated")
+
+  assetVersion AssetVersion @relation(fields: [assetVersionId], references: [id])
+
+  @@schema("asset")
+  @@map("asset_metadata")
+}
+
+/// 所有权流转（**append-only**，C7 / 设计 §5.3）。
+///
+/// 运行期角色只有 `SELECT` + `INSERT`，`UPDATE`/`DELETE` 由
+/// `infra/db/apply-grants.sql` 显式撤销（**两个角色**才让它生效：属主对自己的 REVOKE 是
+/// 空操作），回归在 `tests/integration/db/append-only.test.ts`。
+/// 因此写进来的行**删不掉也改不了**——这正是所有权史的全部价值。
+model OwnershipHistory {
+  id      String @id @default(uuid(7)) @db.Uuid
+  assetId String @map("asset_id") @db.Uuid
+
+  /// 前手。**非空**：转让总是从「当前所有人」出发（`Asset.ownerId` 在同一事务里读出），
+  /// 因此这一列在任何一条转让记录上都有值。「作品诞生」不是转让，今天没有任何写入方
+  /// 写它（C16：不为一种不存在的写入形态放宽约束）。
+  fromUserId String @map("from_user_id") @db.Uuid
+
+  /// 后手。转让的判据就是它成为 `Asset.ownerId`。
+  toUserId String @map("to_user_id") @db.Uuid
+
+  /// 事由（交易所致、裁决所致、管理动作…）。**原文落库**：append-only 的行删不掉，
+  /// 因此这里只放业务事由，绝不放凭证/令牌（C11）。
+  reason String
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  asset Asset @relation(fields: [assetId], references: [id])
+
+  /// 唯一的读法是「某个作品的所有权史，按时间」，因此索引就是那个读法的形状。
+  @@index([assetId, createdAt])
+  @@schema("asset")
+  @@map("ownership_history")
 }

@@ -16,14 +16,35 @@
  * **应用侧只有这一处**：不要再往 `vitest.config.ts` 内联字面量、也不要各测试文件自行 set：
  * 那样会散成多份互相看不出关系的副本，遗漏时排查成本极高。
  *
- * **但「Task 3–9 新增必填变量只改这一处」是不准确的**，据实记载：另有两处**手写的完整
- * 合法环境**，它们刻意不 import 本文件（一处要构造非法变体、一处要显式覆写 `NODE_ENV`）：
+ * **但「新增必填变量只改这一处」是不准确的**，据实记载：另有**五处**手写的完整
+ * 合法环境（它们刻意不 import 本文件：有的要构造非法变体、有的只取 schema 做局部断言），
+ * 外加一份「必填清单」。**P1 Task 1 逐个核对过**（此前文件里写的是「另有两处」，不准），
+ * **P1 Task 8 又核对了第二次**（见下）：
  *
- * - `tests/unit/config/env.schema.test.ts` 的 `VALID`
- * - `tests/unit/config/placeholder-boundary.test.ts` 的 `VALID`
+ * 1. `tests/unit/config/env.schema.test.ts` 的 `VALID`（要构造缺字段/非法值的变体）
+ * 2. `tests/unit/config/placeholder-boundary.test.ts` 的 `VALID`（显式 `production`）
+ * 3. `tests/unit/config/placeholder-rejection.test.ts` 的 `ENV_EXAMPLE_PLACEHOLDERS`
+ *    （逐字取自 `.env.example`，含 `production` 与占位密钥）
+ * 4. `tests/security/trust-proxy.test.ts` 里 `envSchema.parse({...})` 的内联对象
+ *    （只验 `TRUST_PROXY` 的默认值与单一来源）
+ * 5. `tests/unit/config/bootstrap-guard.test.ts` 的 `REQUIRED_KEYS`
+ *    （缺任意一个都必须让引导期拒绝启动，因此**新必填变量必须加进那份清单**）
+ * 6. `tests/unit/asset/key-ring.test.ts` 的 `FULL_ENV`
+ *    （「完整合法 env」的对照，用来断言 schema 与模块两处 keyId 正则一致）
  *
- * 新增必填变量时**这三处都要改**；漏改的表现是那两个文件里的断言变红（快速失败，
- * 不会静默放行）。
+ * **据实记载（Task 8 的核对结果）**：第 6 处**此前不在上面这张清单里**——
+ * 上面那版把它漏了（Task 1 写「四处」，Task 2 加 keyId 时没有回来登记）。
+ * 它当时之所以没出事，是因为加变量时逐文件 grep 到了它；而**靠 grep 而不是靠清单**
+ * 正是这一节要防的形态。Task 8 因此把清单补齐到六处，并把 `key-ring.test.ts` 明确写进来。
+ *
+ * 新增必填变量时这六处都要改；漏改的表现是那些文件里的断言变红（快速失败，不会静默放行）。
+ *
+ * **修复轮 1 的 K9 复核（R5/R6，据实记载）**：这一轮改动的不是「新增」而是**替换**——
+ * `MASTER_ENCRYPTION_KEY` 与 `ARTIFACT_MASTER_KEY` **被删除**，改成一个 `ARTIFACT_KEYS`
+ * （JSON 映射）。上面五处**逐一改过**，并且额外核对了「删掉一个变量」这种方向：
+ * 只要五处里漏掉一处，那一处的用例会立刻变红（例如 `bootstrap-guard.test.ts` 的
+ * `REQUIRED_KEYS` 里若留着已删除的键名，那条「缺任意一个都不许启动」的用例就会失败）。
+ * 「删变量」比「加变量」更容易漏，因为它不会在**本文件**里露出来，只会让别的套件红。
  *
  * ## 为什么这不削弱 fail-fast（C10）
  *
@@ -69,13 +90,63 @@
  * 读取，从不进入应用进程，登记了反而会让「运行期拿到了属主连接串」这种事看起来合法
  * ——那正是 C7 要防的。
  */
+// 命名空间导入而不是 `import { join } from 'node:path'`：本文件会被 Vite **内联进
+// `vitest.config.ts` 的打包产物**，而那份配置自己也有一个 `path` 绑定——实测两者同名时
+// 打包产物里会留下一个未绑定的 `path`，启动直接报 `ReferenceError: path is not defined`
+// （配置连加载都失败，全部 project 都跑不起来）。用一个不会撞名的绑定即可。
+import { tmpdir } from 'node:os';
+import * as nodePath from 'node:path';
+
+/**
+ * 制品卷的**根目录**（修复轮 1 / Fix 5）。
+ *
+ * 这里只登记**根**；**每个制品套件必须在引导应用之前把它覆写成自己的子目录**，
+ * 做法是 `process.env.ARTIFACT_STORE_DIR = artifactStoreDirFor(process.env.VITEST_POOL_ID ?? process.pid)`
+ * ——`tests/integration/asset/upload-stream.test.ts` 的 `beforeAll` 就是这么做的。
+ *
+ * 理由：那个目录曾经是所有文件共用的一个固定路径，而该文件在 `beforeAll`/`beforeEach` 里
+ * `rm -rf` 它——单个消费者时看不出问题，**第二个**并发的集成文件一上来就会把第一个正在用的
+ * 对象全删掉，表现为「上传成功后读回是空」这类看不出原因的失败。
+ *
+ * 为什么**必须**覆写 `process.env`（实测两次才定位到，不是风格选择）：
+ *
+ * 1. `test.env` 是 **Vitest 主进程**求值后**序列化**分发给各 worker 的——worker 里重新
+ *    import 本文件算出的值与应用读到的那一份**可能不同**（`VITEST_POOL_ID` 只在 worker 里存在）。
+ *    实测：worker 里 `process.env.ARTIFACT_STORE_DIR` = `…vca-test-artifacts-15712`、
+ *    重新 import 本夹具 = `…vca-test-artifacts-1`（`evidence/t1-fix1-probe-store-dir.txt`）。
+ * 2. 应用侧（`LocalArtifactStore` 的工厂）只读**它启动时**的 `process.env`：
+ *    在 `beforeAll` 里 import 应用**之后**再改夹具值是没用的——实测「应用写根目录、
+ *    测试读子目录」，三条用例当场变红（`evidence/t1-fix1-diag.txt`）。
+ *    唯独「**引导之前**改 `process.env`，且**应用与测试读同一个值**」这一种形状两边一致
+ *    （`createTestApp()` 内部才 import `AppModule`，因此那次求值晚于本覆写）。
+ *
+ * 残留的已知边界（据实记载）：根目录是共享的，因此**两次同时在同机跑的**
+ * `pnpm test` 会共用它。子目录按套件隔离，所以两次运行之间仍不会互相删对象；
+ * 代价只是崩溃后的残留目录可能被另一次运行的清理顺手收掉——这不影响断言。
+ */
+const artifactRoot = nodePath.join(tmpdir(), 'vca-test-artifacts');
+
+/**
+ * 某个标识下面的制品套件目录：`<根>/<tag>`。
+ *
+ * `tag` 由调用方给出（在 worker 里取 `process.env.VITEST_POOL_ID`，
+ * 没有它时用 `process.pid`：同一个进程内仍然自洽）。
+ */
+export function artifactStoreDirFor(tag: string | number): string {
+  return nodePath.join(artifactRoot, String(tag));
+}
+
 // `as const` 只给**编译期**只读类型，运行期照样可写；`Object.freeze` 才把它真正钉死，
 // 免得某个测试顺手改写这份「唯一登记处」而污染同进程的其他用例（vitest 的 `env` 是共享的）。
 export const testEnv = Object.freeze({
   NODE_ENV: 'test',
   DATABASE_URL: 'postgresql://app_user:test_pw@127.0.0.1:5432/vca_test',
   REDIS_URL: 'redis://127.0.0.1:6379',
-  MASTER_ENCRYPTION_KEY: 'ab'.repeat(32),
+  // `MASTER_ENCRYPTION_KEY` 曾在这里（`'ab'.repeat(32)`）。**已删除**（修复轮 1 / R6）：
+  // 它被校验却全仓无读取方。删掉它的证据不只是「schema 里没有了」，还包括**这里也删了**——
+  // zod 的对象 schema 对多余键**静默忽略**，因此留着一行已删除的变量**不会让任何用例变红**，
+  // 只会让「本文件 = 一份完整合法 env」这句话变得不准确（它多了一个不起作用的变量）。
+  // 这类「无害的残留」正是本文件开头 K9 那段要防的东西。
   // `TRUST_PROXY` 有默认值（`loopback`），登记在这里是为了让「一份完整合法 env」这件事
   // 在三处夹具里保持一致（见文件头 K9；生产引导读的也是同一个变量）。
   TRUST_PROXY: 'loopback',
@@ -84,4 +155,38 @@ export const testEnv = Object.freeze({
   GITHUB_CALLBACK_URL: 'http://localhost:3000/auth/github/callback',
   MAIL_FROM: 'no-reply@example.com',
   SMTP_URL: 'smtp://127.0.0.1:1025',
+  // ── P1 / Task 1 起 ────────────────────────────────────────────────────────────
+  // 制品卷放在系统临时目录下：测试进程对仓库目录没有写权限的机器上也能跑，
+  // 且 `pnpm test` 不会在仓库里留下制品（`storage/` 虽已 gitignore，但测试不该依赖它）。
+  //
+  // 这里登记的是**根**：真正的套件目录由各套件自己用 `artifactStoreDirFor(tag)` 取
+  // （**必须**如此，见上面的实测说明——应用读的是 `process.env` 里那一份，一个进程只有一份）。
+  //
+  // 上限取 **4 MiB** 而不是生产默认的 1 GiB：任务 1 的验收里有一条「超限上传中止后无残留」，
+  // 它必须**真的**触发 `limits.fileSize`，而用 1 GiB 触发意味着每个用例都要传 >1 GiB。
+  // 这是刻意的测试期取值，不是把生产上限改小（生产的 `.env.example` 是 1 GiB）。
+  ARTIFACT_STORE_DIR: artifactRoot,
+  ARTIFACT_MAX_UPLOAD_BYTES: '4194304',
+  // ── P1 / Task 2 起 ────────────────────────────────────────────────────────────
+  // 制品密钥环与写入 keyId。**一次性的测试值，绝不是密钥**（本文件按定义是公开的）。
+  //
+  // 形状由修复轮 1 的 R5 改成**映射**：`{keyId: base64(32 字节)}`。上一版是单个
+  // `ARTIFACT_MASTER_KEY`（hex），它让环里只能装一个键 ⇒ 轮换在部署层不可达。
+  // 这里刻意放**两把**：`v1`（已退役）与 `v2`（活动），于是「已退役但仍在环中的 keyId
+  // 依然可读」这条路径在测试里天然可达——Task 3 的轮换用例正需要它。
+  //
+  // 注意 `ARTIFACT_KEYS` 是 **JSON 文本**，`as const` 只是类型层面的只读，运行期仍是字符串。
+  // 这两把密钥与上一版的两个 hex 值没有继承关系（形状变了，逐字改 hex 没有意义），
+  // 因此这里用的是 `'ab'.repeat(32)` / `'cd'.repeat(32)` 这两个可辨认的字节模式的 base64。
+  ARTIFACT_KEYS: '{"v1":"q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=","v2":"zc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0="}',
+  ARTIFACT_ACTIVE_KEY_ID: 'v2',
+  // ── P1 / Task 8 起 ────────────────────────────────────────────────────────────
+  // 下载票据的 HMAC 密钥（规格 D10）。**一次性测试值，绝不是密钥**——本文件按定义是公开的。
+  //
+  // 为什么它必须在这里（K9）：`AppModule` 在模块求值期就解析整份 env schema，因此
+  // 缺了它，**任何** `import '@vca/api'` 的测试都加载不了模块图。它是必填项、无默认值，
+  // 与 `ARTIFACT_KEYS` 同一个形状（安全参数不做「悄悄生效的默认值」）。
+  //
+  // 长度 ≥32 是为了在生产侧拦住弱密钥；测试值同样满足（否则这份夹具本身过不了 schema）。
+  DOWNLOAD_URL_SECRET: 'test-download-url-secret-0123456789abcdef',
 } as const satisfies Partial<NodeJS.ProcessEnv>);

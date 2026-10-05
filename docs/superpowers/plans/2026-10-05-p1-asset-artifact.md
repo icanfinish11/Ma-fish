@@ -43,7 +43,7 @@ vibe-coding-auction-web/
 │  │  ├─ schema.prisma                 新增 asset schema（Asset/AssetVersion/AssetMetadata/OwnershipHistory）
 │  │  └─ migrations/                   新增迁移（含 append-only 授权）
 │  └─ src/
-│     ├─ config/env.schema.ts          新增 ARTIFACT_MASTER_KEY / ARTIFACT_ACTIVE_KEY_ID / ARTIFACT_STORE_DIR
+│     ├─ config/env.schema.ts          新增 ARTIFACT_KEYS / ARTIFACT_ACTIVE_KEY_ID / ARTIFACT_STORE_DIR
 │     ├─ modules/asset/
 │     │  ├─ asset.module.ts
 │     │  ├─ index.ts                   对外最小接口（只导出 AssetModule + 门面）
@@ -146,7 +146,7 @@ export interface ArtifactStore {
 - Create: `apps/api/src/modules/asset/crypto/artifact-format.ts`
 - Create: `apps/api/src/modules/asset/crypto/key-ring.ts`
 - Create: `apps/api/src/modules/asset/crypto/chunk-cipher.ts`
-- Modify: `apps/api/src/config/env.schema.ts`（`ARTIFACT_MASTER_KEY`、`ARTIFACT_ACTIVE_KEY_ID`）
+- Modify: `apps/api/src/config/env.schema.ts`（`ARTIFACT_KEYS`、`ARTIFACT_ACTIVE_KEY_ID`）
 - Test: `tests/unit/asset/artifact-format.test.ts`、`tests/unit/asset/chunk-cipher.test.ts`
 
 **契约（写死，不得改动）：**
@@ -158,36 +158,83 @@ nonce           12 字节 = noncePrefix(4, 每文件随机) || 块序号(8, 大�
                 **禁止**「固定前缀 + 从 0 开始计数器」跨文件复用（GCM 下 nonce 重用泄露明文异或）
 AAD             `${fileId}:${position}:${isLast ? 'last' : 'more'}`（UTF-8）
                 fileId 为 16 字节随机，十六进制表示
-文件头（定长 48 + keyId）
-  magic(4)="VCA1" | formatVersion(2)=1 | keyIdLen(1) | keyId(N) |
-  fileId(16) | chunkSize(4) | plaintextLength(8) | chunkCount(8) | noncePrefix(4)
-块索引（每块定长 24 字节，紧随头部）
-  offset(8) | ciphertextLength(4) | tagOffset 由 ciphertextLength 推出 | 保留(12)
+
+物理排布（**必须可单趟顺序写出**，Task 1 的 putStream 只能从 0 追加）
+  [ 文件头 31+N 字节 ]  只放流结束**之前**就已知的字段：
+                       magic(4)="VCA1" | formatVersion(2)=1 | keyIdLen(1) | keyId(N) |
+                       fileId(16) | chunkSize(4) | noncePrefix(4)
+  [ 块数据 ... ]       逐块 ciphertext||tag(16)，顺序追加
+  [ 块索引 ... ]       每块 24 字节：
+                       offset(8, **文件绝对偏移**) | ciphertextLength(4, **不含 tag**) |
+                       记录自称序号(8, 大端) | 保留(4, 全零)
+  [ 尾部 24 字节 ]     indexOffset(8) | chunkCount(8) | plaintextLength(8)  ← 恒为文件最后 24 字节
 ```
 
-**Interfaces:**
+> **R3 裁定（2026-10-05）**：原计划的 `[头][索引][数据]` **物理上不可产出**——头里含流结束后才知道的总量，而索引排在数据之前。故 `plaintextLength`/`chunkCount` 移入尾部，索引移到数据之后，读取端先读最后 24 字节定位索引。这同时让「只解密尾部若干块」（Task 3）与 zip 中央目录读取（Task 4）更自然。
+>
+> **R2 裁定**：索引里的**记录自称序号**仅供**比对**，**绝不用于推导 nonce 或 AAD**（那正是预检发现的重排漏洞）。没有这个字段，C20 的校验、Task 3 的错误信息与变异探针都没有数据来源。
+>
+> **R1**：旧稿写的「头部定长 48」是**算术错误**（`4+2+1+16+4+8+8+4 = 47`）。**R3 之后头部为 `31+N` 字节**（`4+2+1+N+16+4+4`：magic/version/keyIdLen/keyId/fileId/chunkSize/noncePrefix），因为 `plaintextLength` 与 `chunkCount` 已移入尾部。**代码已按 31+N 实现并复审通过**；本计划下文若再出现 47/48 均为陈旧文本。
+> **R4**：0 字节输入 ⇒ `chunkCount = 0`、`plaintextLength = 0`。
+> **R5**：环境面为**键环** `ARTIFACT_KEYS`（JSON `{keyId: base64(32B)}`）+ `ARTIFACT_ACTIVE_KEY_ID`，且引导期校验 active ∈ keys。**R6**：删除无读取方的 `MASTER_ENCRYPTION_KEY`。
+>
+> **I3 裁定（最终全分支审查，2026-10-05；规格级决定，取代上面 R3 的两处数字）**：
+> `noncePrefix` 由 4 字节加宽到 **8 字节**、块序号由 BE64 收窄为 **BE32**（nonce 仍是 12 字节），
+> `formatVersion` 1 → **2**，定长头 `31+N` → **`35+N`**（`4+2+1+N+16+4+8`）。
+> 理由（4 字节前缀下跨文件生日界：~9.3k 份制品 ≈ 1% 前缀碰撞、~65k ≈ 39%；而 GCM 的 nonce 重用
+> **还会暴露认证子密钥**，即那把密钥下的可伪造性）、代价与「为什么不改成轮换策略」写在
+> `../specs/2026-10-05-p1-asset-artifact-design.md` 的 **D4**。
+> **本计划里 `31+N` 与 `noncePrefix(4)` 出现的地方都已被 I3 取代**——规格的 D2/D3/D4 是现行真值，
+> 本文件是当时的裁决记录（保留它是为了留下「为什么是 35 而不是 47/48」的完整来路）。
+
+**Interfaces（已按 R2/R3/R5 更新；以 `artifact-format.ts` 的实际导出为准）:**
 ```ts
 export const CHUNK_SIZE = 8 * 1024 * 1024;
 export const ARTIFACT_MAGIC = 'VCA1';
+export const HEADER_FIXED_BYTES = 31;   // 不含 keyId
+export const FOOTER_BYTES = 24;
 
+/** 只含流结束**之前**就已知的字段——总量在尾部。 */
 export interface ArtifactHeader {
   formatVersion: number; keyId: string; fileId: Buffer;
-  chunkSize: number; plaintextLength: bigint; chunkCount: bigint; noncePrefix: Buffer;
+  chunkSize: number; noncePrefix: Buffer;
+}
+/** 流结束后才知道的总量。恒为制品最后 24 字节。 */
+export interface ArtifactFooter {
+  indexOffset: bigint; chunkCount: bigint; plaintextLength: bigint;
 }
 export function encodeHeader(h: ArtifactHeader): Buffer;
 export function decodeHeader(buf: Buffer): { header: ArtifactHeader; keyIdLength: number };
+export function headerByteLength(keyIdLength: number): number;
+export function blockDataOffset(keyIdLength: number): number;
+export function encodeFooter(f: ArtifactFooter): Buffer;
+export function decodeFooter(buf: Buffer): ArtifactFooter;   // 必须恰好 24 字节
+
+/** 索引每条 24 字节：offset(8) | ciphertextLength(4, 不含 tag) | 记录自称序号(8) | 保留(4, 全零) */
+export interface IndexEntry {
+  offset: bigint; ciphertextLength: number;
+  /** **仅供读取端与位置比对，绝不用来推导 nonce/AAD**（R2）。 */
+  index: bigint;
+}
+export function encodeIndex(entries: IndexEntry[]): Buffer;
+/** 写入端编解码**有意不校验**顺序/边界/`index === position`——那些属于读取端（Task 3）。 */
+export function decodeIndex(buf: Buffer): IndexEntry[];
 
 export interface KeyRing { activeKeyId(): string; keyFor(keyId: string): Buffer; }
-/** 缺失活动键或未知 keyId ⇒ 抛错，**绝不回退到默认键**。 */
-export function createKeyRing(env: { ARTIFACT_MASTER_KEY: string; ARTIFACT_ACTIVE_KEY_ID: string }): KeyRing;
+/** 未知 keyId 或活动键不在环中 ⇒ 抛错，**绝不回退到默认键**。 */
+export function createKeyRing(env: { ARTIFACT_KEYS: string; ARTIFACT_ACTIVE_KEY_ID: string }): KeyRing;
 export function deriveNonce(prefix: Buffer, position: number): Buffer;
 export function buildAad(fileId: Buffer, position: number, isLast: boolean): Buffer;
 
 export class ChunkEncryptor {
   constructor(keyRing: KeyRing, opts?: { chunkSize?: number });
-  /** 流式：写入密文片段，不缓冲整个输入。 */
+  /** 流式：**只产出块数据**，不缓冲整个输入。 */
   transform(): Transform;
-  result(): { header: ArtifactHeader; index: Buffer };
+  /** 流成功结束后才可调用；返回组装制品所需的四段（尾部最后写）。 */
+  result(): {
+    header: Buffer; index: Buffer; footer: Buffer;
+    footerFields: ArtifactFooter; blockDataOffset: number;
+  };
 }
 ```
 
@@ -196,7 +243,7 @@ export class ChunkEncryptor {
 - [ ] **Step 2:** 实现 `artifact-format.ts`（纯函数，无 I/O）。
 - [ ] **Step 3:** 失败测试：加密器对 0 字节 / 恰好 1 块 / 1 块+1 字节 / 3 块+1234 字节 分别产出正确的 `chunkCount` 与 `plaintextLength`。
 - [ ] **Step 4:** 实现 `ChunkEncryptor`。
-- [ ] **Step 5:** `createKeyRing` 的失败测试：缺 `ARTIFACT_MASTER_KEY` ⇒ 抛；键长非 32 字节 ⇒ 抛；`ARTIFACT_ACTIVE_KEY_ID` 不在环中 ⇒ 抛。（C10）
+- [ ] **Step 5:** `createKeyRing` 的失败测试：`ARTIFACT_KEYS` 非法 JSON / 非法 base64 / 单键非 32 字节 ⇒ 抛；`ARTIFACT_ACTIVE_KEY_ID` 不在环中 ⇒ 抛（引导期与构造期**两处**都抛）。（C10）
 - [ ] **Step 6:** 跑三项门禁。
 
 **Acceptance:**
@@ -232,10 +279,18 @@ export class ChunkDecipher {
   - [ ] 篡改第 N 块密文 → 抛错且**点名 chunk N**。
   - [ ] **调换两条记录（含各自的 nonce 与 tag）→ 必须被拒**，错误信息点出「位置 P 处的记录自称序号 Q」。
   - [ ] 截断末块 → 被拒（末块 `isLast` 标记使然）。
-  - [ ] 未知 `keyId` → 抛错且**不回退**。
+  - [ ] 未知 `keyId` → 抛错且**不回退**；**已退役但仍在环中的 keyId → 能正常解密**（R5 的轮换路径）。
+- [ ] **Step 3b: 三条完整性校验（**Task 2 复审认定的必要充分条件，缺一不可**）**
+  头部的总量字段**不在任何 AAD 里**，因此「改小 `chunkCount` + 删掉末尾整块」这类截断只能靠读取端校验发现。`isLast` 只挡「不满的末块」那一类。
+  - [ ] `chunkCount === 索引中实际存在的记录数`
+  - [ ] `chunkCount === ceil(plaintextLength / chunkSize)`
+  - [ ] `Σ ciphertextLength === plaintextLength`
+
+  > ⚠️ **前两条合起来仍不充分**：3 块的制品截成 2 块、并把 `chunkCount` 改成 2、`plaintextLength` 改成 16 MiB，前两条都满足。**充分性来自第三条**（对实际存在的记录求和）。三条都要有用例。
 - [ ] **Step 4:** 变异探针：把序号改回「取自记录自称」（即去掉位置校验）⇒ **「调换记录」用例必须变红**。若不变红，说明用例没有真正覆盖 C20。
-- [ ] **Step 5:** `random-access-reader.ts` 适配 `yauzl.RandomAccessReader` 的抽象接口（`_readStreamForRange`/`read`/`ref`/`unref`/`close`），只解密所需块；测试覆盖「读尾部 4 字节只解密最后一块」。
-- [ ] **Step 6:** 跑三项门禁。
+- [ ] **Step 5:** `random-access-reader.ts` 适配 `yauzl.RandomAccessReader` 的抽象接口（`_readStreamForRange`/`read`/`ref`/`unref`/`close`），只解密所需块。**读取尾部 24 字节定位索引时，只应解密最后一块**（`getRange(key, size-24, size-1)`）。
+- [ ] **Step 6:** **读取端必须校验索引自身**：`offset` 单调递增、各区间落在 `[0, indexOffset)` 内、且与文件长度自洽（写入端的 `decodeIndex` 有意不做这些检查，它们属于读取端）。
+- [ ] **Step 7:** 跑三项门禁。
 
 **Acceptance:**
 - 四个契约用例全部通过，且 Step 4 的变异能让「调换记录」用例变红。
@@ -282,6 +337,15 @@ export function validateArchive(reader: RandomAccessReader): Promise<ArchiveVerd
 | `ok.zip` / `ok.tar.gz` | **接受** | **必须有用例**，否则「全部拒绝」的实现也能通过 |
 
 **Steps:**
+- [ ] **Step 0（依赖登记 + 复验）:** 把 `file-type@22.1.1` 与 `tar@7.5.22` **精确版本**登记进 `apps/api`（是 `tar`，**不是** `tar-stream`）。登记后跑 `pnpm install`，再用 **`require.resolve`（从 `apps/api/src` 出发）** 确认两者真的可解析——**不要**以 `node_modules/` 下存在同名目录为准（Task 3 发现：控制器预检探针的残留 `.pnpm` 目录会让「已安装」看起来为真，见预检 §8）。
+- [ ] **Step 0b（末块认证 —— Task 3 复审新增的**强制**要求）:** 归档校验**必须先认证末块**，再下任何结论。五条要点，逐条都要有对应用例：
+  1. **机制**：Task 3 **没有**导出「认证末块」的专用 API（C16 不允许为了一条断言加抽象）。可用形式是**读一段覆盖 `plaintextLength - 1` 的区间**——`ChunkDecipher.decryptAt` 是**急切认证**的，**1 个字节就足够**触发末块的 `isLast` 校验。
+  2. **用例必须是 Task 4 边界上的端到端**：一个**自洽的截断制品**必须被拒**且不返回任何元数据**——而不是只断言「读取会抛」。
+  3. **口径（provenance）比数值更重要**：`totalSize` **必须**取自读取器的 `plaintextLength`，**绝不能**从对象的字节长度或上传元数据重新推导。因为被物理截断的对象**自身是自洽的**，它的长度什么都说明不了。
+  4. **定义 `plaintextLength === 0`**：几何上允许 0 块制品，此时「认证末块」无定义——必须有明确行为与用例。
+  5. **若上传时记录了带外长度**（非制品自称），用它交叉核对——那是**唯一**非自称的长度载体。
+
+  > **为什么这是强制的**：格式里**没有任何字段认证「制品有多长」**（总量字段在尾部，且不在任何 AAD 里）。整块截断只能靠末块的 `isLast` 标记发现，而它**只在末块被真正读取时才生效**。Task 3 已用两条变异探针证明**读取器这一层**无法构造「走到自称末尾却没认证末块」的路径 ⇒ **剩余风险全部转移到 Task 4 如何使用 `plaintextLength`**。
 - [ ] **Step 1:** `limits.ts` + `sniff.ts`。嗅探判定条件必须是 `ext === 'tar.gz' || mime === 'application/gzip'`。
   - **必有用例（预检实测的缺陷）**：断言**合法 tar.gz 被识别为 tar.gz**。写成 `=== 'gz'` 会把 100% 的合法 tar.gz 误拒——这是「测试全绿、生产全炸」型错误，且会让整条 tar.gz 路径不被执行。
 - [ ] **Step 2:** `zip-inspector.ts`：`lazyEntries` 只读中央目录，收集 `fileName` / `uncompressedSize` / `compressedSize` / `externalFileAttributes`。**Open/parse 抛错 ⇒ 返回拒绝**（不是崩）。
@@ -383,7 +447,8 @@ export function parseMetadata(reader: RandomAccessReader, kind: 'zip' | 'tar.gz'
 
 **数据模型（沿用设计文档 §5.1/§5.3）：**
 - `Asset`（永久实体）：`id` UUIDv7、`ownerId`、`createdAt`
-- `AssetVersion`：`assetId`、`sha256`、`plaintextBytes`、`keyId`、`fileId`、`uploadedById`、`createdAt`
+- `AssetVersion`：`assetId`、`sha256`、**`storageKey`（制品对象键——下载路径必须靠它取对象；原字段清单漏了它，Task 5 指出）**、`plaintextBytes`、`keyId`、`fileId`、`uploadedById`、`createdAt`
+  - **`plaintextBytes` 是强制列，不是可选元数据。** 格式里**没有任何字段认证「制品有多长」**，它是制品**自称**值；接入期由 Task 5 用写入侧计量器数出并核对。**Task 7 必须把它落库；Task 8 必须在下载路径把它作为 `expectedPlaintextLength` 传回读取器** —— 否则这条核对**只在接入期有效**，下载路径上「更短、完全自洽」的制品会被当成合法的。Task 5 的探针 m6 实测：不传带外长度 ⇒ 一份更短的合法形状制品被**接受（201）**；带上 ⇒ 422。
 - `AssetMetadata`：`assetVersionId`、上面 `ParsedMetadata` 各字段
 - `OwnershipHistory`：`assetId`、`fromUserId`、`toUserId`、`reason`、`createdAt` — **append-only**
 
@@ -391,6 +456,7 @@ export function parseMetadata(reader: RandomAccessReader, kind: 'zip' | 'tar.gz'
 
 **Steps:**
 - [ ] **Step 1:** schema + 迁移。**迁移必须能在已迁移的库上干净落地**（P0 期间踩过一次：迁移再生成会与已迁移的本地卷冲突）——在全新库与已有库上各验一次。
+- [ ] **Step 1b（Task 5 移交的强制义务）:** `AssetVersion` 必须含 **`storageKey`**（下载路径取对象用）与 **`plaintextBytes`**，且 `plaintextBytes` **由 Task 5 的写入侧计量器数出**、不是从密文长度或上传元数据推导。两者都要有用例断言其确实落库。
 - [ ] **Step 2:** `infra/db/apply-grants.sql` 增加 `asset.ownership_history` 的 `REVOKE UPDATE, DELETE`（C7）。
 - [ ] **Step 3:** 扩展 append-only 集成测试覆盖 `OwnershipHistory`：**运行时角色**下 `UPDATE`/`DELETE` 被真实拒绝（沿用 P0 的双角色断言方式）。
 - [ ] **Step 4:** `ownership.service.ts`：转让 = `Asset.ownerId` 变更 + `OwnershipHistory` 追加一行，**不解密、不复制制品**（§5.2 第 2 条）。在同一事务内。
@@ -423,6 +489,8 @@ export async function consumeNonce(nonce: string, ttlSeconds: number): Promise<b
 ```
 TTL **≤ 300 秒**（威胁 #3）。`nonce` 首次使用即消费；重复使用 ⇒ 拒绝。
 
+> **Task 5 移交的强制义务（下载路径）**：下载时必须把 `AssetVersion.plaintextBytes` 作为 **`expectedPlaintextLength`** 传给读取器并**认证末块**。理由同 Task 5：格式里没有字段认证制品总长，不传带外长度 ⇒ **「更短、完全自洽」的截断制品会被当成合法的**（Task 5 探针 m6 实测：不传 ⇒ 201 接受，传 ⇒ 422）。**这条核对若只在接入期成立、下载期失效，等于没有。**
+
 **Steps:**
 - [ ] **Step 1:** 签名单元测试：正确签名通过；**篡改任一字段**（载荷、过期时间、用户）⇒ 拒绝；过期 ⇒ 拒绝；签名长度或编码畸形 ⇒ 拒绝（不抛未捕获异常）。
 - [ ] **Step 2:** 单次使用集成测试（真 Redis）：首次成功，**第二次同一 nonce 被拒**；两个并发请求只有一个成功。
@@ -453,7 +521,7 @@ TTL **≤ 300 秒**（威胁 #3）。`nonce` 首次使用即消费；重复使�
 | 5 | 全量测试 | `pnpm test` |
 | 6 | 八样本判定（六拒两收） | `pnpm vitest run --project unit -t 归档` |
 | 7 | 块序号契约（调换记录必须被拒） | `pnpm vitest run --project unit -t 序号契约` |
-| 8 | 恶意样本零落盘零残留 | `pnpm vitest run --project integration -t 零落盘` |
+| 8 | 恶意样本零落盘零残留 | `pnpm vitest run --project integration -t 恶意样本` |
 | 9 | append-only 覆盖 `OwnershipHistory` | `pnpm vitest run --project integration -t append-only` |
 | 10 | 越权矩阵 | `pnpm vitest run --project security -t 越权` |
 | 11 | 签名 URL 超时/篡改/重放 | `pnpm vitest run --project integration -t 签名下载` |
