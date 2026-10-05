@@ -43,7 +43,7 @@ vibe-coding-auction-web/
 │  │  ├─ schema.prisma                 新增 asset schema（Asset/AssetVersion/AssetMetadata/OwnershipHistory）
 │  │  └─ migrations/                   新增迁移（含 append-only 授权）
 │  └─ src/
-│     ├─ config/env.schema.ts          新增 ARTIFACT_MASTER_KEY / ARTIFACT_ACTIVE_KEY_ID / ARTIFACT_STORE_DIR
+│     ├─ config/env.schema.ts          新增 ARTIFACT_KEYS / ARTIFACT_ACTIVE_KEY_ID / ARTIFACT_STORE_DIR
 │     ├─ modules/asset/
 │     │  ├─ asset.module.ts
 │     │  ├─ index.ts                   对外最小接口（只导出 AssetModule + 门面）
@@ -146,7 +146,7 @@ export interface ArtifactStore {
 - Create: `apps/api/src/modules/asset/crypto/artifact-format.ts`
 - Create: `apps/api/src/modules/asset/crypto/key-ring.ts`
 - Create: `apps/api/src/modules/asset/crypto/chunk-cipher.ts`
-- Modify: `apps/api/src/config/env.schema.ts`（`ARTIFACT_MASTER_KEY`、`ARTIFACT_ACTIVE_KEY_ID`）
+- Modify: `apps/api/src/config/env.schema.ts`（`ARTIFACT_KEYS`、`ARTIFACT_ACTIVE_KEY_ID`）
 - Test: `tests/unit/asset/artifact-format.test.ts`、`tests/unit/asset/chunk-cipher.test.ts`
 
 **契约（写死，不得改动）：**
@@ -160,7 +160,7 @@ AAD             `${fileId}:${position}:${isLast ? 'last' : 'more'}`（UTF-8）
                 fileId 为 16 字节随机，十六进制表示
 
 物理排布（**必须可单趟顺序写出**，Task 1 的 putStream 只能从 0 追加）
-  [ 文件头 47 字节 ]   只放流结束**之前**就已知的字段：
+  [ 文件头 31+N 字节 ]  只放流结束**之前**就已知的字段：
                        magic(4)="VCA1" | formatVersion(2)=1 | keyIdLen(1) | keyId(N) |
                        fileId(16) | chunkSize(4) | noncePrefix(4)
   [ 块数据 ... ]       逐块 ciphertext||tag(16)，顺序追加
@@ -174,33 +174,58 @@ AAD             `${fileId}:${position}:${isLast ? 'last' : 'more'}`（UTF-8）
 >
 > **R2 裁定**：索引里的**记录自称序号**仅供**比对**，**绝不用于推导 nonce 或 AAD**（那正是预检发现的重排漏洞）。没有这个字段，C20 的校验、Task 3 的错误信息与变异探针都没有数据来源。
 >
-> **R1**：头部定长是 **47** 字节（4+2+1+16+4+8+8+4 的相加是错的旧稿；新布局下为 4+2+1+N+16+4+4 = 31+N）。
+> **R1**：旧稿写的「头部定长 48」是**算术错误**（`4+2+1+16+4+8+8+4 = 47`）。**R3 之后头部为 `31+N` 字节**（`4+2+1+N+16+4+4`：magic/version/keyIdLen/keyId/fileId/chunkSize/noncePrefix），因为 `plaintextLength` 与 `chunkCount` 已移入尾部。**代码已按 31+N 实现并复审通过**；本计划下文若再出现 47/48 均为陈旧文本。
 > **R4**：0 字节输入 ⇒ `chunkCount = 0`、`plaintextLength = 0`。
 > **R5**：环境面为**键环** `ARTIFACT_KEYS`（JSON `{keyId: base64(32B)}`）+ `ARTIFACT_ACTIVE_KEY_ID`，且引导期校验 active ∈ keys。**R6**：删除无读取方的 `MASTER_ENCRYPTION_KEY`。
 
-**Interfaces:**
+**Interfaces（已按 R2/R3/R5 更新；以 `artifact-format.ts` 的实际导出为准）:**
 ```ts
 export const CHUNK_SIZE = 8 * 1024 * 1024;
 export const ARTIFACT_MAGIC = 'VCA1';
+export const HEADER_FIXED_BYTES = 31;   // 不含 keyId
+export const FOOTER_BYTES = 24;
 
+/** 只含流结束**之前**就已知的字段——总量在尾部。 */
 export interface ArtifactHeader {
   formatVersion: number; keyId: string; fileId: Buffer;
-  chunkSize: number; plaintextLength: bigint; chunkCount: bigint; noncePrefix: Buffer;
+  chunkSize: number; noncePrefix: Buffer;
+}
+/** 流结束后才知道的总量。恒为制品最后 24 字节。 */
+export interface ArtifactFooter {
+  indexOffset: bigint; chunkCount: bigint; plaintextLength: bigint;
 }
 export function encodeHeader(h: ArtifactHeader): Buffer;
 export function decodeHeader(buf: Buffer): { header: ArtifactHeader; keyIdLength: number };
+export function headerByteLength(keyIdLength: number): number;
+export function blockDataOffset(keyIdLength: number): number;
+export function encodeFooter(f: ArtifactFooter): Buffer;
+export function decodeFooter(buf: Buffer): ArtifactFooter;   // 必须恰好 24 字节
+
+/** 索引每条 24 字节：offset(8) | ciphertextLength(4, 不含 tag) | 记录自称序号(8) | 保留(4, 全零) */
+export interface IndexEntry {
+  offset: bigint; ciphertextLength: number;
+  /** **仅供读取端与位置比对，绝不用来推导 nonce/AAD**（R2）。 */
+  index: bigint;
+}
+export function encodeIndex(entries: IndexEntry[]): Buffer;
+/** 写入端编解码**有意不校验**顺序/边界/`index === position`——那些属于读取端（Task 3）。 */
+export function decodeIndex(buf: Buffer): IndexEntry[];
 
 export interface KeyRing { activeKeyId(): string; keyFor(keyId: string): Buffer; }
-/** 缺失活动键或未知 keyId ⇒ 抛错，**绝不回退到默认键**。 */
-export function createKeyRing(env: { ARTIFACT_MASTER_KEY: string; ARTIFACT_ACTIVE_KEY_ID: string }): KeyRing;
+/** 未知 keyId 或活动键不在环中 ⇒ 抛错，**绝不回退到默认键**。 */
+export function createKeyRing(env: { ARTIFACT_KEYS: string; ARTIFACT_ACTIVE_KEY_ID: string }): KeyRing;
 export function deriveNonce(prefix: Buffer, position: number): Buffer;
 export function buildAad(fileId: Buffer, position: number, isLast: boolean): Buffer;
 
 export class ChunkEncryptor {
   constructor(keyRing: KeyRing, opts?: { chunkSize?: number });
-  /** 流式：写入密文片段，不缓冲整个输入。 */
+  /** 流式：**只产出块数据**，不缓冲整个输入。 */
   transform(): Transform;
-  result(): { header: ArtifactHeader; index: Buffer };
+  /** 流成功结束后才可调用；返回组装制品所需的四段（尾部最后写）。 */
+  result(): {
+    header: Buffer; index: Buffer; footer: Buffer;
+    footerFields: ArtifactFooter; blockDataOffset: number;
+  };
 }
 ```
 
@@ -209,7 +234,7 @@ export class ChunkEncryptor {
 - [ ] **Step 2:** 实现 `artifact-format.ts`（纯函数，无 I/O）。
 - [ ] **Step 3:** 失败测试：加密器对 0 字节 / 恰好 1 块 / 1 块+1 字节 / 3 块+1234 字节 分别产出正确的 `chunkCount` 与 `plaintextLength`。
 - [ ] **Step 4:** 实现 `ChunkEncryptor`。
-- [ ] **Step 5:** `createKeyRing` 的失败测试：缺 `ARTIFACT_MASTER_KEY` ⇒ 抛；键长非 32 字节 ⇒ 抛；`ARTIFACT_ACTIVE_KEY_ID` 不在环中 ⇒ 抛。（C10）
+- [ ] **Step 5:** `createKeyRing` 的失败测试：`ARTIFACT_KEYS` 非法 JSON / 非法 base64 / 单键非 32 字节 ⇒ 抛；`ARTIFACT_ACTIVE_KEY_ID` 不在环中 ⇒ 抛（引导期与构造期**两处**都抛）。（C10）
 - [ ] **Step 6:** 跑三项门禁。
 
 **Acceptance:**

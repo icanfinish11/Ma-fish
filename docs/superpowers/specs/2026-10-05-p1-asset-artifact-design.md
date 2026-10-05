@@ -62,7 +62,7 @@ AAD 绑定 `fileId | position | 是否末块`。末块标记是**截断检测**�
 
 ### D5 · 密钥与轮换
 
-- 主密钥由环境注入（`ARTIFACT_MASTER_KEY`，32 字节），**不入库、不入 git**；沿用 P0 的占位值拒绝机制。
+- 主密钥由环境注入（`ARTIFACT_KEYS`：JSON `{keyId: base64(32字节)}`，配合 `ARTIFACT_ACTIVE_KEY_ID` 指定当前写入键），**不入库、不入 git**；沿用 P0 的占位值拒绝机制。
 - 文件头带 `keyId`。解密按 `keyId` 选密钥 ⇒ **轮换 = 新增一个 keyId 并让新写入用它**，旧制品继续按其 keyId 可读。
 - 密钥环形如 `{ [keyId]: Buffer }`，当前写入键由 `ARTIFACT_ACTIVE_KEY_ID` 指定。
 - 缺失当前写入键、或遇到未知 keyId ⇒ **拒绝**（不是回退到默认键）。
