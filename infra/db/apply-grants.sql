@@ -110,6 +110,20 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ledger TO app_user;
 
 -- ledger.entries：**append-only**（不变式 #5）——分录是账本的事实，写进去就不能改、
 -- 不能删。一行改过的分录会让「这笔钱去哪了」这个问题永久失去答案。
+--
+-- ⚠️ `SELECT` 在这里**不是**「读接口的权限」，它是**写入路径的一部分**：延迟约束触发器
+-- `ledger.assert_tx_balanced()` 不是 `SECURITY DEFINER`，于是 COMMIT 时刻那句
+-- `SELECT sum(amount) … FROM ledger.entries` 以**调用者**（app_user）的身份执行。
+-- 实测：撤掉 SELECT 之后，app_user 的 INSERT 照样成功，而 COMMIT 以
+-- `permission denied for table entries` 失败，`CONTEXT` 指向触发器内部那句 SQL——
+-- 错误信息会把运维引向「触发器有 bug」这条错路。
+--
+-- 要保住的是**有效 ACL 里的 SELECT**，不是某一行语句。真库上量过三种形状
+-- （`has_table_privilege`）：只把本行收窄成 `GRANT INSERT` ⇒ 仍是 `t`（上面那条 schema 级
+-- 广播还在给）；把本行与那条广播**都**收窄 ⇒ 变 `f`。因此本行的 `SELECT` 今天与广播重复，
+-- 但那不是可以随手删的理由——**改任何一处之前先看有效 ACL**。
+-- 常驻见证：`tests/integration/db/ledger-enforcement.test.ts` 的
+-- 「运行期角色的 SELECT 对**写入**也是承重的」（撤掉 ⇒ COMMIT 被拒；恢复 ⇒ 同形状过账被接受）。
 GRANT SELECT, INSERT ON ledger.entries TO app_user;
 REVOKE UPDATE, DELETE ON ledger.entries FROM app_user;
 

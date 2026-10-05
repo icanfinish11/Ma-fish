@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { Client } from 'pg';
 import { startPostgres, type TestPg } from '../../helpers/db.js';
@@ -44,6 +44,35 @@ describe('账本的数据库强制点（不变式 #1 / #3 / #5）', () => {
     await owner?.end();
     await app?.end();
     await pg?.stop();
+  });
+
+  /**
+   * 把「故意制造失败的 COMMIT」之后留在连接上的事务状态清干净。
+   *
+   * ## 为什么需要它（不是洁癖）
+   *
+   * 本文件里有好几条用例**故意**让 `COMMIT` 失败（那正是不变式 #1 的判据）。失败的 `COMMIT`
+   * 本身会把事务结束掉，但**语句级**的失败（例如把触发器改成非 DEFERRABLE 之后 `INSERT`
+   * 就直接抛）会留下 `current transaction is aborted` 的连接状态——从那一刻起，**同一条
+   * 连接上的后续每一条用例都会以「事务已中止」失败**，而不是以它自己真正的原因失败。
+   *
+   * 代价是实测过的：把 `DEFERRABLE` 去掉的变异探针本该只红 3 条，实际红了 10 条，
+   * 后面 7 条全是这条级联噪声。噪声不是「更严格」，它让**判据的数量**变成假的——
+   * 下一个读这份证据的人会以为有 10 条用例在守着不变式 #1。
+   *
+   * 不在事务里时 PostgreSQL 只发一个 warning（不是错误），所以这里不需要区分两种状态。
+   */
+  async function resetTx(client: Client): Promise<void> {
+    await client.query('ROLLBACK').catch(() => undefined);
+  }
+
+  // 兜底：**任何**一条用例在事务中途抛出（本文件里好几条故意如此）都会把连接留在
+  // `current transaction is aborted`，而那条状态会让**后续每一条用例**以「事务已中止」
+  // 失败——红的是别人的原因。放在 `afterEach` 而不是逐个 try/finally，是因为「哪条用例
+  // 会在哪一步抛」本身随被测对象变化（变异探针会改它），靠人记住是记不住的。
+  afterEach(async () => {
+    await resetTx(owner);
+    await resetTx(app);
   });
 
   it('系统账户恰好三个（D2：只有迁移创建它们）', async () => {
@@ -189,35 +218,43 @@ describe('账本的数据库强制点（不变式 #1 / #3 / #5）', () => {
   it('不变式 #1：平衡的两腿在 COMMIT 被接受', async () => {
     const tx = randomUUID();
     await owner.query('BEGIN');
-    await owner.query(
-      `INSERT INTO ledger.transactions (id, kind, idempotency_key) VALUES ($1,'TOPUP',$2)`,
-      [tx, `probe-${tx}`],
-    );
-    const user = await owner.query(
-      `INSERT INTO ledger.accounts (id, kind, owner_user_id, balance) VALUES (gen_random_uuid(),'USER_AVAILABLE',gen_random_uuid(),0) RETURNING id`,
-    );
-    const escrow = await owner.query(`SELECT id FROM ledger.accounts WHERE kind='EXTERNAL_TOPUP'`);
-    await owner.query(
-      `INSERT INTO ledger.entries (id, transaction_id, account_id, amount) VALUES (gen_random_uuid(),$1,$2,-500),(gen_random_uuid(),$1,$3,500)`,
-      [tx, escrow.rows[0].id, user.rows[0].id],
-    );
-    await expect(owner.query('COMMIT')).resolves.toBeDefined();
+    try {
+      await owner.query(
+        `INSERT INTO ledger.transactions (id, kind, idempotency_key) VALUES ($1,'TOPUP',$2)`,
+        [tx, `probe-${tx}`],
+      );
+      const user = await owner.query(
+        `INSERT INTO ledger.accounts (id, kind, owner_user_id, balance) VALUES (gen_random_uuid(),'USER_AVAILABLE',gen_random_uuid(),0) RETURNING id`,
+      );
+      const escrow = await owner.query(`SELECT id FROM ledger.accounts WHERE kind='EXTERNAL_TOPUP'`);
+      await owner.query(
+        `INSERT INTO ledger.entries (id, transaction_id, account_id, amount) VALUES (gen_random_uuid(),$1,$2,-500),(gen_random_uuid(),$1,$3,500)`,
+        [tx, escrow.rows[0].id, user.rows[0].id],
+      );
+      await expect(owner.query('COMMIT')).resolves.toBeDefined();
+    } finally {
+      await resetTx(owner);
+    }
   });
 
   it('不变式 #1：**单腿**在 COMMIT 被拒，SQLSTATE 23514（跳过应用直接写——它就是回退防线）', async () => {
     const tx = randomUUID();
     await owner.query('BEGIN');
-    await owner.query(
-      `INSERT INTO ledger.transactions (id, kind, idempotency_key) VALUES ($1,'TOPUP',$2)`,
-      [tx, `probe-${tx}`],
-    );
-    const escrow = await owner.query(`SELECT id FROM ledger.accounts WHERE kind='EXTERNAL_TOPUP'`);
-    // INSERT 此刻**成功**（触发器是 DEFERRED）——这一句本身就是「检查发生在 COMMIT」的见证。
-    await owner.query(
-      `INSERT INTO ledger.entries (id, transaction_id, account_id, amount) VALUES (gen_random_uuid(),$1,$2,-7000)`,
-      [tx, escrow.rows[0].id],
-    );
-    await expect(owner.query('COMMIT')).rejects.toMatchObject({ code: '23514' });
+    try {
+      await owner.query(
+        `INSERT INTO ledger.transactions (id, kind, idempotency_key) VALUES ($1,'TOPUP',$2)`,
+        [tx, `probe-${tx}`],
+      );
+      const escrow = await owner.query(`SELECT id FROM ledger.accounts WHERE kind='EXTERNAL_TOPUP'`);
+      // INSERT 此刻**成功**（触发器是 DEFERRED）——这一句本身就是「检查发生在 COMMIT」的见证。
+      await owner.query(
+        `INSERT INTO ledger.entries (id, transaction_id, account_id, amount) VALUES (gen_random_uuid(),$1,$2,-7000)`,
+        [tx, escrow.rows[0].id],
+      );
+      await expect(owner.query('COMMIT')).rejects.toMatchObject({ code: '23514' });
+    } finally {
+      await resetTx(owner);
+    }
   });
 
   it('不变式 #1 的触发器在 **UPDATE / DELETE** 分支上同样会拒（预检只跑过 INSERT；这两条只有属主走得到）', async () => {
@@ -245,17 +282,20 @@ describe('账本的数据库强制点（不变式 #1 / #3 / #5）', () => {
     await owner.query('BEGIN');
     await owner.query(`UPDATE ledger.entries SET amount = 600 WHERE transaction_id = $1 AND amount = 500`, [tx]);
     await expect(owner.query('COMMIT')).rejects.toMatchObject({ code: '23514' });
+    await resetTx(owner);
 
     // 反面对照（先证明这一对腿**本来是平衡的**）：什么都不改，同一事务里空转一次 ⇒ 放行。
     // 没有这一条，上面那条 UPDATE 拒绝可能只是因为「犯了别的错」。
     await owner.query('BEGIN');
     await owner.query(`UPDATE ledger.entries SET amount = 500 WHERE transaction_id = $1 AND amount = 500`, [tx]);
     await expect(owner.query('COMMIT')).resolves.toBeDefined();
+    await resetTx(owner);
 
     // DELETE 分支：删掉借方腿 ⇒ 剩余 sum = 500 ≠ 0 ⇒ COMMIT 被拒
     await owner.query('BEGIN');
     await owner.query(`DELETE FROM ledger.entries WHERE transaction_id = $1 AND amount = -500`, [tx]);
     await expect(owner.query('COMMIT')).rejects.toMatchObject({ code: '23514' });
+    await resetTx(owner);
 
     // 反面对照：把两条腿一起删掉 ⇒ 该交易**没有分录**（sum=0）⇒ 触发器放行。
     // 这一条钉住触发器的边界：它强制的是「已提交分录之和为 0」，**不是**「这笔交易真的发生过」
@@ -263,6 +303,7 @@ describe('账本的数据库强制点（不变式 #1 / #3 / #5）', () => {
     await owner.query('BEGIN');
     await owner.query(`DELETE FROM ledger.entries WHERE transaction_id = $1`, [tx]);
     await expect(owner.query('COMMIT')).resolves.toBeDefined();
+    await resetTx(owner);
 
     await owner.query(`DELETE FROM ledger.transactions WHERE id = $1`, [tx]);
   });
@@ -449,5 +490,69 @@ describe('账本的数据库强制点（不变式 #1 / #3 / #5）', () => {
       { relname: 'entries', privs: 'INSERT,SELECT' },
       { relname: 'transactions', privs: 'INSERT,SELECT' },
     ]);
+  });
+
+  it('运行期角色的 SELECT 对**写入**也是承重的（触发器以调用者身份执行，不是属主）', async () => {
+    // ## 这条用例是 Task 4 的一个**新发现**，不是预检里已有的结论
+    //
+    // `ledger.assert_tx_balanced()` **不是** `SECURITY DEFINER`，因此 COMMIT 时刻那句
+    // `SELECT sum(amount), count(*) FROM ledger.entries` 是以**调用者**（app_user）的身份
+    // 执行的，而不是表属主。实测：把 `SELECT` 从 app_user 撤掉之后，它的 `INSERT` 照样成功，
+    // 但 `COMMIT` 以 `permission denied for table entries` 失败，`CONTEXT` 指向触发器内部
+    // 那句 SQL。
+    //
+    // ⇒ 它把 `apply-grants.sql` 里 `GRANT SELECT, INSERT ON ledger.entries`（而不是只给
+    // `INSERT`）变成一条**有理由且可验证**的写法：SELECT 在这里不是「读接口的权限」，
+    // 它是**写入路径的一部分**。删掉它，账本一条都写不进去——而错误信息会把运维引向
+    // 「触发器有 bug」这条错路。
+    //
+    // 两个方向都在：撤掉 SELECT ⇒ COMMIT 被拒；恢复之后 ⇒ 同形状的平衡过账被接受。
+    // 只测拒绝方向时，「怎么都拒」也能满足它。
+    await owner.query(`REVOKE SELECT ON ledger.entries FROM app_user`);
+    try {
+      const tx = randomUUID();
+      await app.query('BEGIN');
+      await app.query(
+        `INSERT INTO ledger.transactions (id, kind, idempotency_key) VALUES ($1,'TOPUP',$2)`,
+        [tx, `probe-${tx}`],
+      );
+      await app.query(
+        `INSERT INTO ledger.entries (id, transaction_id, account_id, amount)
+         SELECT gen_random_uuid(), $1, id, -5 FROM ledger.accounts WHERE kind='EXTERNAL_TOPUP'`,
+        [tx],
+      );
+      await app.query(
+        `INSERT INTO ledger.entries (id, transaction_id, account_id, amount)
+         SELECT gen_random_uuid(), $1, id, 5 FROM ledger.accounts WHERE kind='PLATFORM_ESCROW'`,
+        [tx],
+      );
+      await expect(app.query('COMMIT')).rejects.toThrow(/permission denied for table entries/i);
+      await resetTx(app);
+    } finally {
+      await owner.query(`GRANT SELECT, INSERT ON ledger.entries TO app_user`);
+    }
+
+    // 反面对照：恢复 SELECT 之后，**同形状**的平衡过账在 COMMIT 被接受。
+    const ok = randomUUID();
+    await app.query('BEGIN');
+    try {
+      await app.query(
+        `INSERT INTO ledger.transactions (id, kind, idempotency_key) VALUES ($1,'TOPUP',$2)`,
+        [ok, `probe-${ok}`],
+      );
+      await app.query(
+        `INSERT INTO ledger.entries (id, transaction_id, account_id, amount)
+         SELECT gen_random_uuid(), $1, id, -5 FROM ledger.accounts WHERE kind='EXTERNAL_TOPUP'`,
+        [ok],
+      );
+      await app.query(
+        `INSERT INTO ledger.entries (id, transaction_id, account_id, amount)
+         SELECT gen_random_uuid(), $1, id, 5 FROM ledger.accounts WHERE kind='PLATFORM_ESCROW'`,
+        [ok],
+      );
+      await expect(app.query('COMMIT')).resolves.toBeDefined();
+    } finally {
+      await resetTx(app);
+    }
   });
 });
