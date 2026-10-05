@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
-import { readdir, rm } from 'node:fs/promises';
+import { readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { Client } from 'pg';
@@ -77,7 +77,14 @@ function sha256(bytes: Buffer): string {
 }
 
 /**
- * 制品库里的**全部文件**（相对路径，排好序）——「零残留」这类判据列目录来数，不猜路径。
+ * 制品库里的**全部文件**（相对路径，排好序）。
+ *
+ * 判据一律用**前后快照的差值**（「这次请求没有新增对象」），**不**断言「目录恰好只有我这一份」：
+ * 制品卷是**按 worker** 切的（`tests/setup/artifact-store.ts`），一个目录里可能有邻居套件
+ * 正在写的对象——那样写出来的判据依赖执行顺序，而且证明不了关于「我这条链路」的任何事情。
+ * 这不是假想：这一版的第一稿就是「目录里恰好一个对象」，实测红过一次
+ * （两个外来的 UUIDv7 对象出现在断言那一刻，`evidence/t9-final-focused.txt`，
+ * 时间戳与本用例相差不到 350ms）。
  */
 async function listObjects(root: string): Promise<string[]> {
   const out: string[] = [];
@@ -198,9 +205,11 @@ describe('上传 → 落库 → 签发 → 下载：一条真的能走通的链�
     await rm(STORE_DIR, { recursive: true, force: true });
   });
 
-  beforeEach(async () => {
-    // 每个用例从空制品库开始：「零残留」这类断言需要一个已知的起点。
-    await rm(STORE_DIR, { recursive: true, force: true });
+  beforeEach(() => {
+    // 每个用例只重置**注入的替换**，**不再**清空制品卷：本文件的判据都是相对快照
+    // （「这次请求没有新增对象」），不需要一个空目录；而 `rm -rf` 在「一个目录可能被邻居
+    // 套件同时使用」时是一个会误伤别人的动作（本轮实测到过一次外来的对象出现在本目录里，
+    // 见 `listObjects` 的注释）。目录的清理留在 `afterAll`（谁用谁清，与其余制品套件一致）。
     store.substitute = null;
   });
 
@@ -277,7 +286,10 @@ describe('上传 → 落库 → 签发 → 下载：一条真的能走通的链�
     // 存储键确实指向盘上那个对象，而它不是明文长度（两者必须不同，否则那条断言是空话）
     const onDisk = await store.stat(version.storageKey);
     expect(onDisk.bytes).toBeGreaterThan(version.plaintextBytes);
-    await expect(listObjects(STORE_DIR)).resolves.toEqual([`${version.storageKey.slice(0, 2)}/${version.storageKey.slice(2, 4)}/${version.storageKey}`]);
+    // 而且那个对象就在分片布局算出来的**那个路径**上（`<前2位>/<次2位>/<键>`）：
+    // 逐字节地问盘，而不是假设目录里只有它（理由见 `listObjects` 的注释）。
+    const objectFile = join(STORE_DIR, version.storageKey.slice(0, 2), version.storageKey.slice(2, 4), version.storageKey);
+    await expect(stat(objectFile)).resolves.toMatchObject({ size: onDisk.bytes });
 
     // ③ 元数据：Task 6 解析出来的那一行。期望值是**样本自己的内容**（地面真值，
     //    见 `fixtures/archives/generate.ts` 的 `ok.zip`），不是从被测代码里回读的。
@@ -357,6 +369,7 @@ describe('上传 → 落库 → 签发 → 下载：一条真的能走通的链�
       const assetsBefore = await prisma.asset.count();
       const versionsBefore = await prisma.assetVersion.count();
       const metadataBefore = await prisma.assetMetadata.count();
+      const objectsBefore = await listObjects(STORE_DIR);
 
       const res = await upload(sampleBytes(name), cookie);
 
@@ -369,8 +382,9 @@ describe('上传 → 落库 → 签发 → 下载：一条真的能走通的链�
       await expect(prisma.assetVersion.count()).resolves.toBe(versionsBefore);
       // 而且没有「没有版本记录的作品」这种半成品
       await expect(prisma.assetMetadata.count()).resolves.toBe(metadataBefore);
-      // D1 第 3 条：拒绝 ⇒ 刚写进去的密文对象被删掉（零残留）
-      await expect(listObjects(STORE_DIR)).resolves.toEqual([]);
+      // D1 第 3 条：拒绝 ⇒ 刚写进去的密文对象被删掉。判据是「**没有新增对象**」
+      // （相对快照，不是「目录恰好是空的」——理由见 `listObjects` 的注释）。
+      await expect(listObjects(STORE_DIR)).resolves.toEqual(objectsBefore);
     });
   }
 
@@ -391,6 +405,7 @@ describe('上传 → 落库 → 签发 → 下载：一条真的能走通的链�
     const assetsBefore = await prisma.asset.count();
     const versionsBefore = await prisma.assetVersion.count();
     const metadataBefore = await prisma.assetMetadata.count();
+    const objectsBefore = await listObjects(STORE_DIR);
 
     await owner.query(`REVOKE INSERT ON asset.asset_versions FROM app_user`);
     let res: request.Response;
@@ -403,8 +418,9 @@ describe('上传 → 落库 → 签发 → 下载：一条真的能走通的链�
     expect(res.status, `响应体=${res.text}`).toBe(500);
     expect((res.body as { code?: string }).code).toBe('ASSET_PERSIST_FAILED');
 
-    // 负后果：**孤儿密文不存在**（那份制品没有任何行指向它，留着只会攒下永远下不来的对象）
-    await expect(listObjects(STORE_DIR)).resolves.toEqual([]);
+    // 负后果：**孤儿密文不存在**（那份制品没有任何行指向它，留着只会攒下永远下不来的对象）。
+    // 判据同样是「没有新增对象」（相对快照），不是「目录恰好是空的」。
+    await expect(listObjects(STORE_DIR)).resolves.toEqual(objectsBefore);
     // 事务整体回滚：连作品那一行也不留（半成品作品比没有作品更糟）。同样是**前后差值**
     // ——本文件前面的用例已经在库里留下过行，断言库级 0 是同义反复。
     await expect(prisma.asset.count({ where: { ownerId: uploader } })).resolves.toBe(0);
