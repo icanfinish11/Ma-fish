@@ -22,7 +22,15 @@ import { Policy, Public } from '../../common/policy/policy.decorator.js';
 import { RateLimited } from '../../common/security/throttler.js';
 import { currentContext } from '../../common/context/request-context.js';
 import { AssetAccessService, AssetVersionNotFoundError, type AssetMetadataView } from './asset-access.service.js';
-import { ArchiveRejectedError, ArtifactCleanupError, ArtifactUnreadableError, AssetService, type StoredArtifact } from './asset.service.js';
+import type { ArchiveKind } from './archive/sniff.js';
+import {
+  ArchiveRejectedError,
+  ArtifactCleanupError,
+  ArtifactUnreadableError,
+  AssetPersistFailedError,
+  AssetService,
+  type StoredArtifact,
+} from './asset.service.js';
 import { DownloadForbiddenError, DownloadService, DownloadTicketRejectedError, type IssuedDownload } from './download/download.service.js';
 import { UUID_IDENTIFIER } from './download/signed-url.js';
 import { AssetNotFoundError, SelfTransferRejectedError } from './ownership.service.js';
@@ -35,17 +43,31 @@ import { AssetNotFoundError, SelfTransferRejectedError } from './ownership.servi
 const UPLOAD_FIELD = 'file';
 
 /**
- * 上传成功的响应（**不含**任何服务端内部标识）。
+ * 上传成功的响应。
  *
- * 今天是「版本记录」里可以对外的那部分：`sha256`（与上传字节一致）、`plaintextBytes`
- * （明文长度）、`kind`（判定出来的归档类型）。**刻意没有** `storageKey` / `fileId` / `keyId`：
- * 存储键是服务端内部状态（Task 1 的控制器注释把它写成了 Task 5 的义务），
- * 而版本 id 要等 Task 7 把记录落库之后才有——那时这里会换成真正的资源标识。
+ * 五个字段，各自都有一个明确的用途（**不含**任何服务端内部标识）：
+ *
+ * | 字段 | 谁在用 |
+ * |---|---|
+ * | `assetId` | 这次上传**诞生的作品**（库里那一行） |
+ * | `assetVersionId` | 这份版本——**属主凭它去签发下载**（`POST /assets/versions/:id/download-url`） |
+ * | `sha256` | 与上传字节一致的明文摘要（客户端可自校验） |
+ * | `plaintextBytes` | 明文长度（**写入侧计量器**数出的那个数，也是库里那一列） |
+ * | `kind` | 判定出来的归档类型 |
+ *
+ * **刻意没有** `storageKey` / `fileId` / `keyId`：存储键是服务端内部状态
+ * （Task 1 的控制器注释把它写成了 Task 5 的义务）。
+ *
+ * **Task 9 之前这里是 `{sha256, plaintextBytes, kind}`**——一条「待落库记录」的可对外部分，
+ * 而那条记录当时**没有任何落点**：调用方拿到三个数，却拿不到任何能据以行动的东西
+ * （没有作品、没有版本、没有可下载的对象）。现在这两个 id 就是把那条缝合上之后的产物。
  */
 export interface IngestResponse {
+  assetId: string;
+  assetVersionId: string;
   sha256: string;
   plaintextBytes: number;
-  kind: 'zip' | 'tar.gz';
+  kind: ArchiveKind;
 }
 
 /**
@@ -91,6 +113,7 @@ const DOWNLOAD_CONTENT_TYPE = {
  * | `ArchiveRejectedError` | 422 | **制品本身**不可接受（上传路径的四种理由；下载路径的带外长度/末块/内容） |
  * | `ArtifactUnreadableError` | 500 | 服务端/存储侧读不回来（不是调用方的问题） |
  * | `ArtifactCleanupError` | 500 | 密文对象删不掉（**制品库里多了一个孤儿**） |
+ * | `AssetPersistFailedError` | 500 | 制品是好的，但作品/版本/元数据写不进库（密文对象**已经删掉**，客户端应重传） |
  *
  * ## `SelfTransferRejectedError` 为什么不选 404 也不选 422（Task 7 留给 Task 8 的那条裁定）
  *
@@ -143,6 +166,12 @@ export function assetErrorToHttp(error: unknown): HttpException | null {
     // 回 500 而不是 422——理由与痕迹都在 `AssetService.delete` 的注释里（含那行审计）。
     return new InternalServerErrorException({ code: 'ASSET_ARTIFACT_CLEANUP_FAILED' });
   }
+  if (error instanceof AssetPersistFailedError) {
+    // 制品通过了全部校验，写不进库的是**记录**（数据库侧故障）。回 500 而不是 4xx：
+    // 调用方上传的东西没有任何问题。此刻密文对象已经被删掉（见 `AssetService.ingest`），
+    // 因此客户端唯一正确的动作是重传——响应体里只给代号，不给库的内部明细。
+    return new InternalServerErrorException({ code: 'ASSET_PERSIST_FAILED' });
+  }
   return null;
 }
 
@@ -174,20 +203,27 @@ export function assetErrorToHttp(error: unknown): HttpException | null {
  * 这条归属不靠自觉：策略/限流覆盖率门断言了这三条路由**各自**的声明（含层名），
  * 集成套件另有一条「打到第 61 次必须 429」的行为见证。
  *
- * ## 制品上传（P1 / Task 1 建立；**Task 5 起是「加密即入库」的入口**）
+ * ## 制品上传（P1 / Task 1 建立；**Task 5 起是「加密即入库」的入口，Task 9 起真的落库**）
  *
- * ## 这条路径今天做四件事，顺序即语义
+ * ## 这条路径今天做五件事，顺序即语义
  *
  * 1. `FileInterceptor` 解析 multipart，自定义存储引擎把 part 流交给
  *    `AssetService.putStream`——**边收边分块加密**写进制品库（明文从不落盘：C21），
  *    并在同一趟里数出明文长度、算出明文 sha256；
- * 2. 处理器拿到写入回执之后调 `AssetService.finalize`：打开**按需解密**的随机访问读取器，
- *    **先认证末块**（Task 4 Step 0b），再用写入侧的明文长度做带外核对并校验归档；
+ * 2. `AssetService.finalize`：打开**按需解密**的随机访问读取器，**先认证末块**
+ *    （Task 4 Step 0b），再用写入侧的明文长度做带外核对并校验归档；
  * 3. 校验失败 ⇒ 那一半已经把密文对象删掉了，这里把结论翻成 **422**（4xx）；
- * 4. 校验通过 ⇒ 返回待落库的版本记录里可对外的那三个字段。
+ * 4. `parseMetadata`（Task 6）：在同一个制品上抽出可浏览的元数据（绝不执行其中任何内容）；
+ * 5. `persistIngested`（Task 7）：**作品 + 版本 + 元数据在同一个事务里落库**，
+ *    作品的所有人是**上传者本人**（控制器裁定）。落库失败 ⇒ 密文对象被删掉 + 500。
  *
  * 中间**没有**「先落盘明文再校验」的分支：zip 的中央目录在文件末尾，单趟前向流校验不了，
  * 而加密即入库是唯一同时满足「明文不落盘」与「不把 1 GB 读进内存」的形状（D1）。
+ *
+ * **据实记载（Task 9 之前这里缺的是什么）**：第 4、5 步此前根本不存在——这条路径会校验、
+ * 会加密、会返回三个数，却**从不创建任何作品或版本**，于是「上传一个包然后下载它」
+ * 在端到端上不成立（下载路径的输入只能由测试手搓）。合上这条缝的是 `AssetService.ingest`，
+ * 判据是 `tests/integration/asset/ingest-download-chain.test.ts`。
  *
  * ## 为什么 422 而不是 400 / 415
  *
@@ -233,10 +269,26 @@ export class AssetController {
     }
 
     try {
-      // `uploadedById` 来自请求上下文（`SessionMiddleware` 填的），不是调用方给的参数：
-      // 归属只能由服务端认定。Task 7 落库时用它填 `uploadedById`。
-      const version = await this.assets.finalize(file, { uploadedById: currentContext()?.userId ?? null });
-      return { sha256: version.sha256, plaintextBytes: version.plaintextBytes, kind: version.kind };
+      /**
+       * `ownerId` 来自请求上下文（`SessionMiddleware` 填的），**不是**调用方给的参数：
+       * 归属只能由服务端认定。控制器的裁定是「**上传者即所有人**」——它是唯一一个不需要
+       * 额外产品输入的选择，且与 D11（所有人可以下载）一致。
+       *
+       * 这里没有「没有身份」的分支：`@Policy({ resource: 'Asset', action: 'create' })`
+       * 要求身份，`PolicyGuard` 因此保证了它存在（方案 B）。万一那条链被改坏，
+       * 传下去的空串会在库里以 `22P02` 失败 ⇒ 500 + `ASSET_PERSIST_FAILED`
+       * ——那是一个**服务端不变量被破坏**的正确表现，不是一次 4xx。
+       */
+      const ownerId = currentContext()?.userId ?? '';
+      // 一条链路：加密即入库（multer 早已接走）→ 校验 → 解析元数据 → 作品/版本/元数据落库。
+      const ingested = await this.assets.ingest(file, { ownerId });
+      return {
+        assetId: ingested.assetId,
+        assetVersionId: ingested.assetVersionId,
+        sha256: ingested.sha256,
+        plaintextBytes: ingested.plaintextBytes,
+        kind: ingested.kind,
+      };
     } catch (error) {
       // 翻译只有一处（`assetErrorToHttp`）：403/404/409/422/500 的每一档都在那里说明责任方。
       throw assetErrorToHttp(error) ?? error;

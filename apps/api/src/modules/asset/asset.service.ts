@@ -5,6 +5,11 @@ import { pipeline } from 'node:stream/promises';
 import { AuditService } from '../audit/index.js';
 import type { ArchiveKind } from './archive/sniff.js';
 import { validateArchive, type ArchiveVerdict } from './archive/validate-archive.js';
+// **必须是值导入，不能写 `import type`**（与 `auth/session.middleware.ts` 里那条实测记载同源）：
+// 构造参数的类型元数据（`design:paramtypes`）只有在参数类型是**值**导入时才写进产物；
+// 写成 `import type` 后 tsc 会把它 emit 成 `[Function]`，Nest 于是拿 `Function` 去查找
+// 提供者、失败并抛「Nest can't resolve dependencies of the AssetService (?, ?, ?, ?)」。
+import { AssetVersionService } from './asset-version.service.js';
 import {
   CHUNK_SIZE,
   FOOTER_BYTES,
@@ -15,6 +20,7 @@ import {
 } from './crypto/artifact-format.js';
 import { ChunkEncryptor } from './crypto/chunk-cipher.js';
 import { KEY_RING, type KeyRing } from './crypto/key-ring.js';
+import { parseMetadata, type ParsedMetadata } from './metadata/parse-metadata.js';
 import { ARTIFACT_STORE, ArtifactTooLargeError, type ArtifactStore } from './store/artifact-store.port.js';
 import { EncryptedArtifactReader } from './store/random-access-reader.js';
 
@@ -31,11 +37,23 @@ import { EncryptedArtifactReader } from './store/random-access-reader.js';
  *                                         ├─ validateArchive（带**写入侧**的明文长度交叉核对）
  *                                         ├─ 拒绝 ⇒ delete(密文对象) + ArchiveRejectedError
  *                                         └─ 通过 ⇒ IngestedVersion（待落库记录）
+ *
+ *                        ingest ─────────▶ finalize（上面那一半）
+ *                                         ├─ parseMetadata（Task 6）
+ *                                         └─ persistIngested（Task 7）⇒ 作品 + 版本 + 元数据
  * ```
  *
  * 两半为什么分开：上传流由 multer 的存储引擎接走（Task 1 的 `createStreamingStorage`），
  * 而校验必须等制品**写完**——zip 的中央目录在文件**末尾**，单趟前向流读不到（D1 的结构性理由）。
  * 中间没有任何落盘缓冲，也没有「先落盘明文再校验」的分支：那正是 C21 结构性排除的东西。
+ *
+ * ## 两半的名字为什么是两个方法（Task 9）
+ *
+ * {@link AssetService.finalize} 是**校验那一半**，契约从 Task 5 起**一个字节都没变**：
+ * 它只回答「这份制品能不能收」，返回待落库的记录。{@link AssetService.ingest} 是**整条链路**：
+ * 它在 `finalize` 之后解析元数据并落库，把「上传一个包」变成「库里真的有一份作品」。
+ * 分开保留了既有那批用例的边界（拒绝路径、限额边界、并发都在 `finalize` 上测），
+ * 而「接线」这件事有它自己的端到端用例（`ingest-download-chain.test.ts`）。
  *
  * ## 明文长度的**唯一**来源（Task 4 §9.2 的移交义务）
  *
@@ -48,27 +66,16 @@ import { EncryptedArtifactReader } from './store/random-access-reader.js';
  * - **不是**上传元数据里的任何数（客户端说的长度不作数）。
  *
  * 两个量在用例里有正对着的断言：`receipt.plaintextBytes !== upload.bytes`。
- *
- * ## 待落库记录的**接缝**（据实记载：Task 7 的表还不存在）
- *
- * `finalize` 返回 {@link IngestedVersion}——**行形状**的版本记录，含
- * `sha256` / `plaintextBytes` / `keyId` / `fileId` / `storageKey` / `kind` / `uploadedById`。
- * 今天**没有任何地方**能把它落库：`Asset` / `AssetVersion` / `AssetMetadata` 模型还不存在
- * （`prisma/schema.prisma` 只有 `User` / `Identity` / `AuditLog` / `OutboxEvent` / `ProcessedJob`），
- * 而 `asset` schema 与迁移是 **Task 7** 的所有权（本任务明令不得自造 schema）。
- *
- * 因此这条接缝就是**返回值本身**：类型在这里、字段在这里、用例逐字段断言它。
- * **Task 7 必须**把 `plaintextBytes` 落进 `asset_versions` 的对应列（P1 计划里叫
- * `plaintextBytes`），**Task 8 必须**在下载路径上把它作为 `expectedPlaintextLength` 传回
- * `validateArchive`——那时这条交叉核对才在「制品已在盘上静止」的场景里真正生效
- * （见 `validate-archive.ts` 文件头的那段移交要求）。**不要**把 `storageKey` 漏掉：
- * P1 计划的 `AssetVersion` 字段清单里没有它，而下载路径要靠它找到对象。
+ * 同一个数还是 `asset_versions.plaintext_bytes` 那一列的来源，而下载路径会把它作为
+ * `expectedPlaintextLength` 传回同一个校验器——**同一条核对在接入期与下载期各成立一次**
+ * （Task 7 与 Task 8 的移交义务；Task 9 起这条链路是通的，见 `ingest`）。
  */
 @Injectable()
 export class AssetService {
   private readonly store: ArtifactStore;
   private readonly ring: KeyRing;
   private readonly audit: AuditService;
+  private readonly versions: AssetVersionService;
 
   /**
    * 密钥环来自 `KEY_RING` 提供者（**Task 8 提取**，原先是本类构造期自己建的）。
@@ -83,15 +90,21 @@ export class AssetService {
    *
    * 刻意**没有**把 `ConfigService` 从构造参数里删掉：本类不再需要它（环的输入只有
    * 那两个环境变量），把不用的依赖留在签名里正是「看起来还需要」的那类噪音。
+   *
+   * **Task 9 加了第四个依赖**（`AssetVersionService`）：{@link AssetService.ingest} 的第三步
+   * 就是它。它是**值导入**（不是 `import type`），理由见文件顶部那段实测记载——
+   * 构造参数的类型元数据只能由值导入 emit 出来。
    */
   constructor(
     @Inject(ARTIFACT_STORE) store: ArtifactStore,
     @Inject(KEY_RING) ring: KeyRing,
     audit: AuditService,
+    versions: AssetVersionService,
   ) {
     this.store = store;
     this.audit = audit;
     this.ring = ring;
+    this.versions = versions;
   }
 
   /**
@@ -220,6 +233,104 @@ export class AssetService {
       kind: verdict.kind,
       uploadedById: opts.uploadedById ?? null,
     };
+  }
+
+  /**
+   * **把这次上传接入成一份作品**（Task 9 合上的那条缝）：校验 → 解析元数据 → 落库。
+   *
+   * ## 三步，顺序即语义（每一步的失败处置都不一样）
+   *
+   * ```
+   * putStream（multer 的存储引擎接走：加密即入库）
+   *    │
+   *    ├─ ① finalize        校验（带外长度核对 + 末块认证 + 嗅探）
+   *    │                     失败 ⇒ 密文对象已被删掉 + ArchiveRejectedError（422）
+   *    ├─ ② parseMetadata   Task 6 的静态解析（同一个刚写下的制品，重新打开一个读取器）
+   *    │                     失败 ⇒ 密文对象被删掉 + ArtifactUnreadableError（500）
+   *    └─ ③ persistIngested Task 7 的落库（作品 + 版本 + 元数据，**一个事务**）
+   *                          失败 ⇒ 密文对象被删掉 + AssetPersistFailedError（500）
+   * ```
+   *
+   * ## 为什么作品必须在**校验之后**才诞生
+   *
+   * `Asset` 是**永久实体**（有版本史与所有权史，库里没有删除它的入口）。为一个后来被判定
+   * 为恶意/损坏的包留下一个空作品，比干净地拒绝一次上传难收拾得多。这里的顺序是结构性的：
+   * 落库那一句在 `finalize` 之后，而 `finalize` 不通过就直接抛错。
+   *
+   * ## 落库失败时为什么**删掉密文对象**（规格 §5 第 3 条要求的那个明确决定）
+   *
+   * 三个候选是：①删掉重来、②留着不管、③留着并记一个「待清理」标记。选 **①**，理由：
+   *
+   * - 制品库里唯一的合法状态是「每一个对象都有一行 `asset_versions` 指向它」。③ 的「待清理
+   *   标记」在本仓库里就是 `audit_logs` 的一行（Task 5 的 `asset.artifact.cleanup_failed`
+   *   已经建立了这个形状），而它的语义是「**该删的没删掉**」——用它去表达「这份制品也许
+   *   还有用」会让两种完全不同的运维动作挤进同一个 `action`；
+   * - ② 留下的对象**任何人都不可能再取到**：没有版本记录就没有 `storageKey` 的读者
+   *   （下载路径按 `AssetVersion` 找对象），它只会无声地攒下去；
+   * - 删除走的是**唯一**的那个出口 {@link AssetService.delete}：它自带同步重试、
+   *   失败时的 append-only 审计（`asset.artifact.cleanup_failed`，同时就是待清理标记）
+   *   与 500。也就是说「删不掉」这一支**已经被处置过**，不需要在这里再发明一层。
+   *
+   * 代价如实记录：一次**瞬时**的数据库故障会让用户重传整个包（而不是稍后自动重试）。
+   * 这是刻意的取舍——另一种选法是留一个没有任何读者、也没有任何标记的孤儿对象，
+   * 而「孤儿会无声地累积」正是 Task 5 的删除失败处置要防的形态。
+   *
+   * ## 双重故障（据实记载的边界）
+   *
+   * 落库失败**且**删除也失败时，抛出去的是 `ArtifactCleanupError`（更严重的那一件：
+   * 制品库里真的多了一个孤儿，而它自己已经在审计里留了一行）。**这一次落库失败的原因
+   * 不落任何持久介质**——排障要看的是那行审计，不是被顶掉的那条消息。
+   *
+   * @param upload `putStream` 的返回值（multer 会把它原样交给控制器）。
+   * @param opts.ownerId **上传者本人**（控制器裁定：上传者即所有人）。它同时是
+   *   `uploadedById`：一次刚发生的上传里，「上传人」与「所有人」就是同一个人
+   *   （转让之后才会分叉，那正是两列都存在的原因）。
+   */
+  async ingest(upload: StoredArtifact, opts: { ownerId: string }): Promise<IngestedAsset> {
+    // ① 校验。不通过时 `finalize` 已经删掉密文对象并抛错，这里不做任何补救。
+    const ingested = await this.finalize(upload, { uploadedById: opts.ownerId });
+
+    /**
+     * ② 元数据（Task 6 的静态解析）。
+     *
+     * 读取器是**新开的**：`finalize` 里那个是它自己的局部变量，用完即弃（绝不池化，
+     * 见 `finalize` 的注释）。代价是头部与索引会被再读一次（一块之内，且不重复解压）；
+     * 换来的是 `finalize` 的契约**一个字节都没变**——它仍然只负责「校验并给出待落库记录」，
+     * 于是既有的那批用例（含拒绝路径、限额边界、并发）继续测着同一条边界。
+     *
+     * 失败与「`validateArchive` 抛错」同一处置：**读不出来的制品没有任何用途**
+     * ⇒ 删掉 + 归成「制品读不回来」（500）。Task 6 的文件头把这条移交写得明确：
+     * 「这时抛错由调用方按『制品读不回来』处置」。
+     */
+    let metadata: ParsedMetadata;
+    try {
+      const reader = await EncryptedArtifactReader.open(this.store, ingested.storageKey, this.ring);
+      metadata = await parseMetadata(reader, ingested.kind);
+    } catch (error) {
+      await this.delete(ingested.storageKey);
+      throw new ArtifactUnreadableError(ingested.storageKey, error instanceof Error ? error.message : String(error));
+    }
+
+    // ③ 落库：作品（所有人 = 上传者）+ 版本 + 元数据，同一个事务。
+    try {
+      const persisted = await this.versions.persistIngested({
+        ownerId: opts.ownerId,
+        ingested,
+        metadata,
+      });
+      return {
+        assetId: persisted.assetId,
+        assetVersionId: persisted.assetVersionId,
+        sha256: ingested.sha256,
+        plaintextBytes: ingested.plaintextBytes,
+        kind: ingested.kind,
+      };
+    } catch (error) {
+      // **密文对象不能留成孤儿**（见上面那段）：落库失败 = 这份制品没有任何行指向它，
+      // 因此与「校验不通过」同一条处置——走**唯一**的删除出口（它自带重试、审计与 500）。
+      await this.delete(upload.key);
+      throw new AssetPersistFailedError(ingested.storageKey, error instanceof Error ? error.message : String(error));
+    }
   }
 
   /**
@@ -364,10 +475,11 @@ export interface StoredArtifact {
 }
 
 /**
- * 待落库的版本记录（**Task 7 的对象**，见类注释里的接缝说明）。
+ * 待落库的版本记录（`finalize` 的返回值；Task 7 的 `persistIngested` 是它唯一的落点）。
  *
  * 字段刻意用「行」的粒度：Task 7 把它铺成 `Asset` / `AssetVersion` / `AssetMetadata` 时
  * 不需要再回到这里补任何东西——特别是 `plaintextBytes`，它是**唯一**那条带外长度的载体。
+ * Task 9 起它的生产落点是 {@link AssetService.ingest} 的第三步（此前只有用例调用它）。
  */
 export interface IngestedVersion {
   /** 制品库对象键（下载路径靠它取对象；**不**出现在 HTTP 响应里）。 */
@@ -378,6 +490,24 @@ export interface IngestedVersion {
   readonly fileId: string;
   readonly kind: ArchiveKind;
   readonly uploadedById: string | null;
+}
+
+/**
+ * 一次上传**落库之后**的结果（{@link AssetService.ingest} 的返回值）。
+ *
+ * 它是「这次上传诞生的东西」的可操作标识：`assetId` 是作品（库里那一行）、
+ * `assetVersionId` 是版本（签发下载要用的就是它）。存储键**刻意不在**这里——
+ * 那是服务端的内部定位量，对外的形状由控制器决定（`IngestResponse`）。
+ */
+export interface IngestedAsset {
+  readonly assetId: string;
+  readonly assetVersionId: string;
+  /** 明文的 sha256（hex）：与上传的字节一致，不是密文的摘要。 */
+  readonly sha256: string;
+  /** 明文字节数（**写入侧计量器**数出的那个数，也是库里 `plaintext_bytes` 那一列）。 */
+  readonly plaintextBytes: number;
+  /** 判定出来的归档类型（下载响应的 `Content-Type` 也由它推导）。 */
+  readonly kind: ArchiveKind;
 }
 
 /**
@@ -432,6 +562,32 @@ export class ArtifactCleanupError extends Error {
         (auditFailure === null ? '' : `；审计写入同样失败：${auditFailure}`),
     );
     this.name = 'ArtifactCleanupError';
+  }
+}
+
+/**
+ * **落库失败**：归档通过了全部校验、元数据也解析出来了，但作品/版本/元数据写不进库
+ * （{@link AssetService.ingest} 的第三步）。
+ *
+ * 责任方**只可能是服务端**（库不可用、约束被撤、连接耗尽），因此走 500 而不是 4xx：
+ * 调用方上传的东西没有任何问题，把它说成「你的文件不行」是撒谎。
+ *
+ * 它**不是** {@link ArtifactUnreadableError} 的兄弟：那一个说的是「制品读不回来」，
+ * 这一个说的是「制品是好的，但记录写不下去」。两者的排障方向完全不同（前者看存储/解密，
+ * 后者看数据库），因此分成两个类型、两个 `code`——本仓库「状态码与代号要说清责任方」的
+ * 同一条口径。
+ *
+ * **此刻密文对象已经被删掉了**（见 `ingest` 里为什么这么选）：也就是说这个错误的
+ * 出现意味着「本次上传的全部痕迹都已清空」，客户端唯一正确的动作是重传。
+ */
+export class AssetPersistFailedError extends Error {
+  constructor(
+    /** 被删掉的那个对象键。只出现在错误消息里（**不进响应体**，C11）。 */
+    readonly key: string,
+    readonly detail: string,
+  ) {
+    super(`上传已通过校验，但版本记录写不进库（制品 ${key} 已删除）：${detail}`);
+    this.name = 'AssetPersistFailedError';
   }
 }
 

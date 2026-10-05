@@ -242,19 +242,20 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
     await prisma.$connect();
     storeDir = await mkdtemp(join(tmpdir(), 'vca-t7-store-'));
     store = new LocalArtifactStore(storeDir);
-    // `AssetService` 的三个依赖都注入**真的**那一个：存储（真目录）、密钥环（测试夹具）、
-    // 审计（真库）。
+    // `AssetService` 的四个依赖都注入**真的**那一个：存储（真目录）、密钥环（测试夹具）、
+    // 审计（真库），以及落库服务（Task 9 起是第四个依赖，`ingest` 的第三步要用它）。
     //
     // **Task 8 改了这里的第二个入参**：密钥环原先由 `AssetService` 在自己的构造期从
     // `ConfigService` 现建，Task 8 把它提取成 `KEY_RING` 提供者（下载路径是第二个消费者，
     // 这正是 Task 5 的注释预告的时机）。因此这里给的是 `ringFromEnv()`——**同一份**环境夹具
     // 算出的同一个环，而不是另造一个。
+    versions = new AssetVersionService(prisma);
     assets = new AssetService(
       store,
       ringFromEnv(),
       new AuditService(prisma),
+      versions,
     );
-    versions = new AssetVersionService(prisma);
   }, 240_000);
 
   afterAll(async () => {
@@ -517,13 +518,15 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
     // （另一个文件正在用的对象被删），而不是静默跑错。
     await rm(storeDir, { recursive: true, force: true });
     store = new LocalArtifactStore(storeDir);
-    // 第二个入参是密钥环（Task 8 起从 `ConfigService` 换成 `KEY_RING`，理由见第 2 节的同一条）。
+    // 第二个入参是密钥环（Task 8 起从 `ConfigService` 换成 `KEY_RING`，理由见第 2 节的同一条）；
+    // 第四个是落库服务（Task 9 起 `AssetService.ingest` 的第三步用它）。
+    versions = new AssetVersionService(prisma);
     assets = new AssetService(
       store,
       ringFromEnv(),
       new AuditService(prisma),
+      versions,
     );
-    versions = new AssetVersionService(prisma);
     ownership = new OwnershipService(prisma);
   }, 240_000);
 
