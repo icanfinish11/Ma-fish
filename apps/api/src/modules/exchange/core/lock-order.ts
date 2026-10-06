@@ -1,3 +1,4 @@
+import { rowLockOrder } from '../../../common/db/lock-order.js';
 import { UnknownLockOrderError } from './errors.js';
 
 /**
@@ -14,12 +15,16 @@ import { UnknownLockOrderError } from './errors.js';
  * 不得插入任何别的写动作。`assertLockOrderHeld` 是这条纪律的运行期判据
  * （Task 7/8 的每条双锁路径在取锁前调它）。
  *
- * ## 它与账本那一侧的关系（据实划界）
+ * ## 它与账本那一侧的关系（Task 4 之后的实况）
  * 预检 §B.1 第（3）条实测：`applyBalances` 的「按金额升序、借方先」**不是全局锁序**
  * ——它连自己那条路径上的取锁点都没覆盖全（`entries.createMany` 对被引用账户取
  * `FOR KEY SHARE`，先于它）。因此**账户行**的锁序是 Task 4 的另一条判据
- * （`tests/integration/ledger/account-lock-order.test.ts`），与这里这条**各自**成立：
- * 本文件只管**作品行**，而它证明的是「两条路径排出来的顺序相同」。
+ * （`tests/integration/ledger/account-lock-order.test.ts`）。
+ * **据实记载一次结构变更**：Task 4 落地时发现「两边各排一次序」是唯一不做提取的写法，
+ * 于是把**顺序判据本身**提到了 `common/db/lock-order.ts`（`rowLockOrder`），
+ * 本文件的 `lockOrder` 与账本的 `lockAccountRows` **import 同一个函数**。
+ * 两个调用方各自只证明自己那一半（资产侧是纯判据、账户侧是真库取锁顺序），
+ * 而「它们是同一个决定」由变异探针 `P-ORDER-SHARED` 见证。
  */
 
 /**
@@ -28,13 +33,19 @@ import { UnknownLockOrderError } from './errors.js';
  * 返回的是**新数组**（不就地排序入参）：调用方手里的 `[assetAId, assetBId]` 是合约行
  * 的字段，就地排序会把「排序」这件事漏回给读那一行的人——而锁序必须是**取锁那一刻**
  * 算出来的东西，不是某个对象上被别人改过的状态。
+ *
+ * ## ★ 顺序判据本身在 `common/db/lock-order.ts`（Task 4 的提取，据实记载一次结构变更）
+ * Task 4 要把**同一条判据**施加到**账户行**上，而 `ledger` 不能 import `exchange/core/*`
+ * （`no-cross-module-internals`：跨模块只走 `index.ts`）。不提取的话唯一可行的写法是
+ * **两边各排一次序**——两份「逐字相同」的实现会在第一次有人只改一边时分开，而后果只在
+ * 真并发下现身。⇒ 判据被提到 `common/db/`，本函数变成它的**资产侧具名包装**：
+ * 名字与领域词汇（「资产锁序」）留在这里，决定只有一份。
+ * 见证（变异探针 `P-ORDER-SHARED`）：把 `common/db/lock-order.ts` 的比较器反过来，
+ * `tests/unit/exchange/lock-order.test.ts` 与 `tests/integration/ledger/account-lock-order.test.ts`
+ * **同时**变红——那正是「一个实现、两个调用方」与「两份实现」的区别。
  */
 export function lockOrder(assetIds: readonly string[]): readonly string[] {
-  // `new Set` 先去重：同一件作品在一次事务里被引用两次（例如两行都指向同一件）
-  // 只该锁一次，否则 `assertLockOrderHeld([a], [a])` 之后还要再锁一次同样的行。
-  // 比较写成三元而不是 `a.localeCompare(b)`：见文件头（`pnpm arch` 之外的唯一纪律落点
-  // 是 `lock-order.test.ts` 里那条大小写混合的用例）。
-  return [...new Set(assetIds)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return rowLockOrder(assetIds);
 }
 
 /** 双锁流程的具名包装：恰好两个资产，且**已经按全局锁序**。 */

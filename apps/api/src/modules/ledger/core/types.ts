@@ -1,4 +1,5 @@
 import type { AccountKind } from './account-kind.js';
+import { UnknownTransactionKindError } from './errors.js';
 
 /**
  * 纯核心的输入/输出形状（Task 5）。**这里没有任何 I/O、没有 Nest、没有 Prisma。**
@@ -53,6 +54,27 @@ export const TRANSACTION_KINDS = {
 } as const;
 
 export type TransactionKind = (typeof TRANSACTION_KINDS)[keyof typeof TRANSACTION_KINDS];
+
+const TRANSACTION_KIND_SET: ReadonlySet<string> = new Set(Object.values(TRANSACTION_KINDS));
+
+/**
+ * D5 / 控制器裁定 ⑦ 的执行点：§8.2 之外的 kind 一律抛 `UnknownTransactionKindError`。
+ *
+ * 形状与 `account-kind.ts` 的 `assertAccountKind` **逐字同源**（含 `asserts` 而不是返回
+ * boolean 的理由：它的真实用武之地是**从库里读回来的字符串**与**调用方给的字符串**，
+ * 两处都必须把 `string` 收窄成 `TransactionKind` 才能交给下游）。
+ *
+ * **它在 `postLegs` 的 `assertBalanced` 之后、幂等判定之前**：一笔 kind 就是错的请求不该
+ * 被当成「一次幂等重放 / 冲突」来回答（那个顺序的理由与 C28 那条 `assertBalanced` 完全相同，
+ * 见 `postLegs` 的注释）。顺序由 `tests/integration/ledger/transaction-kind.test.ts` 里
+ * 「同键 + 同腿 + 非法 kind ⇒ 报 kind 而不是 409」那条**判别性**用例见证。
+ *
+ * **不做 trim、不做大写归一化**：§8.2 的六行是全大写英文，`' TOPUP'` 与 `'TOPUP'` 在
+ * `transactions.kind` 那一列上是**不同的值**（幂等重放的判别式与对账都会静默看错）。
+ */
+export function assertTransactionKind(kind: string): asserts kind is TransactionKind {
+  if (!TRANSACTION_KIND_SET.has(kind)) throw new UnknownTransactionKindError(kind);
+}
 
 /** 一次过账请求（`LedgerService.post` 的输入形状）。 */
 export interface PostingRequest {

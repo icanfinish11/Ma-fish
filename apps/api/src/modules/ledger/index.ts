@@ -46,5 +46,9 @@ export {
   SystemAccountMissingError,
   UnbalancedPostingError,
   UnknownAccountKindError,
+  // P3 / Task 4（D5）：§8.2 之外的**交易** kind。**它必须在这里**：Task 6/7/8/10 的交换路径
+  // 自己构造 `post` 请求，传错 kind 时`instanceof` 是 HTTP 边界唯一能分开责任方的手段，
+  // 而跨模块引用只走 `index.ts`（§3.3 第 2 条 / `no-cross-module-internals`）。
+  UnknownTransactionKindError,
   ZeroAmountLegError,
 } from './core/errors.js';

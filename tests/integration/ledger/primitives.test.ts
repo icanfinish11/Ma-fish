@@ -485,9 +485,18 @@ describe('五个原语（§8.2 / §8.4）', () => {
     } finally {
       await observer.end();
     }
+    // ★ P3 / Task 4 更新了这条构造见证的**具体语句**（它必须跟着取锁点走，否则守的是一个
+    //   已经不存在的形状）：C35 的账户行锁序在 `createMany`/`applyBalances` 之前多了一句
+    //   `SELECT … ORDER BY id FOR UPDATE`，于是 A 现在卡在**那一句**上（在 `applyBalances`
+    //   之前、且在快照读取之后——`findUnique` / `loadSnapshots` 都是纯读、不取锁）。
+    //   **这条用例的本体一字未动**：下面 `kind === USER_FROZEN` 与 `stage === 'conditional-update'`
+    //   两句才是「守卫对冻结余额生效」的判据，它们仍然成立（`stage` 由条件更新那条 UPDATE 的
+    //   重新求值产出）。**据实记载**：这条「卡在哪条语句上」的断言因此**不再区分**冻结那一侧
+    //   与可用那一侧（两边现在卡在同一句上），区分力全在 `kind` 那一句与探针 `p-frozen-guard`
+    //   （把守卫去掉 ⇒ 本条红）——本任务重跑过那个探针（`P-FROZEN-GUARD`，实测仍红）。
     expect(
-      blockedStatements.filter((sql) => /UPDATE\s+"ledger"\."accounts"[\s\S]*"balance" >=/.test(sql)),
-      `等锁的语句必须**是那条带余额守卫的条件更新**（否则这条用例证明的不是「守卫对冻结余额生效」）。实测等锁语句：${JSON.stringify(blockedStatements)}`,
+      blockedStatements.filter((sql) => /FROM "?ledger"?\."?accounts"?[\s\S]*ORDER BY id FOR UPDATE/.test(sql)),
+      `等锁的语句必须是那条**按 id 升序取全部账户行锁**的 SELECT（C35 的取锁点，且它在余额更新之前）。实测等锁语句：${JSON.stringify(blockedStatements)}`,
     ).toHaveLength(1);
 
     release();

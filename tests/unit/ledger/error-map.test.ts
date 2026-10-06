@@ -13,6 +13,7 @@ import {
   SystemAccountMissingError,
   UnbalancedPostingError,
   UnknownAccountKindError,
+  UnknownTransactionKindError,
   UnknownUserError,
   ZeroAmountLegError,
 } from '@vca/api/modules/ledger/core/errors.js';
@@ -124,6 +125,16 @@ const ROWS: Row[] = [
     status: 422,
     code: 'LEDGER_UNKNOWN_ACCOUNT_KIND',
   },
+  {
+    // P3 / Task 4（D5 / 控制器裁定 ⑦）：§8.2 之外的**交易** kind。
+    // 与上一档同档（422）的理由逐字写在 `core/errors.ts` 那个类的注释里：`kind` **不是**
+    // HTTP 入参（六个原语各自硬编码自己的 kind），因此走到这里的只可能是我们自己的代码传错值
+    // ——那是「数据/程序」的问题，与「调用方给的参数不对」（400）不是一回事。
+    label: 'UnknownTransactionKindError（D5：§8.2 之外的交易 kind）',
+    error: () => new UnknownTransactionKindError('NOT_A_KIND'),
+    status: 422,
+    code: 'LEDGER_UNKNOWN_TRANSACTION_KIND',
+  },
 ];
 
 describe('领域错误 → HTTP 的翻译表（唯一出口）', () => {
@@ -141,10 +152,11 @@ describe('领域错误 → HTTP 的翻译表（唯一出口）', () => {
 
   it('两张表不许撞码：每一档的 `code` 两两不同（撞码 = 责任方再也分不开）', () => {
     const codes = ROWS.map((row) => row.code);
-    // 非空转前提：先证明这一组确实有 13 档（否则「两两不同」在空数组上恒真）。
-    // 12 → 13 是 P2 最终审查 C1 加的 `UnknownUserError`（404）；这条下限的用途正是
-    // 「表里少了一档时必须红一次」，因此它跟着表一起改，不许单独放宽。
-    expect(codes).toHaveLength(13);
+    // 非空转前提：先证明这一组确实有 14 档（否则「两两不同」在空数组上恒真）。
+    // 12 → 13 是 P2 最终审查 C1 加的 `UnknownUserError`（404）；13 → 14 是 P3 / Task 4（D5）
+    // 加的 `UnknownTransactionKindError`（422）。这条下限的用途正是「表里少了一档时必须红一次」，
+    // 因此它跟着表一起改，不许单独放宽。
+    expect(codes).toHaveLength(14);
     expect(new Set(codes).size).toBe(codes.length);
     // 再看运行期：每一种错误实例真的翻译出上表里那个 code（而不是只在表面上不同）。
     const actual = ROWS.map((row) => (ledgerErrorToHttp(row.error())?.getResponse() as { code: string }).code);

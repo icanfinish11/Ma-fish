@@ -60,6 +60,33 @@ export class UnknownAccountKindError extends Error {
   }
 }
 /**
+ * §8.2 之外的**交易**类型（P3 / Task 4；D5 / 控制器裁定 ⑦）。
+ *
+ * ## 它挡的是什么（预检 §D.1 的 `[E3]` 实测，逐字）
+ * ```
+ * [E3] ledger.transactions 上的约束 = [{"conname":"transactions_pkey","def":"PRIMARY KEY (id)"}]
+ * [E3] 用一个 §8.2 之外的 kind 过账 ⇒ 成功（没有任何东西拦住它）
+ * [E3] 库里 kind = NOT_A_KIND 的行数 = 1
+ * ```
+ * 与 `UnknownAccountKindError` 是同一族（一次「声明了但未强制」）：`accounts.kind` 至少有
+ * 条件化 CHECK 兜着，而 `transactions.kind` 那一列上**什么约束都没有**——CHECK 无法枚举
+ * 「§8.2 的六行」，因此这是**应用**的活。
+ *
+ * ## 为什么它与 `UnknownAccountKindError` 是**同一档**（422）而不是 400
+ * 那个错误说的是「**库里的数据**出现了 §8.1 之外的取值」；这个说的是「**这次请求**里的
+ * `kind` 不在 §8.2 的六行里」。看起来更像 400，但**它不是**：`kind` **不是** HTTP 入参
+ * ——六个原语各自硬编码自己的 kind，HTTP 边界上根本没有这一个字段
+ * （`grantCreditsSchema` 里没有 `kind`）。因此走到这里的只可能是**我们自己的**代码
+ * 传错了一个值——那是**数据/程序**的问题，与「调用方给的参数不对」不是一回事。
+ * ⇒ 422，与 `UnknownAccountKindError` 同档，`ledger-error-map.ts` 里相邻两行。
+ */
+export class UnknownTransactionKindError extends Error {
+  constructor(readonly kind: string) {
+    super(`未知的交易类型（§8.2 只有六行）：${kind}`);
+    this.name = 'UnknownTransactionKindError';
+  }
+}
+/**
  * 引用的用户**不存在**（P2 最终全分支审查 C1）。
  *
  * ## 为什么它与 `UnknownAccountKindError`（422）分开

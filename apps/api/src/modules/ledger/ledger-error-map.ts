@@ -19,6 +19,7 @@ import {
   SystemAccountMissingError,
   UnbalancedPostingError,
   UnknownAccountKindError,
+  UnknownTransactionKindError,
   UnknownUserError,
   ZeroAmountLegError,
 } from './core/errors.js';
@@ -36,6 +37,7 @@ import {
  * | `MissingAccountError` / `SystemAccountMissingError` | 500 | 服务端数据缺失（迁移没跑 / 账户该在而不在） |
  * | `UnbalancedPostingError` / `EmptyPostingError` / `ZeroAmountLegError` / `NetZeroLegError` / `SelfMoveError` | **500** | 服务端**自己的** bug（C28：这些断言的存在就是为了在这里响亮） |
  * | `UnknownAccountKindError` | 422 | 数据里出现了 §8.1 之外的 kind（C30：五个之外一律不认） |
+ * | `UnknownTransactionKindError` | 422 | §8.2 之外的**交易** kind（P3/Task 4 的 D5：六行之外一律不认；`kind` 不是 HTTP 入参 ⇒ 只可能是我们自己传错了值） |
  * | **`P2028`（Prisma 交互式事务超时）** | **503** | 争用 / 锁等待超出事务预算。**不是**领域错误，但同样只有一个出口：500 会让调用方看不出**重试是安全的**（同一个幂等键会重放） |
  *
  * ## 为什么 409 而不是 400 / 422（与 P1 那次裁定同源）
@@ -117,6 +119,12 @@ export function ledgerErrorToHttp(error: unknown): HttpException | null {
     // 422：**数据里**出现了 §8.1 之外的 kind（C30）。刻意不是 400——调用方交给我们的
     // 参数是合法的（金额字符串、UUID 都对），不可接受的是那批数据本身。
     return new UnprocessableEntityException({ code: 'LEDGER_UNKNOWN_ACCOUNT_KIND' });
+  }
+  if (error instanceof UnknownTransactionKindError) {
+    // 422（P3 / Task 4；D5）：与上一档**同档**，理由逐字写在 `core/errors.ts` 那个类上——
+    // `kind` 不是 HTTP 入参（六个原语各自硬编码自己的 kind），因此走到这里的只可能是
+    // **我们自己的**代码传错了一个值。响应体同样只有 `code`（不回显那个取值：它是内部契约）。
+    return new UnprocessableEntityException({ code: 'LEDGER_UNKNOWN_TRANSACTION_KIND' });
   }
   if (error instanceof MissingAccountError) {
     return new InternalServerErrorException({ code: 'LEDGER_ACCOUNT_MISSING' });

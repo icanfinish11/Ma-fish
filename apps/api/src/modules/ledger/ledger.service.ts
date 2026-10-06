@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { uuidv7 } from '@vca/shared';
+import { rowLockOrder } from '../../common/db/lock-order.js';
 import { PrismaService } from '../../db/prisma.service.js';
 import { AuditService } from '../audit/index.js';
 // 跨模块引用**一律**经对方的 `index.ts`（设计 §3.3 第 2 条）——`no-cross-module-internals`
@@ -15,8 +16,8 @@ import {
 } from './core/errors.js';
 import { applyPosting, assertBalanced, movesToLegs, sameLegs } from './core/posting.js';
 import {
-  TRANSACTION_KINDS, type AccountRef, type AccountSnapshot, type MoneyMove, type PostingLeg,
-  type PostingLegsRequest, type PostingRequest, type PostingResult,
+  TRANSACTION_KINDS, assertTransactionKind, type AccountRef, type AccountSnapshot, type MoneyMove,
+  type PostingLeg, type PostingLegsRequest, type PostingRequest, type PostingResult,
 } from './core/types.js';
 import type { Prisma } from '../../generated/prisma/client.js';
 import { PLATFORM_FEE_BPS, computeFeeSplit } from './core/fee-split.js';
@@ -71,6 +72,7 @@ const frozenRef = (userId: string): AccountRef =>
  * | C25/D8 余额扣减的并发权威是**条件更新的受影响行数** | `applyBalances` | 「两笔并发各冻结 6000」+ 那条确定性用例（`stage === 'conditional-update'`）+ 「解冻」那条（`USER_FROZEN` 那一侧只有它看着）+ 「托管不透支」那条（I1：托管 / 收入那一侧） |
  * | C26/D9 幂等键是数据库**唯一约束**，三态：重放 / 409 / 新键 | `postLegs` 的 findUnique 比**腿 + kind** + `isIdempotencyConflict` | 幂等①②③ + 幂等②′（I2：同键同腿异 kind） |
  * | C28 「应用侧显式平衡断言」是唯一稳定的错误通道 | **`postLegs` 头部**那次 `assertBalanced` | 「直接腿入口」三条用例（探针 p7'：删掉它 ⇒ ② 变红） |
+ * | D5/裁定 ⑦ §8.2 之外的交易 `kind` 必须由**应用**拒绝（那一列上没有任何约束，CHECK 无法枚举六行） | **`postLegs` 头部**的 `assertTransactionKind`（在幂等判定之前） | `tests/unit/ledger/transaction-kind.test.ts`（闭集两侧）+ `tests/integration/ledger/transaction-kind.test.ts`（真服务路径 + 顺序） |
  * | D10 一笔过账一行审计，**写在同一个事务里** | `postLegs` 末尾的 `audit.record(…, tx)` | 「账本回滚 ⇒ 审计行 0 行」（独立断言） |
  *
  * **不要**把延迟约束触发器当主错误通道：实测经 Prisma 7.10.0 时它退化成
@@ -180,6 +182,12 @@ export class LedgerService {
     // ↓ C28 的执行点（本文件里**唯一**一次）：腿集不来自 `movesToLegs` 的那条路上，
     //   这是「借贷必须平衡」的第一道、也是唯一一道应用侧守卫。
     assertBalanced(legs);
+    // ↓ D5（控制器裁定 ⑦）：`kind` 的运行期执行者。位置是**承重**的：在幂等判定**之前**，
+    //   因此一笔 kind 就是错的请求不会被当成「一次幂等重放 / 冲突」来回答。理由与上面那条
+    //   `assertBalanced` 逐字相同（见本方法签名后的长注释）——「结构上就是错的请求」
+    //   先报结构错误。见证：`tests/integration/ledger/transaction-kind.test.ts` 的
+    //   「同键 + 同腿 + 非法 kind ⇒ 不是 409」那条（把这一行挪到 `findUnique` 之后它就红）。
+    assertTransactionKind(request.kind);
 
     const existing = await tx.ledgerTransaction.findUnique({
       where: { idempotencyKey: request.idempotencyKey },
@@ -210,6 +218,15 @@ export class LedgerService {
       data: { kind: request.kind, idempotencyKey: request.idempotencyKey },
       select: { id: true },
     });
+
+    // ↓ C35（控制器裁定 ⑧）：**在任何账户写入之前**按全局锁序取全部账户行锁。
+    //   位置是**三次实测**定下来的（见 `lockAccountRows` 的长注释）：它在
+    //   `createMany`（FK 的 `FOR KEY SHARE`）与 `applyBalances`（余额写）之前，
+    //   但在 `ledgerTransaction.create` **之后**——最后这一点偏离了计划 Step 4 的字面位置，
+    //   理由是那一版会把「并发同键撞唯一索引（P2002）」这条路径变成**不可达**
+    //   （实测：`postings.test.ts` 那条确定性用例变红），而这里只需要「在账户写入之前」。
+    await this.lockAccountRows(tx, legs.map((leg) => leg.accountId));
+
     await tx.ledgerEntry.createMany({
       data: legs.map((leg) => ({ transactionId: transaction.id, accountId: leg.accountId, amount: leg.amount })),
     });
@@ -506,6 +523,89 @@ export class LedgerService {
         await tx.ledgerAccount.update({ where: { id: leg.accountId }, data: { balance: { increment: leg.amount } } });
       }
     }
+  }
+
+  /**
+   * ★ **账户行的全局锁序**（C35 / 控制器裁定 ⑧；预检 §B.1 第（3）条的实测）。
+   *
+   * ## 它修的是什么（实测复现，逐字）
+   * 真实 `LedgerService` 的两笔**相反方向**过账（A→B 与 B→A）：
+   * ```
+   * [B4] S1 = {"code":"P2034","message":"\nInvalid `tx.ledgerEntry.createMany()` invocation …",
+   *            "metaOrigin":"40P01","metaKind":"TransactionWriteConflict"}
+   * ```
+   * **死锁报在 `ledgerEntry.createMany()`**，不是余额更新——因为 `entries` 上有指向
+   * `accounts` 的外键，插入子行会对被引用账户取 `FOR KEY SHARE`，而那**发生在
+   * `applyBalances` 之前**。⇒ `applyBalances` 的「按金额升序、借方先」**不是全局锁序**，
+   * 它连自己这条路径上的取锁点都没覆盖全。
+   *
+   * ## 为什么在**任何账户写入之前**一次性取全部行锁
+   * 「按 id 排序再逐个取」是不够的：`createMany` 会在那之后以**自己的**顺序（腿的数组序）
+   * 对被引用账户取 `FOR KEY SHARE`。但只要那些行**已经**被本次事务持有更强级别的锁
+   * （`FOR UPDATE`），`FOR KEY SHARE` 就是一次**无等待**的加锁。因此顺序必须
+   * **先取完、再动任何一行**——这就是这个方法在 `createMany` 与 `applyBalances` 之前的原因。
+   *
+   * ## ★ 据实记载一处**实测发现**：这条路径上的物理取锁顺序由 **SQL 的 `ORDER BY id`** 决定
+   * 探针 `P-ORDER-DESC-INT` 实测（见 evidence 的探针矩阵）：把共享判据 `rowLockOrder` 的
+   * 比较器**反过来**，账户侧的真库锁序见证**照样绿**——因为 `WHERE id = ANY($1::uuid[])` 的
+   * 扫描顺序对 `FOR UPDATE` 没有约束力，真正定序的是那一句 `ORDER BY id`（`LockRows` 节点
+   * 按排序后的输出顺序逐个加锁）。⇒ 这条路径上是**两个介质在表达同一个决定**：
+   *   * JS 侧：`rowLockOrder` 负责**数组准备**（去重 + 字节升序，与资产侧**同一个函数**）；
+   *   * SQL 侧：`ORDER BY id` 是**执行者**（PostgreSQL 的 `uuid` 比较 = 16 字节字典序）。
+   * 两者给出的顺序**逐个相同**（十六进制小写定长文本上的字节序 = 16 字节字典序），由真库用例
+   * 「两种介质上的同一条规则」断言。
+   * **这一点不粉饰**：「一个实现、两个调用方」在账户侧因此**没有独立的判别力**——那条判别力
+   * 只在资产侧（`P-ORDER-DESC-UNIT` 红）。保留两个介质是**刻意的纵深防御**：即使有人改坏了
+   * JS 比较器，数据库这一层仍按 id 升序取锁。
+   *
+   * ## ★ 位置由**三次实测**定下来（据实偏离计划 Step 4 的字面位置）
+   * 计划把调用点写在 `assertTransactionKind` 之后（读快照**之前**、事务行**之前**）。
+   * 实测那一版会**改变两条既有语义**，两条都发生在 `postings.test.ts` 的确定性用例上：
+   *
+   * 1. **`conditional-update` 那条路不再被走到**：败者在读快照**之前**就卡在取锁上，
+   *    等胜者提交之后才读 ⇒ 纯核心的预判先拦下它（`stage = 'predicted'`）。计划 Step 6
+   *    明写这一条必须仍然成立（「若它变成了 predicted … 停下来报控制器」）。
+   * 2. **「并发同键撞唯一索引（P2002）」那条路变成不可达**：两笔同键请求的腿相同 ⇒
+   *    账户集相同 ⇒ 先卡在账户行锁上，胜者提交后败者重读就能看见那一行、
+   *    直接走**重放**。于是 `runWithIdempotentRetry` 的 P2002 分支与
+   *    `postings.test.ts` 里那条**唯一**见证它的用例一起失效（实测：那条用例红了）。
+   *
+   * ⇒ 本方法只需要「在**任何账户写入**之前取完」，而那两笔纯读（`findUnique` /
+   * `loadSnapshots`）与那一次**不碰账户**的 `ledgerTransaction.create` 都不构成拦阻。
+   * 因此调用点落在**事务行之后、`createMany` 之前**，三条性质同时成立（实测）：
+   * ① 账户行锁按升序一次取完 ⇒ ABBA 消失；② 败者读到旧快照 ⇒ `conditional-update`
+   * 仍是并发权威；③ 同键并发仍会撞唯一索引（它在账户行锁**之前**）⇒ P2002 与重放两条路
+   * 都还在。**为什么不能再往后挪**（`createMany` 之后）：那一版会让两个事务各自先拿到
+   * 对方的 `FOR KEY SHARE` 再互要 `FOR UPDATE`——而这两者是冲突的，死锁原样回来。
+   *
+   * ## 代价（据实记载）
+   * 每一笔过账现在对涉及的每一个账户各发一条 `SELECT … FOR UPDATE`，而且这些锁
+   * **持到 COMMIT**。P2 的 D8 选择「条件更新 + 受影响行数」的部分理由正是「不需要重试路径」
+   * ——这条改动**不**推翻那个选择（条件更新仍是并发权威、仍不需要 SERIALIZABLE），
+   * 但它承认了一件事：并发权威在**余额**那一层，而**取锁顺序**是另一层。
+   *
+   * ## 据实记载：仍有一处**未被排序**的取锁点（本任务不动它）
+   * `resolveAccounts` 里那条 `INSERT … ON CONFLICT DO NOTHING` 发生在 `postLegs` **之前**，
+   * 而它自己的顺序是 `wanted` 数组序。触发条件很窄：一次过账要**同时创建两个以上尚不存在的
+   * 账户**，且两笔这样的过账以相反顺序创建同一组账户（两个全新用户之间的第一笔过账）。
+   * 它的形状与 P2 实测过的那条「INSERT 等唯一索引」同源，而 P2 的收窄（先读、只补缺的）
+   * 已经把它压到「账户真的不存在」那一刻。**修法是一行**（对 `missing` 排序之后再插入），
+   * 但它不在 Task 4 的 Steps 里，且它需要自己的见证 ⇒ 交给控制器裁定，不就地改。
+   */
+  private async lockAccountRows(tx: Prisma.TransactionClient, accountIds: readonly string[]): Promise<void> {
+    // 去重 + **升序**：与资产那一侧**同一个函数**（`common/db/lock-order.ts` 的
+    // `rowLockOrder`；exchange 的 `lockOrder` 也是它）。**据实记载**：这条路径上真正定序的
+    // 是下面那句 SQL 的 `ORDER BY id`（探针 `P-ORDER-DESC-INT` 实测：改这里的比较器不影响
+    // 物理锁序）——这里的排序仍然要有（去重 + 让「意图」在数组上看得见），而两者是**同一条
+    // 规则**（见上面那段长注释）。
+    // `$queryRaw` 是标签模板 ⇒ 插值变成绑定参数（C9 那条 lint 门不可达）。
+    const ordered = rowLockOrder(accountIds);
+    if (ordered.length === 0) return;
+    // 一条语句取完（`ORDER BY id` + `FOR UPDATE`）：PostgreSQL 在 `LockRows` 节点上按
+    // 排序后的输出顺序逐个加锁，因此这一句本身就是「先取全部、按升序」的执行点。
+    await tx.$queryRaw`
+      SELECT id FROM ledger.accounts WHERE id = ANY(${ordered}::uuid[]) ORDER BY id FOR UPDATE
+    `;
   }
 
   /**

@@ -445,6 +445,16 @@ describe('过账：LedgerService.post（C25 / C26 / C28 / D9 / D10）', () => {
     // 预判已经放行」——**实测那句话是错的**（第一版探针：等锁的语句是 `resolveAccounts`
     // 里的 `INSERT … ON CONFLICT DO NOTHING`，于是 A 等到 W 提交后才读快照、走 `predicted`）。
     // 只看「有人等锁」会得到一个**看起来构造成功、实际测了另一条路**的绿。
+    //
+    // ★ P3 / Task 4 更新了这条见证的**具体语句**（构造见证必须跟着取锁点走，否则它守的是
+    //   一个已经不存在的形状）：C35 的账户行锁序在 `createMany`/`applyBalances` 之前多了一句
+    //   `SELECT … ORDER BY id FOR UPDATE`，于是 A 现在卡在**那一句**上。它卡的位置仍然满足
+    //   这条用例要的前提——**在 `applyBalances` 之前、且在快照读取之后**（`loadSnapshots` /
+    //   `findUnique` 都是纯读、不取锁）——只是标识语句从「带守卫的 UPDATE」变成了「有序的
+    //   FOR UPDATE」。**语义断言 `stage === 'conditional-update'` 一字未动**（它是这条用例的
+    //   本体，也是计划 Step 6 明写「必须仍然成立、否则停下来报控制器」的那一条）。
+    //   判别力：探针 `P-PLACE-EARLY`（把取锁点挪回计划 Step 4 的字面位置）实测让**下面那句**
+    //   `stage` 变成 `predicted` 变红——也就是「锁序把败者挡在了快照读取之前」那件事真的会发生。
     const observer = new Client({ connectionString: pg.appUri });
     await observer.connect();
     let blockedStatements: string[];
@@ -453,12 +463,12 @@ describe('过账：LedgerService.post（C25 / C26 / C28 / D9 / D10）', () => {
     } finally {
       await observer.end();
     }
-    const guardedUpdate = blockedStatements.filter(
-      (sql) => /UPDATE\s+"ledger"\."accounts"[\s\S]*"balance" >=/.test(sql),
+    const blockedAtAccountLock = blockedStatements.filter(
+      (sql) => /FROM "?ledger"?\."?accounts"?[\s\S]*ORDER BY id FOR UPDATE/.test(sql),
     );
     expect(
-      guardedUpdate,
-      `等锁的语句必须**是那条带余额守卫的条件更新**（否则这条用例证明的不是并发权威）。实测等锁语句：${JSON.stringify(blockedStatements)}`,
+      blockedAtAccountLock,
+      `等锁的语句必须是那条**按 id 升序取全部账户行锁**的 SELECT（C35 的取锁点，且它在余额更新之前）。实测等锁语句：${JSON.stringify(blockedStatements)}`,
     ).toHaveLength(1);
 
     release();
