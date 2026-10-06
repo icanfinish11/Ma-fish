@@ -373,8 +373,7 @@ describe('对账：不变式 #2（全局 Σ 余额 = 0 且 Σ 分录 = 0）', ()
     }
   });
 
-  it('报告的形状：只含**非零余额**的行，且按 (kind, id) 稳定排序（两次读出来逐条相同）', async () => {
-    // 两件事各有一个理由：
+  it('报告的形状：只含**非零余额**的行，且按 (kind, id) 稳定排序（两次读出来逐条相同）', async () => {    // 两件事各有一个理由：
     // ① 「只含非零行」——`nonzeroAccounts` 的过滤条件如果被改空（`where: {}`），报告里会混进
     //    一堆 0 余额的行。按身份过滤（`filter(a => a.ownerUserId === victim)`）**看不见**这件事，
     //    所以判据必须是「**每一条**的余额都不为 0」。
@@ -396,4 +395,186 @@ describe('对账：不变式 #2（全局 Σ 余额 = 0 且 Σ 分录 = 0）', ()
     const keys = first.nonzeroAccounts.map((row) => `${row.kind}|${row.id}`);
     expect(keys).toEqual([...keys].sort());
   });
+});
+
+/**
+ * ★ **逐账户**对账（P3 / Task 5；预检 §A.2 的两个方向）—— 与上面那组分开，因为它需要
+ * **一个干净的容器**：`reconcilePerAccount()` 的判据是「**恰好**有漂移的那些账户」，
+ * 而本文件上面的用例刻意制造过漂移（用例 3 打过余额侧、用例 5 制造过 ±300）。
+ *
+ * ## 它抓的是全局判据**结构性**看不见的东西（P2 的划界，逐字）
+ *
+ * P2 实测（预检 §A.2 的 `[总长] 0 | 0 | t ← ★ 看不见`）：「A −300 / B +300」这种**保持总量**的
+ * 改写会让 `isBalanced` 照样返回 `true`。修法**不是**更好的求和，而是**逐行比对**：
+ * 把每个账户的 `Σ entries.amount` 与物化的 `balance` 逐行对照。
+ *
+ * ## 两个方向都在（否则「怎么都返回 0 行」的实现也能骗过它）
+ * 方向 ①：制造一次保持总量的漂移 ⇒ **恰好 2 行**，`drift` 是 `-300` 与 `+300`；
+ * 方向 ②：把那一行改回去 ⇒ **0 行**，而同一个查询在方向 ① 下看得见非零。
+ * **同一个容器、同一对账户、同一个查询**——这是本项目对「非空转」的既定要求
+ * （见本文件开头的「每条『和为 0』的断言都必须有一条能看到非零的伴生证据」）。
+ */
+describe('★ 逐账户对账：把每个账户的 Σ entries.amount 与物化 balance 逐行比对（P3 / Task 5）', () => {
+  let isoPg: TestPg;
+  let isoPrisma: PrismaService;
+  let isoLedger: LedgerService;
+  let isoRecon: LedgerReconciliationService;
+  let owner: Client;
+  /**
+   * 孤儿用例之前的分录总数（**在这个容器自己的 `beforeAll` 里读**）。
+   *
+   * 为什么不是常量：容器是干净的，但「干净」这件事本身要有读数——把基线读出来再断言
+   * 「+1」，比写死一个 0 更能看出这条断言在说什么（而且上面那组用例条数变化时不会失效）。
+   *
+   * ★ 为什么它**不**在 `beforeAll` 里求值（TDD 第一次跑实测）：把 `reconcilePerAccount()`
+   * 写在 `beforeAll` 里，红的是**钩子**（`TypeError: isoRecon.reconcilePerAccount is not a function`），
+   * 两条用例因此被**跳过**（`2 skipped`）——「先看到它红」这个动作就看不见断言本身。
+   * 挪进用例体之后，第一次跑的读数是 `Tests 2 failed`，两条用例各自红在自己的第一句上。
+   */
+  let cleanEntryCountBefore: bigint | undefined;
+
+  beforeAll(async () => {
+    isoPg = await startPostgres();
+    isoPrisma = new PrismaService(isoPg.appUri);
+    await isoPrisma.$connect();
+    isoLedger = new LedgerService(isoPrisma, new AuditService(isoPrisma), new AdminDirectory(isoPrisma));
+    isoRecon = new LedgerReconciliationService(isoPrisma);
+    owner = new Client({ connectionString: isoPg.ownerUri });
+    await owner.connect();
+  }, 180_000);
+
+  afterAll(async () => {
+    await owner?.end().catch(() => undefined);
+    await isoPrisma?.$disconnect().catch(() => undefined);
+    await isoPg?.stop();
+  });
+
+  /** 与上面那组同名同义的局部版本（那一个绑在共享容器上）。 */
+  async function isoUser(): Promise<string> {
+    const user = await isoPrisma.user.create({ data: {} });
+    return user.id;
+  }
+  async function isoAccountId(userId: string): Promise<string> {
+    const row = await isoPrisma.ledgerAccount.findFirst({
+      where: { ownerUserId: userId, kind: ACCOUNT_KINDS.USER_AVAILABLE },
+      select: { id: true },
+    });
+    if (!row) throw new Error(`这个用户还没有账户行（构造失败，不是断言失败）：${userId}`);
+    return row.id;
+  }
+
+  it('两个方向一次跑完：保持总量的漂移 ⇒ 恰好 2 行（±300），修回去 ⇒ 0 行；全局判据全程 true', async () => {
+    const a = await isoUser();
+    const b = await isoUser();
+    await isoPrisma.$transaction(async (tx) => {
+      await isoLedger.grantCredit(tx, { userId: a, amount: 1_000n, idempotencyKey: `peracct:a:${a}` });
+      await isoLedger.grantCredit(tx, { userId: b, amount: 1_000n, idempotencyKey: `peracct:b:${b}` });
+    });
+    const accountA = await isoAccountId(a);
+    const accountB = await isoAccountId(b);
+
+    // ── 方向 ② 的前置读数（**先量干净的那一侧**，它同时是后面 0 行的对照）──────────────
+    const cleanBefore = await isoRecon.reconcilePerAccount();
+    expect(cleanBefore.drifts, '干净的账本上不该有任何逐账户漂移').toEqual([]);
+    expect(LedgerReconciliationService.isPerAccountClean(cleanBefore)).toBe(true);
+    expect(cleanBefore.accountCount).toBeGreaterThan(0n); // 非空转：真的读了行
+    expect(cleanBefore.entryCount).toBeGreaterThan(0n);
+
+    try {
+      // ── 方向 ①：保持总量的漂移（A −300 / B +300）────────────────────────────────
+      await owner.query(`UPDATE ledger.accounts SET balance = balance - 300 WHERE id = $1::uuid`, [accountA]);
+      await owner.query(`UPDATE ledger.accounts SET balance = balance + 300 WHERE id = $1::uuid`, [accountB]);
+
+      // 全局判据**本来就该看不见它**——这是 P2 的划界，不是缺陷。
+      const global = await isoRecon.reconcile();
+      expect(
+        LedgerReconciliationService.isBalanced(global),
+        '全局判据本来就该看不见它（P2 的划界，不是缺陷）',
+      ).toBe(true);
+
+      const perAccount = await isoRecon.reconcilePerAccount();
+      // ★ 恰好 2 行：这条断言有判别力**只因为**下面紧接着那半段把同一对账户改回去 ⇒ 0 行。
+      expect(perAccount.drifts, '保持总量的漂移必须被逐账户对账抓到，且恰好 2 行').toHaveLength(2);
+      expect(perAccount.drifts.map((d) => d.accountId)).toEqual([accountA, accountB].sort());
+      expect(perAccount.drifts.map((d) => d.drift).sort((x, y) => (x < y ? -1 : x > y ? 1 : 0))).toEqual([
+        -300n,
+        300n,
+      ]);
+      // 两个分量逐项对得上（不是「碰巧差值对了」）：物化 / 推导 / 差三者的算术关系。
+      const rowA = perAccount.drifts.find((d) => d.accountId === accountA)!;
+      const rowB = perAccount.drifts.find((d) => d.accountId === accountB)!;
+      expect([rowA.materialized, rowA.derived, rowA.drift]).toEqual([700n, 1_000n, -300n]);
+      expect([rowB.materialized, rowB.derived, rowB.drift]).toEqual([1_300n, 1_000n, 300n]);
+      expect(rowA.materialized - rowA.derived, 'drift 必须等于 materialized − derived').toBe(rowA.drift);
+      expect(LedgerReconciliationService.isPerAccountClean(perAccount)).toBe(false);
+      // 全局那一侧此刻仍然报「干净」⇒ 两个判据**确实分叉**（这是本节存在的全部理由）。
+      expect(LedgerReconciliationService.isBalanced(await isoRecon.reconcile())).toBe(true);
+
+      // ★ 而**逐账户**判据的三个合取项各自都被这一格打到：前两项必须仍然成立，
+      //   只有第三项（drifts 非空）红 ⇒ 这一格是 `isPerAccountClean` 第三项的见证。
+      expect(perAccount.totalBalance, '总量没动（这正是全局判据看不见它的原因）').toBe(
+        cleanBefore.totalBalance,
+      );
+      expect(perAccount.totalEntryAmount).toBe(cleanBefore.totalEntryAmount);
+    } finally {
+      // ── 方向 ②：改回去 ⇒ **0 行** ───────────────────────────────────────────────
+      await owner.query(`UPDATE ledger.accounts SET balance = balance + 300 WHERE id = $1::uuid`, [accountA]);
+      await owner.query(`UPDATE ledger.accounts SET balance = balance - 300 WHERE id = $1::uuid`, [accountB]);
+    }
+
+    const cleanAfter = await isoRecon.reconcilePerAccount();
+    expect(cleanAfter.drifts, '修回去之后必须回到 0 行（否则「怎么都报 2 行」的实现也能骗过方向 ①）').toEqual(
+      [],
+    );
+    expect(LedgerReconciliationService.isPerAccountClean(cleanAfter)).toBe(true);
+  }, 180_000);
+
+  it('★ 分录侧多一行（有分录、**没有**账户行）也必须被抓到（`FULL OUTER JOIN` 的理由）', async () => {
+    // 只 `JOIN` 会漏掉这一类：一条指向**不存在**账户的分录在 `INNER JOIN` 下**根本不出现**，
+    // 而它正是「钱去哪了」最该被抓到的形态（P2 的 `[E1]` 同族）。
+    //
+    // 造法：属主在事务里 `SET LOCAL session_replication_role = replica` 插一条指向随机 uuid 的分录
+    // —— 外键在那里被绕过。这是**越权**动作（运行期角色 `app_user` 做不到），与用例 6 同一处置：
+    // 它精确对应「有人绕过了账本」，用完立刻删掉那一行。
+    const txId = uuidv7();
+    const ghostAccountId = uuidv7();
+    // 基线在**用例体内**读（理由见 `cleanEntryCountBefore` 的注释：写在钩子里会红在钩子上）。
+    const before = await isoRecon.reconcilePerAccount();
+    cleanEntryCountBefore = before.entryCount;
+    expect(before.drifts, '这一格的前提：进来时账本是干净的').toEqual([]);
+    try {
+      await owner.query('BEGIN');
+      await owner.query(`SET LOCAL session_replication_role = replica`);
+      await owner.query(
+        `INSERT INTO ledger.transactions (id, kind, idempotency_key) VALUES ($1::uuid, 'PROBE', $2)`,
+        [txId, `peracct:ghost:${txId}`],
+      );
+      await owner.query(
+        `INSERT INTO ledger.entries (id, transaction_id, account_id, amount) VALUES ($1::uuid, $2::uuid, $3::uuid, 777)`,
+        [uuidv7(), txId, ghostAccountId],
+      );
+      await owner.query('COMMIT');
+
+      const report = await isoRecon.reconcilePerAccount();
+      // ★ 恰好 1 行，且它**就是那个不存在的账户**：`INNER JOIN` 实现下这一行不会出现。
+      expect(report.drifts, '一个有分录、没有账户行的账户必须出现在漂移报告里').toHaveLength(1);
+      expect(report.drifts[0]).toEqual({
+        accountId: ghostAccountId,
+        materialized: 0n, // 账户行不存在 ⇒ 0n（与 readBalances 同一条约定，D2）
+        derived: 777n,
+        drift: -777n,
+      });
+      expect(LedgerReconciliationService.isPerAccountClean(report)).toBe(false);
+      // 伴生证据：**同一份报告**里余额侧的行数没有跟着变（这一行只来自分录侧）。
+      expect(report.entryCount).toBe(cleanEntryCountBefore! + 1n);
+    } finally {
+      // 复原：先删分录再删交易（外键 ON DELETE RESTRICT）。删分录时触发器会触发，
+      // 但那时那笔交易已经一条分录都不剩 ⇒ Σ = 0 ⇒ 放行。
+      await owner.query(`DELETE FROM ledger.entries WHERE transaction_id = $1::uuid`, [txId]).catch(() => undefined);
+      await owner.query(`DELETE FROM ledger.transactions WHERE id = $1::uuid`, [txId]).catch(() => undefined);
+    }
+    const restored = await isoRecon.reconcilePerAccount();
+    expect(restored.drifts, '清掉那条孤儿分录之后必须回到 0 行').toEqual([]);
+    expect(LedgerReconciliationService.isPerAccountClean(restored)).toBe(true);
+  }, 180_000);
 });

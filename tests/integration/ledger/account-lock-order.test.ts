@@ -18,12 +18,20 @@ import { startPostgres, type TestPg } from '../../helpers/db.js';
  *
  * ## 三条用例各自的判别力（真库 + 真服务）
  *
- * 1. **账户行按升序取锁**（`★` 那条）。它是这一组里**唯一确定性**的判别式：第三方连接
- *    先锁住**较小的那个** id，观察那一笔**卡在哪一条语句上**，再用 `FOR UPDATE NOWAIT`
- *    从另一条连接试锁**较大的那个**——那一句必须立刻成功，因为按升序取锁的实现
- *    **还没碰过它**。反向取锁的实现会先锁住它 ⇒ `NOWAIT` 报 55P03 ⇒ 红。
- *    （探针实测：`P-ORDER-DESC` 把比较器反过来 ⇒ 这一条的**第二档**红；
- *      `P-LOCK-REMOVED` 删掉取锁调用 ⇒ **第一档**红，实测卡住的是 `INSERT INTO entries`。）
+ * 1. **账户行按升序取锁**（`★` 那条）。它由**两个按序的守卫**组成，各自的红灯形状不同：
+ *    ① **第一档（观察）**：第三方连接先锁住**较小的那个** id，观察那一笔**卡在哪一条语句上**
+ *       —— 必须卡在那条 `SELECT … ORDER BY id FOR UPDATE` 上。这是**唯一**让本组用例能**确定性**红的
+ *       守卫：探针 `P-LOCK-REMOVED`（删掉取锁调用）实测它红，且把**实际**在等的语句原样打出来
+ *       （实测是 `INSERT INTO "ledger"."entries" …`）。
+ *    ② **第二档（`NOWAIT` 探针）**：再用 `FOR UPDATE NOWAIT` 从另一条连接试锁**较大的那个**，
+ *       那一句必须立刻成功。
+ *
+ *    **★ 第二档不能单独变红（本条注释此前写错了机制，据实更正；结论见第 5 条）**：它此前被写成
+ *    「反向取锁的实现会先锁住它 ⇒ `NOWAIT` 报 55P03 ⇒ 红」，并把那条判别力归给「把比较器反过来」。
+ *    **这两句话都不对**：探针 `P-ORDER-DESC-INT`（比较器反过来）下这条用例**照样绿**
+ *    （`evidence/t4-probe-matrix.txt` 与 `t5-nowait-discriminating-power.txt` 的 ② 格：
+ *    `Tests 1 failed | 5 passed`，红的是「两种介质上的同一条规则」）。原因是账户侧的物理取锁
+ *    顺序由那条 SQL 的 `ORDER BY id` 决定（`LedgerService.lockAccountRows` 的长注释记着同一件事）。
  *
  * 2. **两笔相反方向的真实过账都成功**。**据实记载：这条的判别力不是确定性的**——
  *    修之前那两笔要**恰好交错**到各自的 `createMany` 才会 ABBA（预检实测的 P2034/40P01
@@ -36,6 +44,29 @@ import { startPostgres, type TestPg } from '../../helpers/db.js';
  *    而这条用例会在探针 `P-DISC-P2010` 下变红。
  *
  * 4. **不可重试的错误不重试**（真路径上的领域错误：余额不足 ⇒ 调用一次、原样抛出）。
+ *
+ * 5. **★ 据实记载：第 1 条里 `NOWAIT` 那一档无法被单独行使**（P3 / Task 5 的实测结论，
+ *    取代了此前那句没有见证的注释）。三次实验（`evidence/t5-nowait-discriminating-power.txt`、
+ *    `t5-nowait-exhaustive.txt`、`t5-nowait-diag.txt`），四格：
+ *
+ *    | 变异 | 锁序那条用例 | `NOWAIT` 那一档 |
+ *    |---|---|---|
+ *    | 基线（升序判据 + `ORDER BY id`） | 绿 | 绿（`SUCCESS`，未被持有） |
+ *    | 只有 `rowLockOrder` 比较器反过来（= `P-ORDER-DESC-INT`） | **绿**（红的是「两种介质」那条） | 绿 |
+ *    | 只有 SQL 的 `ORDER BY id` 删掉 | **红在第一档**（3 s 观察超时） | **根本走不到** |
+ *    | 两者同时 | 红在第一档 | 走不到 |
+ *
+ *    **机制（插桩实测，`t5-nowait-diag.txt`）**：那一笔卡住那一刻，`pg_locks` 里它对**两行**
+ *    都已经持有 tuple 锁（`locktype = tuple` / `mode = AccessExclusiveLock` / `granted = true`），
+ *    它真正在等的是**持有者的事务 id**（`transactionid` / `ShareLock` / `granted = false`）。
+ *    `LockRows` 是**先把所有目标行锁住、之后**才因为拿不到事务快照而等——因此「它还没碰过第二个
+ *    账户」这个**前提本身不成立**。反面对照（构造一条把第三方连接锁在**较大的** id 上、
+ *    从而让第一档保持绿的用例，已实测后删除）：四格**全绿**——因为那时**两行**在探针眼里都已被持有。
+ *    ⇒ **任何**在「实现把全部目标行都锁住」这一形状下的 `NOWAIT` 探测都无法区分取锁顺序；
+ *    要让它红必须先删掉 `ORDER BY id`，而那一格又红在第一档。**这是结构性遮蔽，不是参数没调好。**
+ *    它作为第 1 条的**附带观测**仍然承重（它直接证明那一笔确实持有两个账户行，而紧随其后的
+ *    `resolves.toMatchObject({ created: true })` 只证明它最终成功）；但**不要**把它当成
+ *    「取锁顺序」的独立见证——那个见证是第一档与探针 `P-LOCK-REMOVED`。
  */
 const available = (userId: string) => ({ kind: ACCOUNT_KINDS.USER_AVAILABLE, ownerUserId: userId }) as const;
 const frozen = (userId: string) => ({ kind: ACCOUNT_KINDS.USER_FROZEN, ownerUserId: userId }) as const;
@@ -301,7 +332,14 @@ describe('账户行锁序与两档重试判别式（C35 / C36；真库 + 真服�
         `那一笔必须卡在**按 id 升序取全部账户行锁**的那一句上（卡在别处说明这次测的不是锁序）。实测：${blocked}`,
       ).toMatch(/ORDER BY id FOR UPDATE/);
 
-      // 第二档：它**还没碰过** `second`。反向取锁的实现会先锁住 `second` ⇒ NOWAIT 报 55P03。
+      // 第二档：那一句必须立刻成功。
+      // ★ 据实更正（见文件头第 5 条）：**这一档不能被单独行使**——它红的条件是那一笔
+      //   「还没碰过 `second`」，而实测（`t5-nowait-diag.txt` 的 `pg_locks` 快照）是：它卡住时
+      //   **两行**的 tuple 锁都已经被它持有（`granted = true`），它等的是**持有者的事务 id**。
+      //   `LockRows` 先锁全部目标行、之后才等 ⇒ 这个前提不成立；把第三方连接改锁在较大的 id 上
+      //   也一样（四格全绿，已实测后删除）。它在这里仍然是**一条真实观测**：那一笔确实持有
+      //   `first`（`probeError === null` 就是「`second` 没被它持有」这一句的直接读数）。
+      //   「取锁顺序」的独立见证是上面第一档，不是这里。
       const probe = new Client({ connectionString: pg.appUri });
       await probe.connect();
       let probeError: unknown = null;

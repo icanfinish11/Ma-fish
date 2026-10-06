@@ -37,6 +37,39 @@ export interface ReconciliationReport {
 }
 
 /**
+ * 一个**逐账户**上的差：物化余额 vs 由分录推导的余额（P3 / Task 5）。
+ *
+ * 它是 `reconcile()` 那份报告**结构上**给不出的东西：全局报告只有两个标量，
+ * 而「钱被搬到了别人的账户上」在这两个标量上**一个字都看不出来**（见 `reconcilePerAccount`）。
+ */
+export interface PerAccountDrift {
+  readonly accountId: string;
+  /** 物化余额（**分**）。账户行不存在时为 `0n`（与 `readBalances` 同一条约定，D2）。 */
+  readonly materialized: bigint;
+  /** `Σ entries.amount`（**分**）。该账户没有任何分录时为 `0n`。 */
+  readonly derived: bigint;
+  /** `materialized - derived`（**分**）。非 0 就是漂移。 */
+  readonly drift: bigint;
+}
+
+/**
+ * 逐账户对账的完整读数：**四个量 + 恰好有漂移的那些账户**。
+ *
+ * `drifts` 的契约是「**恰好**有漂移的那些账户」——干净时是**空数组**，不是「一个全是 0 的数组」。
+ * 这个区别是判据本身：把没有漂移的账户也放进来，`isPerAccountClean` 就必须自己去过滤，
+ * 于是「报告 0 行」这件事会变成「报告 N 行然后被过滤掉」——两者对运维是不同的东西
+ * （前者是「没问题」，后者是「有问题但被吞了」）。
+ */
+export interface PerAccountReport {
+  readonly totalBalance: bigint;
+  readonly totalEntryAmount: bigint;
+  readonly accountCount: bigint;
+  readonly entryCount: bigint;
+  /** **恰好**有漂移的那些账户（干净时是空数组）。按 `accountId` 升序，报告可以做 diff。 */
+  readonly drifts: readonly PerAccountDrift[];
+}
+
+/**
  * 对账（设计 §8.3 的不变式 #2：全局 `Σ 所有账户余额 = 0`）—— **P2 / Task 9**。
  *
  * ## 它**不是**每次提交都跑的检查（预检 §B.5 / §B.7 的实测，不是判断）
@@ -67,8 +100,8 @@ export interface ReconciliationReport {
  *    物化余额已经是 700 / 1300，而按分录推导仍是 1000 / 1000——**每条差 300 分**，
  *    可是两个量一个都没动，`isBalanced` 照样返回 `true`。要看见这件事需要的**不是**
  *    更好的求和，而是**逐账户**的对账：把每个账户的 `Σ entries.amount` 与物化的
- *    `balance` 逐行比对（`derivedBalance` 那种查询）。那是 P3 加周期执行者时**同一次**
- *    要一并落地的东西——本类的形状（一份报告 + 一个判据）留得下它。
+ *    `balance` 逐行比对。**那已经落地**（P3 / Task 5 的 `reconcilePerAccount`），
+ *    且它带自己的两个方向：漂移 ⇒ 恰好 2 行（±300）、修回去 ⇒ 0 行。
  * 2. **`Σ 分录` 恒为 0 是「不变式 #1 的触发器还在」的推论**，不是本类自己挣来的。
  *    实测（用例 6）：属主在事务里 `SET LOCAL session_replication_role = replica` 之后，
  *    一笔不平衡的分录**真的提交了**，该量立刻变成 −12 345。
@@ -159,5 +192,139 @@ export class LedgerReconciliationService {
    */
   static isBalanced(report: ReconciliationReport): boolean {
     return report.totalBalance === 0n && report.totalEntryAmount === 0n;
+  }
+
+  /**
+   * ★ **逐账户**对账（P3 / Task 5；预检 §A.2 的实测）—— 与 `reconcile()` 是**两件**读数。
+   *
+   * ## 为什么必须有它（P2 自己的划界，逐字）
+   * 「要看见这件事需要的**不是**更好的求和，而是**逐账户**的对账：把每个账户的
+   * `Σ entries.amount` 与物化的 `balance` 逐行比对。」`reconcile()` 只能发现
+   * 「总量上多出/少了钱」（实测：直接 `UPDATE balance` 之后全库 Σ ≠ 0），
+   * **发现不了**「钱被搬到了别人的账户上」（A −300 / B +300 ⇒ 两个量都没动）。
+   *
+   * ## 为什么是 `FULL OUTER JOIN` 而不是 `JOIN`
+   * 只 `JOIN` 会漏掉**两侧的孤儿**：一个有分录但没有账户行的账户（`INNER JOIN` 下它
+   * 根本不出现），以及一个没有任何分录却有余额的账户（看起来完全正常，因为余额是个
+   * 合法的数）。前者正是「钱去哪了」最该被抓到的形态，因此 `accounts` 从**左**
+   * 全外连出来、`entries` 的聚合从**右**全外连出来。
+   *
+   * ## 为什么 `COALESCE(…, 0)` 不能省
+   * 空集上 `sum()` 返回 **NULL**（P2 实测：`[M6] 空集 无 COALESCE → null`），
+   * 而 `BigInt(null)` 抛 `TypeError`。`::text` 的理由与 `reconcile()` 逐字相同
+   * （`sum(bigint)` 返回 numeric，Prisma 读成 `Decimal2`；跨过 1e21 时 `toString()`
+   * 改指数形式而 `BigInt` 抛 SyntaxError）—— **四个量必须落在同一条已实测无损的路径上**。
+   *
+   * ## 代价（实测，不是预测）
+   * 20 万条分录 / 1 万账户 **40 ms**（P2 的全局判据 8.2 ms）。**★ 据实更正一条计划里的
+   * 预期**：D4 / 控制器裁定 ⑥ 加索引时以为这条查询会因此摆脱 `Seq Scan on entries`，
+   * 实测**不会**——它要的是**全表** `Σ entries.amount`（按 `account_id` 分组），
+   * 而分组必须读每一行；有索引与没索引都是 `Seq Scan on entries` + `HashAggregate`
+   * （`evidence/t5-plan-probe-attempt4.txt`：删掉索引之后计划与耗时**逐字不变**，
+   * 40.112 ms）。索引的落点是**逐账户**的读法（见 `driftOf`），不是这一条全表读法。
+   * ⇒ 这条查询的规模上限由**分录总量**决定，与索引无关；它今天够用是因为 40 ms
+   * 远超运维可接受的通知延迟。
+   */
+  async reconcilePerAccount(): Promise<PerAccountReport> {
+    const drifts = await this.prisma.$queryRaw<
+      { account_id: string; materialized: string; derived: string; drift: string }[]
+    >`
+      WITH derived AS (
+        SELECT account_id, sum(amount) AS total FROM ledger.entries GROUP BY account_id
+      )
+      SELECT COALESCE(a.id, d.account_id)::text          AS account_id,
+             COALESCE(a.balance, 0)::text                AS materialized,
+             COALESCE(d.total, 0)::text                  AS derived,
+             (COALESCE(a.balance, 0) - COALESCE(d.total, 0))::text AS drift
+        FROM ledger.accounts a
+        FULL OUTER JOIN derived d ON d.account_id = a.id
+       WHERE COALESCE(a.balance, 0) <> COALESCE(d.total, 0)
+       ORDER BY 1
+    `;
+    const [totals] = await this.prisma.$queryRaw<
+      { total_balance: string; total_entry_amount: string; account_count: bigint; entry_count: bigint }[]
+    >`
+      SELECT COALESCE((SELECT sum(balance) FROM ledger.accounts), 0)::text AS total_balance,
+             COALESCE((SELECT sum(amount)  FROM ledger.entries),  0)::text AS total_entry_amount,
+             (SELECT count(*) FROM ledger.accounts)::bigint               AS account_count,
+             (SELECT count(*) FROM ledger.entries)::bigint                AS entry_count
+    `;
+    return {
+      totalBalance: BigInt(totals!.total_balance),
+      totalEntryAmount: BigInt(totals!.total_entry_amount),
+      accountCount: totals!.account_count,
+      entryCount: totals!.entry_count,
+      drifts: drifts.map((row) => ({
+        accountId: row.account_id,
+        materialized: BigInt(row.materialized),
+        derived: BigInt(row.derived),
+        drift: BigInt(row.drift),
+      })),
+    };
+  }
+
+  /**
+   * ★ **单个账户**的同一笔比对（P3 / Task 5）—— 报告里被点到名之后，运维要钻进去看的那一步。
+   *
+   * ## 为什么它与 `reconcilePerAccount()` 是**两条查询**而不是一条的过滤版本
+   * `reconcilePerAccount()` 必须先做**全表** `GROUP BY account_id` 才知道哪些账户有漂移
+   * ——它的成本由分录总量决定（20 万行 40 ms，实测），**加索引也改不掉**（见该方法的注释）。
+   * 而「已知是哪个账户之后再看一眼」是**完全不同的形状**：按一个 `account_id` 取值。
+   * 这两件事共用一个实现，就等于让「钻进去看一个账户」永远付全表扫描的价钱。
+   *
+   * ## 索引的落点就是这里（D4 / 控制器裁定 ⑥ 的实测见证）
+   * 20 万条分录 / 1 万账户上的实测（`evidence/t5-drill-plan-probe.txt`）：
+   *
+   * | | 计划 | 耗时 |
+   * |---|---|---|
+   * | `entries_account_id_idx` 在 | `Bitmap Index Scan on entries_account_id_idx` | **0.174 ms** |
+   * | 索引删掉 | `Seq Scan on entries`（两次，两个标量子查询各一次） | **14.512 ms** |
+   *
+   * ⇒ **83 倍**，而这一条**正是** `pg_indexes` 里那条索引存在的理由。裁定 ⑥ 的原文
+   * 「为一个**已交付功能**加索引不是投机抽象，是它的使能条件」在这里成立；
+   * 而它对全表那一半**不**成立——那一半的计划两向逐字相同，这一点据实记在上面。
+   *
+   * ## 返回值：为什么是 `PerAccountDrift | null` 而不是一个永远有值的形状
+   * `null` = 「库里的 `accounts` 与 `entries` **都没有**这个 id」——那是**调用方的问题**
+   * （问了一个不存在的账户），不是「漂移为 0」。把它折成 `drift: 0n` 会让「账本上没有这个
+   * 账户」与「这个账户完全对得上」变成同一个回答，而那正是本项目反复抓的那类合并。
+   */
+  async driftOf(accountId: string): Promise<PerAccountDrift | null> {
+    const rows = await this.prisma.$queryRaw<
+      { account_id: string; materialized: string; derived: string; drift: string }[]
+    >`
+      SELECT a.id::text                                                              AS account_id,
+             COALESCE(a.balance, 0)::text                                            AS materialized,
+             COALESCE((SELECT sum(e.amount) FROM ledger.entries e WHERE e.account_id = a.id), 0)::text AS derived,
+             (COALESCE(a.balance, 0)
+                - COALESCE((SELECT sum(e.amount) FROM ledger.entries e WHERE e.account_id = a.id), 0))::text AS drift
+        FROM ledger.accounts a
+       WHERE a.id = ${accountId}::uuid
+    `;
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      accountId: row.account_id,
+      materialized: BigInt(row.materialized),
+      derived: BigInt(row.derived),
+      drift: BigInt(row.drift),
+    };
+  }
+
+  /**
+   * 判据：**三个量都要成立** —— 全局长和为零（不变式 #2）、分录全和为零（不变式 #1 的
+   * 全局形式）、且**没有任何一个账户**有漂移。
+   *
+   * 为什么三个而不是一个：三者来源不同（物化余额 / 分录 / 逐账户比对），因此**可以分叉**。
+   * 前两项各有 P2 的用例 3 / 用例 6 看着，第三项由本任务的逐账户用例看着——
+   * 三个合取项**各自**都有一条会红的见证，没有一项是装饰。
+   *
+   * 为什么是 `static` 而不是实例方法：与 `isBalanced` 逐字同源——它**不碰数据库**，
+   * 只读报告，因此测试里可以直接对一个手工构造的报告求值。
+   */
+  static isPerAccountClean(report: PerAccountReport): boolean {
+    return (
+      report.totalBalance === 0n && report.totalEntryAmount === 0n && report.drifts.length === 0
+    );
   }
 }
