@@ -32,7 +32,7 @@
  * |---|---|
  * | `OwnershipService` | `exchange`（Task 8 的原子释放：同一个 `tx` 里装下所有权互换） |
  * | `AssetNotFoundError` / `SelfTransferRejectedError` | 同上：HTTP 边界要分开说清责任方（404 / 409） |
- * | `POLICY_CONDITIONS` | 实际调用方是**本模块自己的** `asset.module.ts`（注册条件） |
+ * | `POLICY_CONDITIONS` | **没有**模块外调用方（见下面那条注释里的据实记载与复访条件） |
  *
  * `OwnershipService` 此前**刻意**不导出，理由写在旧版注释里：「它今天没有模块外的调用方
  * （C16：不为不存在的调用方建接口）」。**Task 8 是第一个真实调用方**，因此导出的时机
@@ -44,9 +44,15 @@ export { AssetModule } from './asset.module.js';
 /**
  * 策略条件的名字（P3 / Task 1）。
  *
- * 跨模块导出它**不是**为了给别的模块用，而是因为**名字的所有权在声明方**：注册方
- * （`asset.module.ts`）与声明方（`asset.controller.ts`）必须引用同一个字符串。
- * 导出它顺带让 `exchange`（Task 6）能按同一形状引用 `asset` 的条件名，而不必深引内部文件。
+ * ## 据实记载：它今天**没有任何模块外的调用方**
+ *
+ * 真正的引用者在模块**内部**（`asset.module.ts` 从 `./asset.controller.js` 直接 import
+ * 它来注册条件），因此按 C16「不为不存在的调用方建接口」的严格读法，这一行本可以不加。
+ * 它写在这里的理由是**计划 Task 1 Step 7 明写要加**，并且它属于「模块对外接口」这张表：
+ * `asset` 的条件名从此是**具名且可见**的，而不是藏在内部文件里。
+ *
+ * **复访触发条件**：若到 P3 结束仍没有任何模块外代码 import 它，就删掉这一行
+ * （而不是留着「以防万一」）——这句是给下一位实现者的，不是给读者的安慰。
  */
 export { POLICY_CONDITIONS } from './asset.controller.js';
 
