@@ -135,22 +135,28 @@ describe('对账：不变式 #2（全局 Σ 余额 = 0 且 Σ 分录 = 0）', ()
       const emptyRecon = new LedgerReconciliationService(emptyPrisma);
       const report = await emptyRecon.reconcile();
 
+      // ★ 「先验再做」要求的**返回类型实测**（不靠推断）：四个量都必须是 JS `bigint`。
+      //   背景（本机实测，原始输出在 evidence/t9-step0-measure-raw.txt）：
+      //   `sum(bigint)` 在 PostgreSQL 里是 **numeric**，Prisma 把它读成 `Decimal2` 对象
+      //   （`typeof === 'object'`，`Object.prototype.toString` = `[object Decimal]`）；
+      //   `count(*)` 是 int8，Prisma 读成 `bigint`。走 `::text` 之后两个都是确定的形态。
+      //
+      // ★ 为什么这四条排在**数值断言之前**（探针 p-trust-prisma-type 逼出来的顺序）：
+      //   把 `::text` 去掉、并且不再 `BigInt(...)` 转换之后，`totalBalance` 变成一个
+      //   `Decimal2`。如果数值断言排在前面，先失败的是 `expect(report.totalBalance).toBe(0n)`
+      //   （实测消息：`expected 0 to be 0n`），**类型断言根本走不到**——于是它没有独立见证。
+      //   排在前面之后，同一次变异红的正是 `expected 'object' to be 'bigint'`。
+      expect(typeof report.accountCount).toBe('bigint');
+      expect(typeof report.entryCount).toBe('bigint');
+      expect(typeof report.totalBalance).toBe('bigint');
+      expect(typeof report.totalEntryAmount).toBe('bigint');
+
       expect(report.accountCount).toBe(3n); // 只有迁移种子化的三个系统账户（D2）
       expect(report.entryCount).toBe(0n);
       expect(report.totalBalance).toBe(0n);
       expect(report.totalEntryAmount).toBe(0n);
       expect(report.nonzeroAccounts).toEqual([]);
       expect(LedgerReconciliationService.isBalanced(report)).toBe(true);
-
-      // ★ 「先验再做」要求的**返回类型实测**（不靠推断）：四个量都必须是 JS `bigint`。
-      //   背景（本机实测，原始输出在 evidence/t9-step0-measure-raw.txt）：
-      //   `sum(bigint)` 在 PostgreSQL 里是 **numeric**，Prisma 把它读成 `Decimal2` 对象
-      //   （`typeof === 'object'`，`Object.prototype.toString` = `[object Decimal]`）；
-      //   `count(*)` 是 int8，Prisma 读成 `bigint`。走 `::text` 之后两个都是确定的形态。
-      expect(typeof report.accountCount).toBe('bigint');
-      expect(typeof report.entryCount).toBe('bigint');
-      expect(typeof report.totalBalance).toBe('bigint');
-      expect(typeof report.totalEntryAmount).toBe('bigint');
 
       // ★★ 非空转伴生证据（**同一个查询、同一个库**）：直接给一个种子账户 +1 分。
       await owner.query(`UPDATE ledger.accounts SET balance = balance + 1 WHERE kind = 'EXTERNAL_TOPUP'`);
