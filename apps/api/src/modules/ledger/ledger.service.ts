@@ -222,9 +222,12 @@ export class LedgerService {
     // ↓ C35（控制器裁定 ⑧）：**在任何账户写入之前**按全局锁序取全部账户行锁。
     //   位置是**三次实测**定下来的（见 `lockAccountRows` 的长注释）：它在
     //   `createMany`（FK 的 `FOR KEY SHARE`）与 `applyBalances`（余额写）之前，
-    //   但在 `ledgerTransaction.create` **之后**——最后这一点偏离了计划 Step 4 的字面位置，
-    //   理由是那一版会把「并发同键撞唯一索引（P2002）」这条路径变成**不可达**
-    //   （实测：`postings.test.ts` 那条确定性用例变红），而这里只需要「在账户写入之前」。
+    //   但在 `ledgerTransaction.create` **之后**——最后这一点**偏离计划 Step 4 的字面位置**，
+    //   那一版实测会毁掉两条既有语义：① 同键并发**再也撞不到唯一索引**（那条见证 P2002 的
+    //   既有用例变红）；② 败者在读快照**之前**就卡住 ⇒ `stage` 从 `conditional-update`
+    //   变成 `predicted`（探针 `P-PLACE-EARLY` 实测，而计划 Step 6 明写这一条必须仍然成立）。
+    //   这里只需要「在账户写入之前」⇒ 那两笔纯读与那次不碰账户的 `ledgerTransaction.create`
+    //   都不构成拦阻。
     await this.lockAccountRows(tx, legs.map((leg) => leg.accountId));
 
     await tx.ledgerEntry.createMany({
