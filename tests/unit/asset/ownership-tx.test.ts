@@ -18,15 +18,16 @@ import { OwnershipService } from '@vca/api/modules/asset/ownership.service.js';
  * 计划 Step 1 给的两条里，有一条（`expect(true).toBe(true)`）是**恒真**的，另一条
  * （`Function.length === 2`）**分不出 required 与 optional**。本文件因此改成：
  *
- * | 判据 | 在哪一层 | 什么改动会打红它 |
- * |---|---|---|
- * | ① `TxIsRequired` | 编译期 | `tx` 改成 `tx?` ⇒ 变成 `false` ⇒ TS2322 |
- * | ② `TxIsTransactionClient` | 编译期 | `tx` 被删掉/换成别的类型 ⇒ 变成 `false` ⇒ TS2322 |
- * | ③ `@ts-expect-error`（PrismaService 不能当 tx） | 编译期 | 否定约束（`$connect`）被去掉 ⇒ 指令**不再被使用** ⇒ TS2578 |
- * | ④ `Function.length === 2` | 运行期 | `tx` 参数被**整个删掉** ⇒ 1 |
+ * | 判据 | 在哪一层 | 什么改动会打红它 | 谁把它打红过 |
+ * |---|---|---|---|
+ * | ① `TxParamIsRequiredTransactionClient` | 编译期 | `tx` 改成 `tx?` **或** `tx` 被删掉 ⇒ 变成 `false` ⇒ TS2322 | 探针 P-1（实测） |
+ * | ② `@ts-expect-error`（`PrismaService` 不能当 `tx`） | 编译期 | 否定约束（`$connect`）被去掉 ⇒ 指令**不再被使用** ⇒ TS2578 | 见下面「复访触发条件」 |
+ * | ③ `Function.length === 2` | 运行期 | `tx` 参数被**整个删掉** ⇒ 1（**分不出 required/optional**，理由写在用例上） | TDD 的首次红灯（实测 `expected 1 to be 2`） |
  *
- * 判据 ①②③ 由 `pnpm typecheck`（`pnpm -r typecheck` 覆盖 `tests/` 这个 workspace 包）
- * 执行，`vitest` 只执行 ④——ESM 下类型在运行期不存在，这一点没法绕开，因此它写在明处。
+ * 判据 ①② 由 `pnpm typecheck`（`pnpm -r typecheck` 覆盖 `tests/` 这个 workspace 包）
+ * 执行，`vitest` 只执行 ③——ESM 下类型在运行期不存在，这一点没法绕开，因此它写在明处。
+ * **判据的编号与「谁打红过」都必须逐条有实测**：本项目抓到过的缺陷里有一整类
+ * 「断言红了，但红在别的机制上」，因此没有实测过的判别力一律不写在这里。
  *
  * ## ★★ 为什么必须给参数类型加一条否定约束（**这是与计划 D1 的实测分歧**）
  *
@@ -70,29 +71,48 @@ import { OwnershipService } from '@vca/api/modules/asset/ownership.service.js';
  * 可以简化成裸的 `Prisma.TransactionClient`（那时 ③ 会提示这件事）。
  */
 
-/** `transferOwnership` 的**第一个**参数类型（判据 ①②③ 全从它推出）。 */
+/** `transferOwnership` 的**第一个**参数类型（见证 ①③ 全从它推出）。 */
 type TxParam = Parameters<typeof OwnershipService.prototype.transferOwnership>[0];
 
-// ① **必填**：`tx?` 会把 `undefined` 并进第一个参数的类型里（实测 F8a），
-//    于是 `TxIsRequired` 变成 `false`，下一行以 TS2322 红。
-type TxIsRequired = undefined extends TxParam ? false : true;
-const txIsRequired: TxIsRequired = true;
-
-// ② **是**事务客户端：没有这一条，把 `tx` 整个删掉会让 ① 依然为 `true`
-//    （第一个参数变成业务入参，`undefined` 照样不满足它）。两条件必须合看。
-type TxIsTransactionClient = TxParam extends Prisma.TransactionClient ? true : false;
-const txIsTransactionClient: TxIsTransactionClient = true;
+/**
+ * ① **「是一个事务客户端，且必填」——一条见证，不是两条**。
+ *
+ * ## 为什么合成一条（探针 P-1 的实测逼出来的结论）
+ *
+ * 初稿把它写成两条独立的类型别名（`TxIsRequired` 与 `TxIsTransactionClient`），
+ * 各配一行 `= true`。**探针 P-1 一次把两行都打红了**：
+ *
+ * ```
+ * tests/unit/asset/ownership-tx.test.ts(79,7): error TS2322: Type 'true' is not assignable to type 'false'.
+ * tests/unit/asset/ownership-tx.test.ts(84,7): error TS2322: Type 'true' is not assignable to type 'false'.
+ * ```
+ *
+ * 那次输出说明了一件事：`undefined extends TxParam` 为真 **蕴含**
+ * `TxParam extends Prisma.TransactionClient` 为假（`undefined` 不是对象类型的成员）
+ * ⇒ **前一条永远不可能单独变红**，留着它就是一条「不可能失败的断言」——正是本项目
+ * 反复抓到的那一类（P0 的恒真 `toContain`、P1 的整除拆分、P2 的 `--passWithNoTests`）。
+ * 合成一条之后，两个方向仍然各自可判别：
+ *
+ * - `tx` 改成 `tx?`（**探针 P-1**）⇒ `undefined extends TxParam` ⇒ 这一行红；
+ * - `tx` 被整个删掉（第一个参数退回业务入参）⇒ 第二个分支不成立 ⇒ **同一行**红。
+ *
+ * 判别力边界（据实写在这里，而不是留给读者猜）：这一条**不**能证明
+ * `PrismaService` 被拒——那是 ③ 的活；`tx: Prisma.TransactionClient`（去掉否定约束）
+ * 会让 ① 照旧绿，而 ③ 以 TS2578 红。两者覆盖**不同**的改动。
+ */
+type TxParamIsRequiredTransactionClient =
+  undefined extends TxParam ? false : TxParam extends Prisma.TransactionClient ? true : false;
+const txParamIsRequiredTransactionClient: TxParamIsRequiredTransactionClient = true;
 
 /**
- * 上面两条见证**在运行期一次都不被读**——ESM 下类型不存在，`tsc` 是唯一的判据
+ * 上面这条见证**在运行期一次都不被读**——ESM 下类型不存在，`tsc` 是唯一的判据
  * （`pnpm typecheck` 覆盖 `tests/` 这个 workspace 包）。
  *
- * `void` 写在这里是为了让 `@typescript-eslint/no-unused-vars` 看明白它们不是漏写。
- * **刻意不用 `expect(txIsRequired).toBe(true)` 那样的运行期断言**：类型被擦除之后
- * 那一句恒真，正是本项目反复抓到的那类「不可能失败的断言」。
+ * `void` 写在这里是为了让 `@typescript-eslint/no-unused-vars` 看明白它不是漏写。
+ * **刻意不用 `expect(txParamIsRequiredTransactionClient).toBe(true)` 那样的运行期断言**：
+ * 类型被擦除之后那一句恒真，正是上面那段说的同一类缺陷。
  */
-void txIsRequired;
-void txIsTransactionClient;
+void txParamIsRequiredTransactionClient;
 
 /**
  * ③ **`PrismaService` 被编译期拒收**（本任务的机器判据本体）。

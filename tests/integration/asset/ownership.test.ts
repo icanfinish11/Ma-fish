@@ -882,10 +882,15 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
       }),
     ).rejects.toThrow('业务失败');
 
-    await expect(prisma.asset.findUniqueOrThrow({ where: { id: asset.id } })).resolves.toMatchObject({
-      ownerId: alice,
-    });
-    await expect(prisma.ownershipHistory.count({ where: { assetId: asset.id } })).resolves.toBe(0);
+    // 断言带**显式消息**：探针 P-2 打红这一条时，输出里能直接读到「变成了谁」，
+    // 归因不必靠猜（本项目的探针输出要被逐字记进报告，因此它必须自解释）。
+    const afterRollback = await prisma.asset.findUniqueOrThrow({ where: { id: asset.id } });
+    expect(
+      afterRollback.ownerId,
+      `外层事务回滚之后所有权指针变成了 ${afterRollback.ownerId}（应为 alice）——预检 §0.1 的 [B6] 构造复现了`,
+    ).toBe(alice);
+    const historyRows = await prisma.ownershipHistory.count({ where: { assetId: asset.id } });
+    expect(historyRows, `外层事务回滚之后 ownership_history 仍有 ${historyRows} 行（应为 0）`).toBe(0);
   });
 
   /**
