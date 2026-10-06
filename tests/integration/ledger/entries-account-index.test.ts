@@ -187,6 +187,21 @@ describe('★ `ledger.entries(account_id)` 索引：目录断言 + 执行计划�
       drift: -BigInt(PER_ACCOUNT),
     });
 
+    // ── ★ Step 8 要求记进报告的三个数之一：一次 `reconcilePerAccount()` 在 20 万行上的耗时 ──
+    // 这条同时是**规模前提**的见证：`drifts` 在这个形状下必须是 1 万个账户全都漂移
+    // （每个账户 derived = 20、materialized = 0）——于是「全表那条查询真的读完了每一行」
+    // 有了一个可数的结果，而不只是墙上时钟的一个数。
+    const t0 = performance.now();
+    const report = await recon.reconcilePerAccount();
+    const reconcileMs = performance.now() - t0;
+    process.stderr.write(
+      `[对账实测] reconcilePerAccount 在 ${ENTRIES} 条分录 / ${ACCOUNTS} 个账户上：${reconcileMs.toFixed(1)} ms，` +
+        `漂移账户 ${report.drifts.length} 个，entryCount=${report.entryCount}\n`,
+    );
+    expect(report.entryCount).toBe(BigInt(ENTRIES));
+    expect(report.drifts.length, '造的数据让**每一个**账户都漂移 ⇒ 这条读数真的覆盖了全表').toBe(ACCOUNTS);
+    expect(LedgerReconciliationService.isPerAccountClean(report)).toBe(false);
+
     // ── ★ 反面对照：把索引 DROP 掉，**同一条查询**必须落到 `Seq Scan on entries` ──────
     // 没有这一半，上面那句「计划里没有 Seq Scan」在一条「索引根本不影响它」的查询上
     // 也会通过——而计划 Step 5 原本要测的那条**全表**查询恰恰就是这种查询

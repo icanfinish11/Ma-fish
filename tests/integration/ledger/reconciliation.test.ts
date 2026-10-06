@@ -576,5 +576,117 @@ describe('★ 逐账户对账：把每个账户的 Σ entries.amount 与物化 b
     const restored = await isoRecon.reconcilePerAccount();
     expect(restored.drifts, '清掉那条孤儿分录之后必须回到 0 行').toEqual([]);
     expect(LedgerReconciliationService.isPerAccountClean(restored)).toBe(true);
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ★ 第二个方向：**反过来的那个孤儿** —— 有账户行、**一条分录都没有**。
+    // ══════════════════════════════════════════════════════════════════════════
+    // ## 为什么它必须在这里（这一格是探针 `P-PERACCT-DROP-COALESCE` **逼出来的**）
+    //
+    // 上面那一格用的是**左**孤儿（分录有、账户无），而它的 `sum(amount)` 是 **777**、不是 NULL
+    // —— 于是 `COALESCE(d.total, 0)` 在那一格里**一次都没有被行使**。实测证据：把
+    // `COALESCE(d.total, 0)` 换成裸的 `d.total` 之后，整个文件**照样 9 passed**（假绿）。
+    // 这是探针驱动器抓到的第四条「断言覆盖不到它声称覆盖的东西」，也是本节要补的东西。
+    //
+    // 右孤儿（账户在、分录无）才让 `derived` 走**空集**那条路：`sum()` 返回 **NULL**
+    // （P2 实测 `[M6] 空集 无 COALESCE → null`），而两个后果各自是一条独立的判据：
+    //   ① `COALESCE(d.total, 0)::text` 那个 **SELECT 里的** `COALESCE`：少了它，
+    //      `derived` 是 NULL ⇒ `BigInt(null)` 抛 `TypeError`（整条查询炸掉，不是「少一行」）。
+    //   ② `WHERE COALESCE(…) <> COALESCE(…)` 里那个 **WHERE 里的** `COALESCE`：少了它，
+    //      比较变成 `balance <> NULL` ⇒ 结果是 NULL ⇒ **这一行被静默丢掉**。
+    //      那正是最坏的一种：一个「余额被凭空加了 5 分」的账户**不出现**在漂移报告里。
+    //
+    // 造法（第四版；前三版都被实测打红，每一步的教训都留着——这正是这一格最容易写错的地方）：
+    //   ① **不能拿系统账户当对侧**：给 `EXTERNAL_TOPUP` 插一条 −5 会让**它**变成漂移。
+    //   ② **分录侧要 ∑ = 0**：`totalEntryAmount` 是 `isBalanced` 的第二个合取项。
+    //   ③ **余额侧也要 ∑ = 0**：新增账户的余额算进 `totalBalance`。
+    //   ④ **对侧余额必须能是负的**：`USER_AVAILABLE` 有非负 CHECK（`mayGoNegative()` 名单里
+    //      只有 `EXTERNAL_TOPUP`）⇒ 对侧只能是一个**新的** `EXTERNAL_TOPUP` 行
+    //      （`owner_user_id` 为 NULL，唯一约束允许第二行）。
+    // 最终形状（两式都等于 0，因此**全局判据全程看不见它**——这才是逐账户判据要证的那件事）：
+    //   真实右孤儿：账户余额 **+5**、零分录                       ⇒ drift +5   ← 本格的判别力
+    //   对侧：新 `EXTERNAL_TOPUP` 行余额 **−5**、零分录            ⇒ drift −5
+    //   三个假账户：余额 0，分录 ±5、±5（外键被 `replica` 绕过）     ⇒ drift ±5，自相抵消
+    //   Σ 余额 = 5 − 5 = 0；Σ 分录 = 5 − 5 + 5 − 5 = 0 ⇒ `isBalanced` **仍然 true**。
+    const rightOrphanAccount = uuidv7();
+    const counterOrphanAccount = uuidv7();
+    const topupOrphanAccount = uuidv7();
+    const mirrorOrphanAccount = uuidv7();
+    const negativeEscrow = uuidv7();
+    const rightOrphanTx = uuidv7();
+    try {
+      await owner.query('BEGIN');
+      await owner.query(`SET LOCAL session_replication_role = replica`);
+      await owner.query(
+        `INSERT INTO ledger.accounts (id, kind, owner_user_id, balance, created_at) VALUES
+           ($1::uuid, 'USER_AVAILABLE',  NULL,  5, now()),
+           ($2::uuid, 'EXTERNAL_TOPUP',  NULL, -5, now())`,
+        [rightOrphanAccount, negativeEscrow],
+      );
+      await owner.query(
+        `INSERT INTO ledger.transactions (id, kind, idempotency_key) VALUES ($1::uuid, 'PROBE', $2)`,
+        [rightOrphanTx, `peracct:right-orphan:${rightOrphanAccount}`],
+      );
+      await owner.query(
+        `INSERT INTO ledger.entries (id, transaction_id, account_id, amount) VALUES
+           ($1::uuid, $5::uuid, $6::uuid, 5),
+           ($2::uuid, $5::uuid, $7::uuid, -5),
+           ($3::uuid, $5::uuid, $8::uuid, 5),
+           ($4::uuid, $5::uuid, $9::uuid, -5)`,
+        [
+          uuidv7(),
+          uuidv7(),
+          uuidv7(),
+          uuidv7(),
+          rightOrphanTx,
+          counterOrphanAccount,
+          topupOrphanAccount,
+          mirrorOrphanAccount,
+          counterOrphanAccount,
+        ],
+      );
+      await owner.query('COMMIT');
+
+      const withRightOrphan = await isoRecon.reconcilePerAccount();
+      const row = withRightOrphan.drifts.find((d) => d.accountId === rightOrphanAccount);
+      expect(
+        row,
+        '一个有余额、**一条分录都没有**的账户必须出现在漂移报告里 —— ' +
+          '`WHERE` 里那个 `COALESCE` 少了它，比较会变成 `5 <> NULL` ⇒ NULL ⇒ 这一行被静默丢掉',
+      ).toBeDefined();
+      // ★ 这一行才是 `COALESCE(d.total, 0)` 的见证：`derived` 走的是**空集**那条路
+      //   （`sum()` → NULL → `COALESCE` → 0）。少了它这里会先是 `BigInt(null)` 的 `TypeError`。
+      expect(row).toEqual({
+        accountId: rightOrphanAccount,
+        materialized: 5n,
+        derived: 0n,
+        drift: 5n,
+      });
+      expect(LedgerReconciliationService.isPerAccountClean(withRightOrphan)).toBe(false);
+      // ★ 只有**两行**的 `derived` 是 0n（真实右孤儿 +5 与对侧 −5）—— 它们才是
+      //   「空集 ⇒ NULL ⇒ COALESCE ⇒ 0n」那条路。（三个假账户的 `derived` 是 ±5。）
+      const emptyDerived = withRightOrphan.drifts.filter((d) => d.derived === 0n);
+      expect(
+        emptyDerived.map((d) => d.accountId).sort(),
+        '**恰好两行**走的是「空集 ⇒ NULL ⇒ COALESCE ⇒ 0n」那条路（本格的判别力在这两行上）',
+      ).toEqual([negativeEscrow, rightOrphanAccount].sort());
+      // ★★ 全局那一侧**看不见它** —— 这是 P2 划界的复现，也是这一格存在的全部理由：
+      //   两式都为 0（余额 +5 −5 = 0；分录 5 − 5 + 5 − 5 = 0）。
+      const globalAfter = await isoRecon.reconcile();
+      expect(
+        LedgerReconciliationService.isBalanced(globalAfter),
+        '这一次注入是**两侧都配平**的 ⇒ 全局判据看不见它（P2 的划界，不是缺陷）',
+      ).toBe(true);
+      expect(globalAfter.totalBalance, 'Σ 余额 = 5 − 5 = 0').toBe(before.totalBalance);
+      expect(globalAfter.totalEntryAmount, 'Σ 分录 = 5 − 5 + 5 − 5 = 0').toBe(before.totalEntryAmount);
+      // 反空转：上面那两个 0 不是因为「什么都没插」——漂移行数与分录数都动了。
+      expect(withRightOrphan.drifts.length, '真的多出了漂移行').toBeGreaterThan(before.drifts.length);
+      expect(globalAfter.entryCount, '真的多插了 4 条分录').toBe(before.entryCount + 4n);
+    } finally {
+      await owner.query(`DELETE FROM ledger.entries WHERE transaction_id = $1::uuid`, [rightOrphanTx]).catch(() => undefined);
+      await owner.query(`DELETE FROM ledger.transactions WHERE id = $1::uuid`, [rightOrphanTx]).catch(() => undefined);
+      await owner.query(`DELETE FROM ledger.accounts WHERE id = ANY($1::uuid[])`, [
+        [rightOrphanAccount, negativeEscrow],
+      ]).catch(() => undefined);
+    }
   }, 180_000);
 });
