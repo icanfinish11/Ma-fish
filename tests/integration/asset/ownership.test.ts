@@ -546,7 +546,11 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
     const carol = randomUUID();
     const asset = await prisma.asset.create({ data: { ownerId: alice } });
 
-    const first = await ownership.transferOwnership({ assetId: asset.id, toUserId: bob, reason: '拍卖成交' });
+    // Task 1 起转让**收调用方的事务**（`tx` 必填）：调用点自己写 `$transaction`，
+    // 转让因此不再有自己的 `COMMIT`。下面两笔各是一个独立事务（与转让前的语义相同）。
+    const first = await prisma.$transaction((tx) =>
+      ownership.transferOwnership(tx, { assetId: asset.id, toUserId: bob, reason: '拍卖成交' }),
+    );
     expect(first.assetId).toBe(asset.id);
     expect(first.fromUserId).toBe(alice);
     expect(first.toUserId).toBe(bob);
@@ -555,7 +559,9 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
       ownerId: bob,
     });
 
-    const second = await ownership.transferOwnership({ assetId: asset.id, toUserId: carol, reason: '交换成交' });
+    const second = await prisma.$transaction((tx) =>
+      ownership.transferOwnership(tx, { assetId: asset.id, toUserId: carol, reason: '交换成交' }),
+    );
     // 第二笔的**前手是当前所有人**（bob），不是「上一次转让之前那个人」——这正是行锁要保证的。
     expect(second.fromUserId).toBe(bob);
     expect(second.toUserId).toBe(carol);
@@ -590,7 +596,9 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
     const beforeRow = await prisma.assetVersion.findUniqueOrThrow({ where: { id: persisted.assetVersionId } });
 
     const to = randomUUID();
-    await ownership.transferOwnership({ assetId: seeded.assetId, toUserId: to, reason: '转让' });
+    await prisma.$transaction((tx) =>
+      ownership.transferOwnership(tx, { assetId: seeded.assetId, toUserId: to, reason: '转让' }),
+    );
 
     // ① 盘上那份制品：字节逐字节相同（大小、内容、摘要都不变）。
     const afterBytes = await readFile(path);
@@ -615,7 +623,9 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
     const ghost = randomUUID();
     let thrown: unknown;
     try {
-      await ownership.transferOwnership({ assetId: ghost, toUserId: randomUUID(), reason: '不存在的作品' });
+      await prisma.$transaction((tx) =>
+        ownership.transferOwnership(tx, { assetId: ghost, toUserId: randomUUID(), reason: '不存在的作品' }),
+      );
     } catch (err: unknown) {
       thrown = err;
     }
@@ -656,7 +666,9 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
 
     let thrown: unknown;
     try {
-      await ownership.transferOwnership({ assetId: asset.id, toUserId: alice, reason: '转给自己' });
+      await prisma.$transaction((tx) =>
+        ownership.transferOwnership(tx, { assetId: asset.id, toUserId: alice, reason: '转给自己' }),
+      );
     } catch (err: unknown) {
       thrown = err;
     }
@@ -684,7 +696,9 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
 
     // 反面对照：同一个作品转让给**别人**照旧成功（否则上面两句在「怎么都抛」的实现上也红）。
     const to = randomUUID();
-    const ok = await ownership.transferOwnership({ assetId: asset.id, toUserId: to, reason: '正常转让' });
+    const ok = await prisma.$transaction((tx) =>
+      ownership.transferOwnership(tx, { assetId: asset.id, toUserId: to, reason: '正常转让' }),
+    );
     expect(ok.fromUserId).toBe(alice);
     await expect(prisma.ownershipHistory.count({ where: { assetId: asset.id } })).resolves.toBe(1);
   });
@@ -718,7 +732,9 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
 
     let thrown: unknown;
     try {
-      await ownership.transferOwnership({ assetId: asset.id, toUserId: upper, reason: '转给自己（大写拼写）' });
+      await prisma.$transaction((tx) =>
+        ownership.transferOwnership(tx, { assetId: asset.id, toUserId: upper, reason: '转给自己（大写拼写）' }),
+      );
     } catch (err: unknown) {
       thrown = err;
     }
@@ -734,7 +750,25 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
     });
   });
 
-  it('同一事务：历史写不进去时指针**也没有变**（不是半个转让）', async () => {
+  /**
+   * 历史写不进去 ⇒ 指针也没有变（不是半个转让）。
+   *
+   * ## Task 1 之后这条用例表达的性质**由谁提供**（据实改写，不夸大）
+   *
+   * 改签名**之前**，这条用例的原子性是「方法**自开事务**」给的：`transferOwnership`
+   * 自己 `BEGIN`，历史写不进去时它自己的事务回滚。改签名之后同类性质由**调用方的
+   * `$transaction`** 提供——因此这里的调用点在明处写了一个 `prisma.$transaction`。
+   *
+   * ## ★ 它的判别力边界（据实记载，防「红在别的机制上」那一类缺陷）
+   *
+   * **这条用例在新旧两种实现下的可观测结果逐项相同**（指针仍是 alice、历史 0 行、
+   * 抛出的是一个 `Error`）：两种实现都让这次写整体回滚，只是回滚由谁发起不同。
+   * 因此它**不是**「自开事务被拿掉」的见证——那是 Step 6 那两条方向用例的活
+   * （探针 P-2 实测：把 `this.prisma.$transaction` 写回方法体，红的正是那一条，
+   * 而本条照旧绿）。留在这里的理由是它仍然钉着一件真事：**一次失败的转让不会留下
+   * 半份状态**，而那件事对任何实现都必须成立。
+   */
+  it('历史写不进去 ⇒ 指针也没有变（原子性由调用方的 $transaction 提供，不再是方法自开事务）', async () => {
     const alice = randomUUID();
     const bob = randomUUID();
     const asset = await prisma.asset.create({ data: { ownerId: alice } });
@@ -743,7 +777,9 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
     await owner.query(`REVOKE INSERT ON asset.ownership_history FROM app_user`);
     let thrown: unknown;
     try {
-      await ownership.transferOwnership({ assetId: asset.id, toUserId: bob, reason: '这笔必须整体失败' });
+      await prisma.$transaction((tx) =>
+        ownership.transferOwnership(tx, { assetId: asset.id, toUserId: bob, reason: '这笔必须整体失败' }),
+      );
     } catch (err: unknown) {
       thrown = err;
     } finally {
@@ -751,14 +787,16 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
     }
 
     expect(thrown, '历史写不进去时没有抛错').toBeInstanceOf(Error);
-    // 回滚的证据：指针仍是 alice（若两条语句各写各的事务，这里会变成 bob 而没有历史行）。
+    // 回滚的证据：指针仍是 alice（若指针那次写逃出了这个事务，这里会变成 bob 而没有历史行）。
     await expect(prisma.asset.findUniqueOrThrow({ where: { id: asset.id } })).resolves.toMatchObject({
       ownerId: alice,
     });
     await expect(prisma.ownershipHistory.count({ where: { assetId: asset.id } })).resolves.toBe(0);
 
     // 反面对照：权限恢复之后同一笔转让可以成功（否则上面那句断言在「怎么都抛」的实现上也绿）。
-    const retry = await ownership.transferOwnership({ assetId: asset.id, toUserId: bob, reason: '重试' });
+    const retry = await prisma.$transaction((tx) =>
+      ownership.transferOwnership(tx, { assetId: asset.id, toUserId: bob, reason: '重试' }),
+    );
     expect(retry.fromUserId).toBe(alice);
     await expect(prisma.asset.findUniqueOrThrow({ where: { id: asset.id } })).resolves.toMatchObject({
       ownerId: bob,
@@ -795,7 +833,12 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
     await owner.query('BEGIN');
     await owner.query('SELECT owner_id FROM asset.assets WHERE id = $1 FOR UPDATE', [asset.id]);
 
-    const pending = ownership.transferOwnership({ assetId: asset.id, toUserId: carol, reason: '并发场景' });
+    // ★ 这里**不能**写成 `await prisma.$transaction(...)`：`pending` 必须保持是一个
+    //   **尚未 settle 的 Promise**，这条用例靠「先不等它」来制造并发。`$transaction(fn)`
+    //   本身就返回 Promise，因此并发构造原样保留（Task 1 Step 5 明写的两处特殊处理之一）。
+    const pending = prisma.$transaction((tx) =>
+      ownership.transferOwnership(tx, { assetId: asset.id, toUserId: carol, reason: '并发场景' }),
+    );
     // 让转让走到它的读语句（持锁实现会**停在那里**）
     await new Promise((resolve) => setTimeout(resolve, 500));
     // 锁的持有者在这一行上做一次真实的变更（模拟另一笔事务先提交）
@@ -808,5 +851,63 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
     expect(history).toHaveLength(1);
     expect(history[0]?.fromUserId).toBe(dave);
     expect(history[0]?.toUserId).toBe(carol);
+  });
+
+  /**
+   * ★ **预检 §0.1 的反向对照，逐字搬进用例**（Task 1 的核心判据）。
+   *
+   * 这条用例问的是：把转让 + 一次业务写入放进**同一个** `$transaction`，其中业务写入抛错，
+   * 那么**所有权指针**与**历史行**是不是都回到原样。
+   *
+   * ## 它的红是什么样（**探针 P-2 的实测就是预检的 `[B6]` 构造**）
+   *
+   * 把 `transferOwnership` 改回**自开事务**（`this.prisma.$transaction(...)`）之后，
+   * 这条用例红，且红在下面 `ownerId` 那一句上：外层事务回滚了，所有权指针**真的**
+   * 变成了 bob、`ownership_history` **真的**多了一行——预检的
+   * 「账本回滚、所有权不滚」在当前 HEAD 上原样复现。改回之后绿，而绿的机制是
+   * **结构性的**：本方法里 `this.prisma.$transaction` **零匹配**，它不再有自己的 `COMMIT`。
+   *
+   * 两个量**逐项**核对（不是只看指针）：历史里那一行同样是不可撤销的写入
+   * （`ownership_history` 的 UPDATE/DELETE 在运行期角色下被 REVOKE，判据 10）。
+   */
+  it('外层事务回滚 ⇒ 所有权指针与历史行**都**回滚（预检 §0.1 的 [B6] 构造）', async () => {
+    const alice = randomUUID();
+    const bob = randomUUID();
+    const asset = await prisma.asset.create({ data: { ownerId: alice } });
+
+    await expect(
+      prisma.$transaction(async (tx) => {
+        await ownership.transferOwnership(tx, { assetId: asset.id, toUserId: bob, reason: '注定回滚的转让' });
+        throw new Error('业务失败');
+      }),
+    ).rejects.toThrow('业务失败');
+
+    await expect(prisma.asset.findUniqueOrThrow({ where: { id: asset.id } })).resolves.toMatchObject({
+      ownerId: alice,
+    });
+    await expect(prisma.ownershipHistory.count({ where: { assetId: asset.id } })).resolves.toBe(0);
+  });
+
+  /**
+   * 反面对照（**每条拒绝都要有验收对照**）：同一个 `$transaction` 正常提交时，
+   * 指针与历史行**一起**落地。「怎么都不写」的实现会骗过上面那条，这一条挡住它。
+   *
+   * 判别力：它同时钉住「指针变了」与「历史有且仅有一行」——`fromUserId` 那一句还钉住了
+   * 持锁读出来的前手是 alice（不是别的什么）。
+   */
+  it('同一事务正常提交 ⇒ 指针与历史行**一起**可见（反面对照）', async () => {
+    const alice = randomUUID();
+    const bob = randomUUID();
+    const asset = await prisma.asset.create({ data: { ownerId: alice } });
+
+    const result = await prisma.$transaction((tx) =>
+      ownership.transferOwnership(tx, { assetId: asset.id, toUserId: bob, reason: '正常提交' }),
+    );
+
+    expect(result.fromUserId).toBe(alice);
+    await expect(prisma.asset.findUniqueOrThrow({ where: { id: asset.id } })).resolves.toMatchObject({
+      ownerId: bob,
+    });
+    await expect(prisma.ownershipHistory.count({ where: { assetId: asset.id } })).resolves.toBe(1);
   });
 });

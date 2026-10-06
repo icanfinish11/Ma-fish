@@ -1,10 +1,11 @@
-import { Module } from '@nestjs/common';
+import { Inject, Module, type OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { MulterModule } from '@nestjs/platform-express';
 import type { Env } from '../../config/env.schema.js';
+import { PolicyGuard } from '../../common/policy/policy.guard.js';
 import { createStreamingStorage } from '../../common/upload/stream-upload.js';
 import { AuditModule } from '../audit/index.js';
-import { AssetController } from './asset.controller.js';
+import { AssetController, POLICY_CONDITIONS } from './asset.controller.js';
 import { AssetAccessService } from './asset-access.service.js';
 import { AssetService } from './asset.service.js';
 import { AssetVersionService } from './asset-version.service.js';
@@ -189,4 +190,35 @@ export class AssetStoreModule {}
   controllers: [AssetController],
   exports: [AssetStoreModule],
 })
-export class AssetModule {}
+export class AssetModule implements OnModuleInit {
+  constructor(@Inject(PolicyGuard) private readonly policy: PolicyGuard) {}
+
+  /**
+   * 注册 `asset` 的策略条件（P3 / Task 1；控制器裁定 ①）。
+   *
+   * ## 为什么这个模块现在要注册条件
+   *
+   * `readMetadata` 从 `@Public()` 收紧为「登录即可」的有条件声明，而条件的名字由
+   * **声明方**（`asset.controller.ts`）拥有、**注册方**（这里）反向 import 它——
+   * `@Policy({…})` 的实参在类定义期求值，反过来的方向会成环（那一次实测记在
+   * `ledger.controller.ts` 的常量头注释上，本文件与 `ledger.module.ts` 同一形状）。
+   *
+   * ## 为什么是 `onModuleInit` 而不是字段初始化时
+   *
+   * `registerCondition` 必须落在**全局守卫那一个实例**上（`PolicyModule` 是 `@Global()`，
+   * `AppModule` 用 `useExisting` 把同一个实例接到 `APP_GUARD`）。在 `onModuleInit` 里注册
+   * 保证 DI 已经就绪，且注册发生在应用 `init()` 之前——`PolicyGuard.canActivate` 只会
+   * 在 `init()` 之后被调用。
+   *
+   * ## 条件体为什么只判「有没有当事人」
+   *
+   * 守卫在进入条件之前已经拒掉了匿名请求（判定顺序第 4 步），因此这一句是**纵深防御**，
+   * 与 `ledger.module.ts` 的写法逐字同源。它**不是**这条规则的全部：真正的规则是
+   * 「登录即可」，而它由**声明**表达；条件存在的理由是让这条规则有一个具名的、
+   * 可被注册表看见的落点（见 `asset.controller.ts` 上的那段注释）。
+   * 未注册的条件一律拒绝（fail-closed），因此漏注册的表现是「这条路由 403」而不是放行。
+   */
+  onModuleInit(): void {
+    this.policy.registerCondition(POLICY_CONDITIONS.assetMetadataRead, ({ userId }) => userId !== undefined);
+  }
+}

@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import type { Prisma } from '../../generated/prisma/client.js';
 import { PrismaService } from '../../db/prisma.service.js';
 
 /**
@@ -56,18 +57,85 @@ import { PrismaService } from '../../db/prisma.service.js';
  *   `22P02`（uuid 语法）失败，**不**伪装成「作品不存在」——那会把一次调用错误说成一次
  *   正常的 404。参数校验属于 HTTP 边界（Task 8 的控制器）。**规范化不等于校验**：
  *   前者只把「同一个取值的另一种拼写」对齐，后者是另一件事（见方法入口那段）。
+ *
+ * ## ★ 转让**收调用方的事务**，`tx` 必填（P3 / Task 1；预检 §0.1 的证伪）
+ *
+ * 本方法此前**自己开事务**（`this.prisma.$transaction(...)`）。那在 P1 的语境里没问题
+ * ——它当时唯一的调用方是自己。但设计 §6.3:294 要求 `RELEASED` **在单一数据库事务内完成**，
+ * 而预检用一条决定性构造证明了自开事务的转让**建不起**那件事：
+ *
+ * ```
+ * [B6] 外层事务回滚了 = true
+ * [B6] 回滚之后 owner_id     = …0002（= U2）    ← 真的改了
+ * [B6] 回滚之后 history 行数 = 1                ← 真的多了一行
+ * ```
+ *
+ * 即「账本回滚、所有权不滚」的释放**可以构造出来**，而设计说任何异常必须完全回滚。
+ * 反向对照（把等价的三步用**调用方的 `tx`** 内联写出来）：注入异常后七个量逐项相同。
+ *
+ * ### 「必填」还不够 —— 参数类型上必须有一条**否定约束**（实测量出来的分歧）
+ *
+ * P2 裁定 C-1 的教训是「可选参数使错误调用在类型层合法」。但**把参数改成必填的
+ * `Prisma.TransactionClient` 并没有把这件事变成一个机器判据**，实测：
+ *
+ * ```
+ * F1  '$transaction' extends keyof Prisma.TransactionClient  === true
+ *     （@prisma/client/runtime/client.d.ts 的 denylist 是
+ *       ["$connect","$disconnect","$on","$use","$extends"] —— Prisma 7 把 `$transaction`
+ *       移出去了；Prisma ≤6 它在里面。计划 D1 那句「它没有 $transaction」在今天**不成立**。）
+ * F2  const tx: Prisma.TransactionClient = prismaService;     ← **编译通过**
+ * ```
+ *
+ * 原因是 TS 的结构化判定：**多出来的成员不会让赋值失败**。`PrismaService` 继承
+ * `PrismaClient`，它有 `Prisma.TransactionClient` 的每一个成员，于是它满足后者——
+ * `transferOwnership(this.prisma, input)` 照样编译通过。
+ *
+ * 因此参数类型是「事务客户端 **且** 没有 `$connect`」：
+ *
+ * - 事务客户端确实没有 `$connect`（它在 denylist 里，实测 `F6`）；
+ * - `PrismaService` **有** `$connect` ⇒ 被编译期拒收（实测 `F4`：
+ *   `Type '() => Promise<void>' is not assignable to type 'undefined'`）；
+ * - 真实调用方（`prisma.$transaction(async (tx) => …)`）**不**受影响（实测 `F5`/`F11`）。
+ *
+ * 于是「忘了传」与「把 `this.prisma` 当 `tx` 传」都是**一行红波浪线**，而不是
+ * 一条只有测试才发现的调用形状。判据由 `tests/unit/asset/ownership-tx.test.ts` 的
+ * 三条编译期见证钉住（`pnpm typecheck` 覆盖 `tests/` 这个 workspace 包）。
+ *
+ * ### 这条判据自己的守卫（复访触发条件）
+ *
+ * 它依赖 Prisma 的 denylist 内容。若 `$connect` 哪天也被移出去，那三条见证会以
+ * **TS2578（未使用的 `@ts-expect-error`）**变红，真实调用点会以 TS2322 变红——
+ * 两条都响亮，不会静默失效。若 `$transaction` 被移**回** denylist，本判据仍然成立，
+ * 此后可以简化成裸的 `Prisma.TransactionClient`（那时 TS2578 会提示这件事）。
+ *
+ * ### 迁移说明（给既有调用方）
+ *
+ * 落地时 `apps/api/src` 下**零**个生产调用点（`grep` 复核：`dist/` 与
+ * `apps/worker/node_modules/@vca/api` 的编译产物会让朴素 grep 多报，必须排除）；
+ * 全部 **11** 处在 `tests/integration/asset/` 里，逐个包进 `prisma.$transaction((tx) => …)`。
+ * 交换模块（Task 8）是第一个**跨模块**调用方：它会在同一个 `tx` 里再装下账本两腿、
+ * 两行历史、对手方访问权、义务行、审计与幂等键。
  */
 @Injectable()
 export class OwnershipService {
   constructor(private readonly prisma: PrismaService) {}
 
   /**
-   * 把作品转让给另一个用户：指针变更 + 追加一行所有权史，**同一事务**。
+   * 把作品转让给另一个用户：指针变更 + 追加一行所有权史，**在调用方的 `tx` 里**。
    *
+   * 本方法**不再自己开事务**：`this.prisma.$transaction` 在方法体里零匹配，因此
+   * 「转让有自己的 `COMMIT`」这件事在结构上不可能——外层事务回滚时，指针与历史行
+   * **一起**回滚（`tests/integration/asset/ownership.test.ts` 的两条方向用例）。
+   *
+   * @param tx 调用方的事务客户端。**必填**，且类型上有否定约束（`$connect`）——
+   *           理由见类注释。`PrismaService` 因此**不**满足它。
    * @throws {AssetNotFoundError} 作品不存在（**不**创建、**不**追加历史行）。
    * @throws {SelfTransferRejectedError} 新所有人就是当前所有人（**不**写历史行、**不**改指针）。
    */
-  async transferOwnership(input: TransferOwnershipInput): Promise<OwnershipTransferResult> {
+  async transferOwnership(
+    tx: Prisma.TransactionClient & { readonly $connect?: never },
+    input: TransferOwnershipInput,
+  ): Promise<OwnershipTransferResult> {
     /**
      * 入参在**方法入口**规范化一次（修复轮 2 / Critical）。
      *
@@ -95,50 +163,48 @@ export class OwnershipService {
      */
     const toUserId = input.toUserId.toLowerCase();
 
-    return this.prisma.$transaction(async (tx) => {
-      // ① 持锁读前手。写成标签模板（而不是拼接字符串）：Prisma 会把插值变成**绑定参数**，
-      //    因此这里不存在 C9 点名的字符串拼接 raw 那条路径。
-      const locked = await tx.$queryRaw<{ owner_id: string }[]>`
-        SELECT owner_id FROM asset.assets WHERE id = ${input.assetId}::uuid FOR UPDATE
-      `;
-      const current = locked[0];
-      if (current === undefined) throw new AssetNotFoundError(input.assetId);
-      const fromUserId = current.owner_id;
+    // ① 持锁读前手。写成标签模板（而不是拼接字符串）：Prisma 会把插值变成**绑定参数**，
+    //    因此这里不存在 C9 点名的字符串拼接 raw 那条路径。
+    const locked = await tx.$queryRaw<{ owner_id: string }[]>`
+      SELECT owner_id FROM asset.assets WHERE id = ${input.assetId}::uuid FOR UPDATE
+    `;
+    const current = locked[0];
+    if (current === undefined) throw new AssetNotFoundError(input.assetId);
+    const fromUserId = current.owner_id;
 
-      // ①′ 「转给自己」在**任何写之前**被拒。顺序是刻意的：先读行、再判自转。
-      //     反过来（先判自转）会让一条 `assetId` 不存在的调用拿到「转给自己」这个错误，
-      //     而正确的说法是「作品不存在」——而且那样连作品存在与否都不用查就能返回，
-      //     成了一条不需要鉴权的探测口。
-      //     拒绝的后果由用例实测：没有历史行、指针未变（一行 `X→X` 写下去就删不掉了）。
-      if (toUserId === fromUserId) {
-        throw new SelfTransferRejectedError(input.assetId, fromUserId);
-      }
+    // ①′ 「转给自己」在**任何写之前**被拒。顺序是刻意的：先读行、再判自转。
+    //     反过来（先判自转）会让一条 `assetId` 不存在的调用拿到「转给自己」这个错误，
+    //     而正确的说法是「作品不存在」——而且那样连作品存在与否都不用查就能返回，
+    //     成了一条不需要鉴权的探测口。
+    //     拒绝的后果由用例实测：没有历史行、指针未变（一行 `X→X` 写下去就删不掉了）。
+    if (toUserId === fromUserId) {
+      throw new SelfTransferRejectedError(input.assetId, fromUserId);
+    }
 
-      // ② 指针变更。用 `update`（不是 `updateMany`）：主键在上一句里已经被锁住，
-      //    所以它必然命中一行；命中不了的话那就是「锁读与更新之间被删了」，
-      //    让 Prisma 抛错比默默改零行好。
-      await tx.asset.update({ where: { id: input.assetId }, data: { ownerId: toUserId } });
+    // ② 指针变更。用 `update`（不是 `updateMany`）：主键在上一句里已经被锁住，
+    //    所以它必然命中一行；命中不了的话那就是「锁读与更新之间被删了」，
+    //    让 Prisma 抛错比默默改零行好。
+    await tx.asset.update({ where: { id: input.assetId }, data: { ownerId: toUserId } });
 
-      // ③ 追加一行历史。`append-only` 的语义在数据库层（`REVOKE UPDATE, DELETE`，C7），
-      //    应用层只负责**只写不更新**：这里没有任何 upsert / update 的分支。
-      const history = await tx.ownershipHistory.create({
-        data: {
-          assetId: input.assetId,
-          fromUserId,
-          toUserId,
-          reason: input.reason,
-        },
-        select: { id: true, createdAt: true },
-      });
-
-      return {
+    // ③ 追加一行历史。`append-only` 的语义在数据库层（`REVOKE UPDATE, DELETE`，C7），
+    //    应用层只负责**只写不更新**：这里没有任何 upsert / update 的分支。
+    const history = await tx.ownershipHistory.create({
+      data: {
         assetId: input.assetId,
         fromUserId,
         toUserId,
-        ownershipHistoryId: history.id,
-        transferredAt: history.createdAt,
-      };
+        reason: input.reason,
+      },
+      select: { id: true, createdAt: true },
     });
+
+    return {
+      assetId: input.assetId,
+      fromUserId,
+      toUserId,
+      ownershipHistoryId: history.id,
+      transferredAt: history.createdAt,
+    };
   }
 }
 

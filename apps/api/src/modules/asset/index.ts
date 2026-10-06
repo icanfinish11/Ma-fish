@@ -22,11 +22,41 @@
  * 边界要能分开说清责任方（404/409/422/500），把错误类藏在模块内部会让调用方只能按
  * 错误消息匹配。
  *
- * **不导出**：`AssetService`（接入流程）、`AssetVersionService`、`OwnershipService`——
+ * **不导出**：`AssetService`（接入流程）、`AssetVersionService`——
  * 它们今天没有模块外的调用方（C16：不为不存在的调用方建接口）。测试直接用深路径 import，
  * 那是测试的特权（架构规则的主体是 `apps/` 的源码，不是 `tests/`）。
+ *
+ * ## P3 / Task 1 新增的四处导出（以及它们各自的**真实**调用方）
+ *
+ * | 导出 | 谁是第一个模块外的调用方 |
+ * |---|---|
+ * | `OwnershipService` | `exchange`（Task 8 的原子释放：同一个 `tx` 里装下所有权互换） |
+ * | `AssetNotFoundError` / `SelfTransferRejectedError` | 同上：HTTP 边界要分开说清责任方（404 / 409） |
+ * | `POLICY_CONDITIONS` | 实际调用方是**本模块自己的** `asset.module.ts`（注册条件） |
+ *
+ * `OwnershipService` 此前**刻意**不导出，理由写在旧版注释里：「它今天没有模块外的调用方
+ * （C16：不为不存在的调用方建接口）」。**Task 8 是第一个真实调用方**，因此导出的时机
+ * 就是现在，而不是 P1 那会儿——那条理由没有被推翻，只是它的前提到期了。
+ * 两个错误类型同批导出：`transferOwnership` 会抛它们，而 HTTP 边界必须能分开翻译。
  */
 export { AssetModule } from './asset.module.js';
+
+/**
+ * 策略条件的名字（P3 / Task 1）。
+ *
+ * 跨模块导出它**不是**为了给别的模块用，而是因为**名字的所有权在声明方**：注册方
+ * （`asset.module.ts`）与声明方（`asset.controller.ts`）必须引用同一个字符串。
+ * 导出它顺带让 `exchange`（Task 6）能按同一形状引用 `asset` 的条件名，而不必深引内部文件。
+ */
+export { POLICY_CONDITIONS } from './asset.controller.js';
+
+export {
+  AssetNotFoundError,
+  OwnershipService,
+  SelfTransferRejectedError,
+  type OwnershipTransferResult,
+  type TransferOwnershipInput,
+} from './ownership.service.js';
 
 export {
   AssetAccessService,

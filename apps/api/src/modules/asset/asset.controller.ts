@@ -176,6 +176,40 @@ export function assetErrorToHttp(error: unknown): HttpException | null {
 }
 
 /**
+ * 策略条件的名字（**唯一**定义处；两侧引用它：本文件的声明 + `AssetModule` 的注册）。
+ *
+ * ## 为什么常量必须住在**这个文件的顶部**，而不是文件末尾（实测踩到的一次）
+ *
+ * `@Policy({…})` 的实参在**类定义期**求值，而类定义发生在 `const` 语句**之前**
+ * ——`const` 有 TDZ。把常量写在文件末尾（`ledger.controller.ts` 那句「常量跟着拥有
+ * 这个概念的那处代码走」被误读成「写在最后」）会让**三个 security 套件在收集阶段**红：
+ *
+ * ```
+ * ReferenceError: Cannot access 'POLICY_CONDITIONS' before initialization
+ *  ❯ apps/api/src/modules/asset/asset.controller.ts:411:59
+ * ```
+ *
+ * 这不是循环 import，是**同一个文件内的求值顺序**：`ledger.controller.ts` 之所以没踩到，
+ * 是因为它的常量在第 36 行、类在第 50 行之后。
+ *
+ * ## 为什么常量在**控制器**这一侧（与 `ledger.controller.ts` 同一处置）
+ *
+ * 若常量定义在 `asset.module.ts` 里、而模块又 import 控制器，就会**成环**
+ * （`ledger.controller.ts` 的常量头注释记着那一次实测：
+ * `TypeError: Cannot read properties of undefined (reading 'ledgerAdminGrant')`）。
+ * **声明方**与**注册方**之间只有一条无环的方向——模块 → 控制器。
+ * 写成两份字面量的代价是真实的：改名会让「声明了一个没人注册的条件」在运行期表现为
+ * 一条**看不出原因**的 403（`PolicyGuard` 对未注册条件是 fail-closed）。
+ *
+ * ## 今天只有一个成员，为什么还是写成对象
+ *
+ * 与 `ledger.controller.ts` 的 `POLICY_CONDITIONS` 逐字同形：它是**命名空间**，
+ * 不是「为将来预留一个空抽象」——一个模块一组条件、名字住在声明方，这条规则的一致写法
+ * 本身就是它的理由（C16 指的是不为**不存在的调用方**建接口）。
+ */
+export const POLICY_CONDITIONS = { assetMetadataRead: 'assetMetadataRead' } as const;
+
+/**
  * 制品模块的 HTTP 边界（P1 / Task 1 建立上传，**Task 8 补下载与元数据**）。
  *
  * ## 五条路由与它们的声明（`Asset` 资源 × 动作）
@@ -185,7 +219,7 @@ export function assetErrorToHttp(error: unknown): HttpException | null {
  * | `POST /assets/upload` | `Asset.create` | `upload` | 任何已登录用户 |
  * | `POST /assets/versions/:versionId/download-url` | `Asset.download` | `search` | 登录 + `checkAccess`（属主） |
  * | `GET /assets/download` | `@Public()` | `search` | 持有效票据者（签名即凭证） |
- * | `GET /assets/versions/:versionId/metadata` | `@Public()` | `search` | 所有人（§9 矩阵的一行） |
+ * | `GET /assets/versions/:versionId/metadata` | `Asset.read` + `assetMetadataRead` | `search` | **所有已登录用户**（P3 / Task 1 裁定 ①；原为 `@Public()`） |
  *
  * ## 限流归属：三个新端点为什么都写 `@RateLimited('search')`（**据实记载**）
  *
@@ -373,22 +407,42 @@ export class AssetController {
   }
 
   /**
-   * 元数据读取（设计文档 §9 矩阵：`Asset` 元数据 read = **所有人**，因此 `@Public()`）。
+   * 元数据读取（设计文档 §9 矩阵：`Asset` 元数据 read = **所有人**）。
    *
-   * ## 「所有人可读」是矩阵里的**一行**，不是默认
+   * ## ★ 为什么它今天**要求登录**（P3 / Task 1；控制器裁定 ①）
    *
-   * 默认仍然是拒绝（`PolicyGuard` 未声明即 403）；这一行是显式写出来的授权，
-   * 而它授权的范围在 `AssetAccessService.readMetadata` 里被卡死在元数据本身上：
-   * 存储键、`fileId`、`keyId`、`sha256` 一列都不在 `select` 里（取不到，不是过滤掉）。
-   * 换句话说：**这条路由公开的是「项目是什么」，不是「制品是什么」。**
+   * §9 的第 1 行写「所有人」，第 4 行写 `Preview Dossier read = 交换要约的对手方`——
+   * **同一份文档对同一种对象给出两个不同的「谁」**。控制器裁定收紧本路由，理由：
+   * 一个**匿名可枚举**创作者**文件树、语言分布、依赖清单**的端点，正是威胁 #9
+   * （受限预览资料）要防的侦察面；而 §9 第 1 行的「所有人」若读成「含匿名」，
+   * 与第 4 行的存在本身矛盾。P2 的 M1 处理币种列时用的是同一条标准：**把决定写进规格**，
+   * 而不是留一句与实现不符的话。**这是一处刻意的行为变更**，控制器已标给人类过目。
+   *
+   * 被替换掉的旧注释原文是「元数据读取（设计文档 §9 矩阵：`Asset` 元数据 read = **所有人**，
+   * 因此 `@Public()`）」+「## 「所有人可读」是矩阵里的**一行**，不是默认 … 这条路由公开的是
+   * 「项目是什么」，不是「制品是什么」」。**授权范围那一段依然成立**（见下），变的只有「谁」。
+   *
+   * ## 「登录即可」由**具名条件**表达，而**不是**靠省略 `condition`
+   *
+   * `PolicyGuard` 的判定顺序第 4 步对**任何**非 `@Public()` 的声明都先要求身份（方案 B），
+   * 因此省略 `condition` 也挡得住匿名——但那会把这条规则藏在「装饰器少写一个字段」里。
+   * 这里显式注册条件 `assetMetadataRead`（`AssetModule.onModuleInit`）：它今天只判
+   * 「有没有当事人」（守卫已经拒过匿名，那一句是纵深防御），作用是**留一个具名的判定点**，
+   * 让「元数据该给谁看」这条规则有一个可被找到、可被 grep、可被注册表看见的位置。
+   *
+   * ## 它授权的范围**没有**变
+   *
+   * 存储键、`fileId`、`keyId`、`sha256` 一列都不在 `AssetAccessService.readMetadata` 的
+   * `select` 里（取不到，不是过滤掉）。**公开的是「项目是什么」，不是「制品是什么」**——
+   * 这句话在收紧之后依然逐字成立。
    *
    * ## 限流归属
    *
-   * 它是公开读端点，因此同样归 `search` 层（表里唯一按 IP 的短窗口档，60 次/分钟）。
-   * 这条声明有一条端到端用例（打到第 61 次必须 429）——见集成套件；它同时是
-   * 「新路由真的被接进了 P0 的限流器」的行为见证。
+   * 仍是 `search` 层（表里唯一按 IP 的短窗口档，60 次/分钟）。**行为见证跟着改了形状**：
+   * `tests/integration/asset/signed-download.test.ts` 的「第 60 次仍然 200，第 61 次 429」
+   * 那一节现在**带会话**打这 61 次——不带的话它们会全部停在 403，限流层一次都没被行使。
    */
-  @Public()
+  @Policy({ resource: 'Asset', action: 'read', condition: POLICY_CONDITIONS.assetMetadataRead })
   @RateLimited('search')
   @Get('versions/:versionId/metadata')
   async readMetadata(@Param('versionId') versionId: string): Promise<AssetMetadataView> {

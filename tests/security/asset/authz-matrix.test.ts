@@ -241,12 +241,32 @@ describe('越权矩阵：asset 模块的每个端点 × 每个角色（判据 11
     },
     {
       handler: 'readMetadata',
-      label: 'GET /assets/versions/:versionId/metadata（@Public：§9 的「元数据 read = 所有人」）',
+      label: 'GET /assets/versions/:versionId/metadata（@Policy + assetMetadataRead：P3 裁定 ①「登录即可」）',
       call: (role) => withRole(request(app.getHttpServer()).get(`/assets/versions/${versionId}/metadata`), role),
       expect: {
-        // §9 矩阵里**唯一**授权给「所有人」的资产行。四格同形是刻意的：
-        // 它证明的是「这一行的放行与身份无关」，而不是「我们忘了加判定」。
-        anonymous: { status: 200, kind: 'ok' },
+        /**
+         * ★ **P3 / Task 1（控制器裁定 ①）改了这一格**：原为 `{ status: 200, kind: 'ok' }`。
+         *
+         * ## 被替换掉的旧契约原文（据实记载，别让旧断言无声消失）
+         *
+         * > §9 矩阵里**唯一**授权给「所有人」的资产行。四格同形是刻意的：
+         * > 它证明的是「这一行的放行与身份无关」，而不是「我们忘了加判定」。
+         * > `anonymous: { status: 200, kind: 'ok' }`
+         *
+         * 旧契约把 §9 第 1 行的「所有人」读成**含匿名**。新契约读作**所有已登录用户**：
+         * 一个匿名可枚举创作者**文件树、语言分布、依赖清单**的端点，正是威胁 #9
+         * 要防的侦察面；而 §9 第 4 行（`Preview Dossier read = 交换要约的对手方`）
+         * 的存在本身就与「匿名也能拿到同一份资料」矛盾。
+         * 判据是 `kind: 'login'`（守卫的「需要登录」）而不是 `'denied'`：
+         * 拒绝发生在**身份判定**这一步，资源级判定根本没开始。
+         */
+        anonymous: { status: 403, kind: 'login', message: '需要登录' },
+        /**
+         * **验收对照**（每条拒绝都要有）：其余三格必须仍然是 200。
+         * 一个「谁都不许读」的实现会让这三格红——它挡住的是「把门焊死也算通过」
+         * 那一类假绿。三格还共享下面 `kind === 'ok'` 那一支的断言：拿到的是**同一份**
+         * 元数据，而不是每个角色一份。
+         */
         stranger: { status: 200, kind: 'ok' },
         admin: { status: 200, kind: 'ok' },
         owner: { status: 200, kind: 'ok' },

@@ -117,11 +117,29 @@ describe('每个路由都必须有策略声明（§9 / 验收 13.2）', () => {
         isPublic: true,
         decl: null,
       });
-      expect(registry.find('AssetController', 'readMetadata')).toMatchObject({
+      expect(registry.find('AssetController', 'readMetadata'), '新路由没被注册表发现').toMatchObject({
         path: '/assets/versions/:versionId/metadata',
-        // §9 矩阵里「Asset 元数据 read = 所有人」那一行由 @Public() 独占表达
-        isPublic: true,
-        decl: null,
+        /**
+         * ★ **P3 / Task 1（控制器裁定 ①）改了这里的声明形状**。
+         *
+         * 被替换掉的旧契约原文：
+         * ```
+         * // §9 矩阵里「Asset 元数据 read = 所有人」那一行由 @Public() 独占表达
+         * isPublic: true,
+         * decl: null,
+         * ```
+         *
+         * 新契约：「登录即可」的**具名条件** `assetMetadataRead`（由 `AssetModule.onModuleInit`
+         * 注册）。它不是「无需身份」的第二种写法——`PolicyGuard` 的判定顺序第 4 步对
+         * **任何**非 `@Public()` 的声明都先要求身份（`policy.guard.ts` 的方案 B），
+         * 因此匿名的表现是 403「需要登录」而不是放行。
+         *
+         * 判别力：把 `@Policy(...)` 换回 `@Public()`（探针 P-3 的做法）⇒ `isPublic` 变成
+         * `true`、`decl` 变成 `null` ⇒ 这条立刻红，而**同一次改动**也让越权矩阵的匿名格
+         * 拿到 200 ⇒ 另一条也红。
+         */
+        isPublic: false,
+        decl: { resource: 'Asset', action: 'read', condition: 'assetMetadataRead' },
       });
       expect(registry.find('AssetController', 'upload')).toMatchObject({
         path: '/assets/upload',

@@ -602,8 +602,11 @@ describe('签名下载（D10）：授权、单次使用、超时、篡改、审�
     const { cookie } = await login(owner);
     const issued = (await issue(versionId, cookie)).body as { url: string };
 
-    // 真的转让一次（Task 7 的服务；本用例只关心那张已经签出去的票会怎样）
-    await ownership.transferOwnership({ assetId, toUserId: buyer, reason: '测试：转让后旧票失效' });
+    // 真的转让一次（Task 7 的服务；本用例只关心那张已经签出去的票会怎样）。
+    // Task 1 起转让收调用方的事务（`tx` 必填），因此调用点在明处写一个 `$transaction`。
+    await prisma.$transaction((tx) =>
+      ownership.transferOwnership(tx, { assetId, toUserId: buyer, reason: '测试：转让后旧票失效' }),
+    );
 
     const afterTransfer = await redeem(issued.url);
     expect(afterTransfer.status, `响应体=${afterTransfer.text}`).toBe(403);
@@ -616,13 +619,36 @@ describe('签名下载（D10）：授权、单次使用、超时、篡改、审�
     expect((await redeem(reissued.url)).status).toBe(200);
   });
 
-  it('元数据端点：所有人可读（§9 的一行），且**只回元数据**——没有存储键/摘要/内部标识', async () => {
+  it('元数据端点：**匿名 403 / 登录后 200**，且只回元数据——没有存储键/摘要/内部标识（P3 / Task 1 裁定 ①）', async () => {
     const owner = await createUser();
     const { versionId, storageKey } = await createVersion({ ownerId: owner });
     const version = await prisma.assetVersion.findUniqueOrThrow({ where: { id: versionId } });
 
-    // 匿名（不带任何 cookie）也能读：这正是 §9 矩阵里「Asset 元数据 read = 所有人」那一行
-    const res = await request(app.getHttpServer()).get(`/assets/versions/${versionId}/metadata`);
+    /**
+     * ★ **拒绝面**（P3 / Task 1，控制器裁定 ①）。
+     *
+     * 被替换掉的旧契约原文（`it` 标题是「元数据端点：所有人可读（§9 的一行）…」）：
+     * ```
+     * // 匿名（不带任何 cookie）也能读：这正是 §9 矩阵里「Asset 元数据 read = 所有人」那一行
+     * const res = await request(app.getHttpServer()).get(`/assets/versions/${versionId}/metadata`);
+     * expect(res.status, `响应体=${res.text}`).toBe(200);
+     * ```
+     * 「所有人」现在读作**所有已登录用户**：匿名可枚举文件树 / 语言分布 / 依赖清单
+     * 正是威胁 #9 要防的侦察面。判据取守卫那句「需要登录」，并断言**响应里没有任何
+     * 元数据**——一个「403 但顺手回了一份」的实现会让后两句红。
+     */
+    const anonymous = await request(app.getHttpServer()).get(`/assets/versions/${versionId}/metadata`);
+    expect(anonymous.status, `响应体=${anonymous.text}`).toBe(403);
+    expect((anonymous.body as { message?: string }).message).toBe('需要登录');
+    expect(anonymous.body).not.toHaveProperty('assetVersionId');
+    expect(anonymous.body).not.toHaveProperty('fileTree');
+
+    // ★ **验收对照**：登录之后照旧 200，且下面这一整组内容判据一个字都没放宽。
+    //   一个「谁都不许读」的实现会让这里红——拒绝与放行必须**同时**被钉住。
+    const { cookie } = await login(owner);
+    const res = await request(app.getHttpServer())
+      .get(`/assets/versions/${versionId}/metadata`)
+      .set('Cookie', cookie);
 
     expect(res.status, `响应体=${res.text}`).toBe(200);
     const body = res.body as Record<string, unknown>;
@@ -636,7 +662,11 @@ describe('签名下载（D10）：授权、单次使用、超时、篡改、审�
     expect(body).not.toHaveProperty('storageKey');
     expect(body).not.toHaveProperty('sha256');
 
-    const missing = await request(app.getHttpServer()).get(`/assets/versions/${randomUUID()}/metadata`);
+    // 同一份「已登录」请求打一个不存在的版本 ⇒ 404（**「没有」与「空」不是同一件事**）：
+    // 这一句同时证明上面那个 200 不是「这条路由现在对谁都回 200」。
+    const missing = await request(app.getHttpServer())
+      .get(`/assets/versions/${randomUUID()}/metadata`)
+      .set('Cookie', cookie);
     expect(missing.status).toBe(404);
   });
 });
@@ -1010,6 +1040,7 @@ describe('签名下载：资产模块的新路由归属 P0 的限流层（打到
   let store: SwappingStore;
   let assets: AssetService;
   let versions: AssetVersionService;
+  let sessions: SessionService;
 
   beforeAll(async () => {
     redis = await startTestRedis();
@@ -1026,8 +1057,16 @@ describe('签名下载：资产模块的新路由归属 P0 的限流层（打到
     });
     assets = app.get(AssetService);
     versions = app.get(AssetVersionService);
-    // 这一节打的是**公开**的元数据端点（不需要会话），CSRF 令牌也不必带：
-    // GET 是安全方法，`CsrfGuard` 对它不做校验（C13 只覆盖写操作）。
+    sessions = app.get(SessionService);
+    /**
+     * 这一节打的元数据端点 **P3 / Task 1 起要求登录**（控制器裁定 ①）。
+     *
+     * 旧注释的原文是「这一节打的是**公开**的元数据端点（不需要会话），CSRF 令牌也不必带」。
+     * 那句话现在是**旧行为**的记录：不带会话的 61 次会**全部**停在 403 上，
+     * `statuses.slice(0, 60).every(200)` 立刻红——限流层因此根本没被行使。
+     * GET 仍是安全方法，`CsrfGuard` 对它不做校验（C13 只覆盖写操作），
+     * 所以只需要会话 cookie，不需要 CSRF 令牌——请求形状的这一半没有变。
+     */
   }, 240_000);
 
   afterAll(async () => {
@@ -1047,9 +1086,16 @@ describe('签名下载：资产模块的新路由归属 P0 的限流层（打到
     const metadata = await parseMetadata(reader, ingested.kind);
     const persisted = await versions.persistIngested({ assetId: asset.id, ingested, metadata });
 
+    // ★ P3 / Task 1（控制器裁定 ①）：这条路由现在要求登录，因此这 61 次必须**带会话**。
+    //   不带会话时它们会全部停在 403（守卫的「需要登录」），限流层一次都没被行使，
+    //   而下面前 60 次那一句会以「前 60 次里出现了非 200：403,…」红。
+    //   带会话**不改变**这条用例问的事：它证明的是「这条路由真的挂了 P0 的 `search` 层」。
+    const { sessionId } = await sessions.create(owner, { ip: '127.0.0.1', userAgent: 'vitest' });
+
     const call = (): request.Test =>
       request(app.getHttpServer())
         .get(`/assets/versions/${persisted.assetVersionId}/metadata`)
+        .set('Cookie', `${SESSION_COOKIE}=${sessionId}`)
         .set('X-Forwarded-For', '203.0.113.9');
 
     const statuses: number[] = [];
