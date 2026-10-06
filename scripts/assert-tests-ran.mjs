@@ -35,6 +35,13 @@
  * 起进程走 `process.execPath` + vitest 自己的 JS 入口，不经过 `pnpm`/`.cmd` 垫片
  * （K19：Windows 上 `execFileSync('pnpm', …)` 会 ENOENT，`shell: true` 也不可靠）。
  *
+ * ## 两类下限：按 **project**，与按 **作用域**（P3 / Task 4）
+ *
+ * `GATES` 的键是 project。它挡不住**某一类**用例的静默消失：`unit` / `integration` 这两个
+ * project 的规模与构成一直在变，给它们设总数下限只会制造噪音，于是这两个 project 里的用例
+ * **完全不受下限保护**。`SCOPED_GATES` 补的就是这一半：project + 路径（前缀）+ 下限，
+ * 跑的是路径过滤而不是整个 project。两类的判据逐字相同（实际执行条数 ≥ 下限、且全绿）。
+ *
  * ## 依赖自检（K6）
  *
  * 只用到 node 内建模块，以及根 `devDependencies` 里已声明的 `vitest`——没有新增依赖。
@@ -119,6 +126,54 @@ const GATES = {
   property: 15,
 };
 
+/**
+ * **按作用域**的下限：project + 路径（或路径前缀）+ 实际执行条数下限。
+ *
+ * ## 它补的是哪一类洞（P3 / Task 4；控制器账本里 Task 3 段落末尾的裁定）
+ *
+ * 上面的 `GATES` 按 project 设下限，而 `unit` / `integration` **太宽**：它们的规模与构成
+ * 一直在变，给它们钉总数只会制造噪音。代价是这两类用例此前**不受任何下限保护**：
+ *   * `integration` 里的**真库强制点**（append-only / 唯一索引 / 状态闭集 / 权限事实）；
+ *   * `unit` 里的**纯核心判据**（交换的状态机、锁序、幂等键、计时器、资格、义务）。
+ * 一个文件被改名、被删空、或被整段 `skip` 掉，`pnpm test` 照样绿——而它检查的东西
+ * 一件都没了。P3 到 Task 3 为止这样的用例有 **62 条**（Task 2 的 15 + Task 3 的 47），
+ * 这是当时最大的开放项。
+ *
+ * ## 做法与判据
+ *
+ * 每一项跑的是 `vitest run --project <project> <paths…>`。刻意用**路径过滤**而不是
+ * `-t` 标题过滤：标题过滤会过量匹配（P3 / Task 3 实测 `-t 交换` 多匹配 5 条，
+ * 因为 github-oauth 里有一个叫 `exchange()` 的 describe），而过量匹配与零匹配是同一族
+ * 缺陷——「过滤器没有选中那一行声称选中的东西」。判据与 `GATES` 逐字相同：
+ * **实际执行**条数（`numTotalTests - numPendingTests - numTodoTests`）不得低于下限，
+ * 且全部通过。收集到但被 `skip` / `todo` 的不计入。
+ *
+ * 于是「把其中一条改成 `it.skip`」与「把文件改名 / 搬走 / 删空」都会以非零码 +
+ * `::error::<组名>` 变红，而**不必**给整个 `unit` / `integration` 追数字。
+ *
+ * ## 数字从哪来（本文件的既定规矩：与当前**实测**执行条数对齐）
+ *
+ * 每一条的 `floor` 都是跑出来量到的执行条数（不是预测），来源写在 `why` 里；
+ * 任何删除都会红一次并要求在这里改数——安全面的缩小必须是一次有意识的改动。
+ * 新增同类用例时**上调**这里：`node scripts/assert-tests-ran.mjs <组名>` 会把实测条数打出来。
+ */
+const SCOPED_GATES = {
+  // P3 / Task 2 的真库强制点。实测（`--reporter=json`）：15 条，0 条 skip。
+  'exchange-enforcement': {
+    project: 'integration',
+    paths: ['tests/integration/db/exchange-enforcement.test.ts'],
+    floor: 15,
+    why: 'P3 Task 2 的 exchange 真库强制点（append-only / 唯一索引 / 状态闭集 / 检查约束）',
+  },
+  // P3 / Task 3 的交换纯核心。实测：47 条（6 个文件），0 条 skip。
+  'exchange-core': {
+    project: 'unit',
+    paths: ['tests/unit/exchange'],
+    floor: 47,
+    why: 'P3 Task 3 的交换纯核心（状态机 / 全局锁序 / 确定性幂等键 / 三个计时器 / 资格 / 义务判据）',
+  },
+};
+
 /** vitest 自己的 JS 入口（读它 `package.json` 里声明的 `bin.vitest`，不猜路径）。 */
 function resolveVitestBin() {
   const require = createRequire(import.meta.url);
@@ -130,15 +185,20 @@ function resolveVitestBin() {
 }
 
 /**
- * 跑一个 project 并返回 json 报告。**输出直接透传**（`stdio: 'inherit'`）：
+ * 跑一个门并返回 json 报告。**输出直接透传**（`stdio: 'inherit'`）：
  * CI 日志里必须能看见 vitest 原本的逐文件结果，否则失败时要靠猜。
+ *
+ * `gate.paths` 为空 = 整跑那个 project（`GATES` 那一类）；非空 = 只跑给定路径
+ * （`SCOPED_GATES` 那一类）。两者走**同一条**命令形状与同一份判据。
  */
-function runProject(project, reportFile) {
+function runGate(gate, reportFile) {
   const args = [
     resolveVitestBin(),
     'run',
     '--project',
-    project,
+    gate.project,
+    // 路径过滤是位置参数；为空时它不出现，于是整跑该 project。
+    ...gate.paths,
     // 两个 reporter 并存：`default` 给人看（透传到日志），`json` 给下面的断言看。
     // `--outputFile.json=` 只把 json 写文件，人读的那份仍留在 stdout。
     '--reporter=default',
@@ -161,14 +221,32 @@ function readReport(reportFile) {
   }
 }
 
-const requested = process.argv.slice(2);
-const projects = requested.length > 0 ? requested : Object.keys(GATES);
+/**
+ * 命令行给的是一串**门的名字**，两类都收：`GATES` 的 project 名与 `SCOPED_GATES` 的组名。
+ * 不带参数 = 跑全部（这也是 `pnpm test:gate` 的语义）。
+ */
+const KNOWN_GATES = [...Object.keys(GATES), ...Object.keys(SCOPED_GATES)];
 
-const unknown = projects.filter((p) => !(p in GATES));
+// 自检：两处登记表**不得重名**。重名会让两个门写同一个报告文件名，第二个门读到的是第一个门
+// 的报告——那是一条静默的假绿（本文件存在的理由就是防这一族）。宁可在这里响亮地停下。
+const COLLIDING = Object.keys(SCOPED_GATES).filter((name) => name in GATES);
+if (COLLIDING.length > 0) {
+  console.error(
+    `::error::门的名字在 GATES 与 SCOPED_GATES 里重复：${COLLIDING.join(', ')}。` +
+      '两者会用同一个报告文件名，后者读到的是前者的结果——请改名。',
+  );
+  process.exit(1);
+}
+
+const requested = process.argv.slice(2);
+const names = requested.length > 0 ? requested : KNOWN_GATES;
+
+const unknown = names.filter((name) => !KNOWN_GATES.includes(name));
 if (unknown.length > 0) {
   console.error(
-    `::error::未登记的门：${unknown.join(', ')}。可用的有 ${Object.keys(GATES).join(', ')}——` +
-      '要新增请同时在 scripts/assert-tests-ran.mjs 的 GATES 里写下限。',
+    `::error::未登记的门：${unknown.join(', ')}。可用的有 ${KNOWN_GATES.join(', ')}——` +
+      '要新增请同时在 scripts/assert-tests-ran.mjs 的 GATES（按 project）或 ' +
+      'SCOPED_GATES（按路径作用域）里写下限。',
   );
   process.exit(1);
 }
@@ -177,15 +255,23 @@ const workDir = mkdtempSync(path.join(tmpdir(), 'vca-gate-'));
 let failed = false;
 
 try {
-  for (const project of projects) {
-    const floor = GATES[project];
-    const reportFile = path.join(workDir, `${project}.json`);
-    const run = runProject(project, reportFile);
+  for (const name of names) {
+    // 两类门在这里归一成同一个形状：`project`（跑哪个 project）、`paths`（作用域，空 = 整个
+    // project）、`floor`（实际执行条数下限）、`why`（这一组是什么，红了要能看懂）、
+    // `label`（**消息里必须出现的组名**——零匹配陷阱的教训：红了却不知道是哪一组等于没红）。
+    const gate =
+      name in GATES
+        ? { label: name, project: name, paths: [], floor: GATES[name], why: `project ${name}` }
+        : { label: name, ...SCOPED_GATES[name] };
+    const scope = gate.paths.length > 0 ? `，作用域 ${gate.paths.join(' ')}` : '';
+    const reportFile = path.join(workDir, `${name}.json`);
+    const run = runGate(gate, reportFile);
     const report = readReport(reportFile);
 
     if (!report) {
       console.error(
-        `::error::${project}：没有拿到 vitest 的 json 报告（${run.reason ?? '未知原因'}）。` +
+        `::error::${gate.label}：没有拿到 vitest 的 json 报告（${run.reason ?? '未知原因'}）。` +
+          `这一组是「${gate.why}」${scope}。` +
           '最常见的原因是**一条测试都没匹配到**（include glob 或文件名被改过）——' +
           '门在这一刻是空的，命令不能算通过。',
       );
@@ -202,32 +288,35 @@ try {
     const executed = total - pending;
     if (executed === 0) {
       console.error(
-        `::error::${project}：一条用例都没**执行**（收集到 ${total} 条，其中 ${pending} 条被 skip/todo）。` +
+        `::error::${gate.label}：一条用例都没**执行**（收集到 ${total} 条，其中 ${pending} 条被 skip/todo）。` +
+          `这一组是「${gate.why}」${scope}。` +
           '门在这一刻是**空的**，命令不能算通过——最常见的原因是 include glob 或测试文件名被改过、' +
-          'project 选择写错了，或者整个文件被 skip 掉了。',
+          '路径作用域写错了，或者整个文件被 skip 掉了。',
       );
       failed = true;
       continue;
     }
     if (run.failed || report.success !== true) {
       console.error(
-        `::error::${project}：用例未全部通过（执行 ${executed} 条，通过 ${passed} 条）${run.reason ?? ''}`,
+        `::error::${gate.label}：用例未全部通过（执行 ${executed} 条，通过 ${passed} 条）${run.reason ?? ''}`,
       );
       failed = true;
       continue;
     }
-    if (executed < floor) {
+    if (executed < gate.floor) {
       console.error(
-        `::error::${project}：只**执行**了 ${executed} 条用例，低于登记的 ${floor} 条` +
+        `::error::${gate.label}：只**执行**了 ${executed} 条用例，低于登记的 ${gate.floor} 条` +
           `（收集到 ${total} 条，其中 ${pending} 条被 skip/todo，不计入）。` +
-          '门被削弱了（文件被改名/删除？有用例被 skip 掉？project 选择写错？）。若是有意为之，' +
-          '请下调 scripts/assert-tests-ran.mjs 的 GATES 并在提交信息里说明理由。',
+          `这一组是「${gate.why}」${scope}。` +
+          '门被削弱了（文件被改名/删除？有用例被 skip 掉？路径作用域写错？）。若是有意为之，' +
+          '请下调 scripts/assert-tests-ran.mjs 的 GATES / SCOPED_GATES 并在提交信息里说明理由。',
       );
       failed = true;
       continue;
     }
     console.log(
-      `✔ ${project}：实际执行 ${executed} 条用例（下限 ${floor}），全部通过。` +
+      `✔ ${gate.label}：实际执行 ${executed} 条用例（下限 ${gate.floor}），全部通过。` +
+        (scope ? `作用域 ${gate.paths.join(' ')}。` : '') +
         (pending > 0 ? `另有 ${pending} 条被 skip/todo，**未**计入执行数。` : ''),
     );
   }
