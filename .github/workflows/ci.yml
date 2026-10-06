@@ -79,17 +79,23 @@ jobs:
           psql "$MIGRATE_DATABASE_URL" -v ON_ERROR_STOP=1 -f infra/db/apply-grants.sql
 
       # Ruling 1 的闭环：上一步「没报错」不等于「授权真的生效」。这里直接问 PostgreSQL
-      # 四件事——运行期角色**能用**什么、**不能用**什么，以及能不能碰到迁移台账。
-      # 期望值 t|t|f|f|f 的含义：auth 表可读写 / audit 表可 INSERT（append-only 的另一半）/
-      # audit 表**不可** UPDATE / audit 表**不可** DELETE / public._prisma_migrations 不可读
-      # （Task 3 修复）。UPDATE 与 DELETE 两项是 `apply-grants.sql` 里那条
-      # `REVOKE UPDATE, DELETE` 的两个方向，缺一不可（不变式 #5）。
+      # **十五件事**——运行期角色**能用**什么、**不能用**什么，以及能不能碰到迁移台账。
       #
-      # 修复轮 2 补上 DELETE：此前注释与报告都说「append-only 的 REVOKE 被这一步覆盖」，
-      # 而语句里只查了 UPDATE——那条 REVOKE 有两个动词，检查只有一个。DELETE 另有一层
-      # 兜着（集成套件的 append-only 用例在真容器上断言写入被拒），所以那是个**精度**
-      # 问题而不是漏洞；补第五个判据只花一行，换来的是注释与事实一致。
-      - name: 运行期角色的权限事实（不变式 #5 / Ruling 1）
+      # 扩到 ledger（P2 / Task 4）与 asset.ownership_history（补 P1 的漏）的理由：
+      # 预检实测这条断言此前**只覆盖 auth/audit 五项**，连 P1 新增的 append-only 表都不查
+      # ——也就是说「ownership_history 不可改写」与「ledger 不可改写」这两条不变式在 CI 里
+      # **没有见证**，只有集成用例（那是本机的，不是流水线的）。
+      # 期望值 t|t|f|f|f|f|f|t|t|f|t|f|f|f|f 的逐项含义见下面的 echo。
+      #
+      # 第 10 项（`ledger.accounts` 的 `DELETE` = **f**）是控制器 2026-10-06 的裁定：
+      # P2 没有任何删账户的路径 ⇒ 这个能力没有合法使用者，而删掉的行恢复不回来
+      # （对账护的是完整性、不是可用性）。理由逐条写在 `infra/db/apply-grants.sql` 那段注释里。
+      #
+      # 第二条腿（`relacl`）不是重复：`has_table_privilege` 回答的是「PostgreSQL 现在怎么
+      # 判」，而 `aclexplode(relacl)` 读的是**授权记录本身**。两者一起才排得掉
+      # 「某台库上被人手工 GRANT 过」与「某条 REVOKE 被删掉」这两类分歧。它同时把
+      # 「schema 级 ALL TABLES 广播过、随后被逐表收回」这段历史钉进证据里。
+      - name: 运行期角色的权限事实（不变式 #5 / Ruling 1 / P2 Task 4）
         env:
           MIGRATE_DATABASE_URL: postgresql://vca_owner:owner_pw@127.0.0.1:5432/vca
         run: |
@@ -99,13 +105,67 @@ jobs:
                    has_table_privilege('app_user','audit.audit_logs','INSERT'),
                    has_table_privilege('app_user','audit.audit_logs','UPDATE'),
                    has_table_privilege('app_user','audit.audit_logs','DELETE'),
-                   has_table_privilege('app_user','public._prisma_migrations','SELECT')")
-          echo "app_user: auth.users SELECT | audit_logs INSERT | audit_logs UPDATE | audit_logs DELETE | migrations SELECT = $actual"
-          if [ "$actual" != "t|t|f|f|f" ]; then
-            echo "::error::运行期角色权限不符合预期（期望 t|t|f|f|f）：$actual"
-            echo "::error::多半是引导顺序错了（授权跑在迁移之前 → 对空 schema 静默授予零个对象），或 append-only 的 REVOKE UPDATE, DELETE 被删。"
+                   has_table_privilege('app_user','public._prisma_migrations','SELECT'),
+                   has_table_privilege('app_user','asset.ownership_history','UPDATE'),
+                   has_table_privilege('app_user','asset.ownership_history','DELETE'),
+                   has_table_privilege('app_user','ledger.accounts','UPDATE'),
+                   has_table_privilege('app_user','ledger.accounts','INSERT'),
+                   has_table_privilege('app_user','ledger.accounts','DELETE'),
+                   has_table_privilege('app_user','ledger.entries','INSERT'),
+                   has_table_privilege('app_user','ledger.entries','UPDATE'),
+                   has_table_privilege('app_user','ledger.entries','DELETE'),
+                   has_table_privilege('app_user','ledger.transactions','UPDATE'),
+                   has_table_privilege('app_user','ledger.transactions','DELETE')")
+          echo "auth.users SELECT | audit_logs INSERT/UPDATE/DELETE | migrations SELECT | ownership_history UPDATE/DELETE | accounts UPDATE/INSERT/DELETE | entries INSERT/UPDATE/DELETE | transactions UPDATE/DELETE = $actual"
+          if [ "$actual" != "t|t|f|f|f|f|f|t|t|f|t|f|f|f|f" ]; then
+            echo "::error::运行期角色权限不符合预期（期望 t|t|f|f|f|f|f|t|t|f|t|f|f|f|f）：$actual"
+            echo "::error::多半是引导顺序错了（授权跑在迁移之前 → 对空 schema 静默授予零个对象），或 append-only 的 REVOKE UPDATE, DELETE 被删，或 ledger.accounts 那条 REVOKE DELETE 被删。"
             exit 1
           fi
+
+          # 第二条腿：直接读授权记录（`relacl`），逐表列出 app_user 的**能力集合**。
+          # entries / transactions 必须恰好是 `INSERT,SELECT`——多一个字母就意味着
+          # append-only 不成立。accounts 是可写的（物化余额），但**只有三个动词**：
+          # `DELETE` 由控制器裁定撤掉（P2 没有删账户的路径）。
+          acl=$(psql "$MIGRATE_DATABASE_URL" -tA -v ON_ERROR_STOP=1 -c "
+            SELECT string_agg(c.relname || '=' || p.privs, '|' ORDER BY c.relname)
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              CROSS JOIN LATERAL (
+                SELECT COALESCE(string_agg(a.privilege_type, ',' ORDER BY a.privilege_type), '(none)') AS privs
+                  FROM aclexplode(c.relacl) a WHERE a.grantee = 'app_user'::regrole
+              ) p
+             WHERE n.nspname = 'ledger' AND c.relkind = 'r'")
+          echo "ledger relacl（app_user 的直接授权）: $acl"
+          if [ "$acl" != "accounts=INSERT,SELECT,UPDATE|entries=INSERT,SELECT|transactions=INSERT,SELECT" ]; then
+            echo "::error::ledger 的 ACL 不符合预期（期望 accounts 三项、entries/transactions 只有 INSERT,SELECT）：$acl"
+            echo "::error::最可能的原因：apply-grants.sql 里 `REVOKE UPDATE, DELETE ON ledger.entries`（或 transactions 那一对）、或 `REVOKE DELETE ON ledger.accounts` 被删了。"
+            exit 1
+          fi
+
+      # P2 / Task 1：手写 DDL（延迟约束触发器 / 条件化 CHECK）不在 Prisma 的模型里，
+      # 因此「迁移被谁改过」只能靠 migrate diff 的**退出码**看。这一步必须在数据库引导
+      # （migrate deploy + apply-grants）之后——它比的是**库**与**模型**，不是文件。
+      #
+      # ⚠️ 这条门证明的**只有**「Prisma 建模的东西（表/列/索引/外键）与库一致」。
+      # 它**看不见**函数、约束触发器与 CHECK —— Task 1 实测：库里挂着手写的
+      # plpgsql 函数 + DEFERRABLE 约束触发器 + CHECK 时，它照样报 `No difference detected.`
+      # 因此**不要**把它当成手写 DDL 的见证；手写对象的存在性由 Task 4 的真库断言
+      # （`pg_get_constraintdef` / `pg_trigger` 查询 + 行为用例）负责。
+      # 完整实测（含另一条：`ledger` 不在 `datasource.schemas` 里时这条门对它结构性失明）
+      # 见 docs/superpowers/notes/2026-10-06-p2-migration-drift.md。
+      #
+      # 退出码：prisma 的语义是「空=0 / 出错=1 / 非空=2」，但**经 pnpm 调用时 2 被包成 1**
+      # （Task 1 实测：stderr 写着 `Command failed with exit code 2`，而 pnpm 自己退 1）。
+      # 对本步的通过/不通过没有影响，但注释不要写成「非空=2」。
+      #
+      # Task 4 前置条件：`ledger` 必须已经进了 `datasource db` 的 `schemas` 数组
+      # （加三个 model 时本来就要加，否则 Prisma 根本不管理 `ledger`）。两者必须在同一个
+      # 提交里，否则这条门在 ledger 上是绿的**且看不见任何东西**。
+      - name: 迁移零漂移（Prisma 建模面与库一致）
+        env:
+          MIGRATE_DATABASE_URL: postgresql://vca_owner:owner_pw@127.0.0.1:5432/vca
+        run: pnpm --filter @vca/api exec prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
 
       # ── 测试 ──
       #
@@ -121,6 +181,17 @@ jobs:
       # 那条例用**不在** `-t parseEnv` 的匹配范围内，所以这里整跑 unit project。
       - name: 单元测试（含 C10 引导期 fail-fast 接线）
         run: pnpm vitest run --project unit
+
+      # P2 / Task 1（预检判决 1 的修复）：设计 §8.3/§13.3 把「≥10 万次随机操作的属性测试」
+      # 写成验收判据，而此前 CI 里**没有**这一步、`property` project 也**没有任何用例**——
+      # 一条今天没有执行者的验收判据等于不存在。它现在走与 security/architecture 同一条门
+      # （json reporter 读**实际执行条数**并要求不低于登记的下限），因此
+      # 「文件被改名 / 用例被 skip / project 名写错」都会红，而不是静默跳过。
+      #
+      # 为什么不能只写 `pnpm test:property`：那个脚本带 `--passWithNoTests`（为本地开发留的），
+      # 实测**空 project 退出 0**——门在这一刻是空的却报成功。这道区别 Task 1 有双向取证。
+      - name: 属性测试（金额契约 + 五条不变式的预算；≥10 万次随机操作，§8.3/§13.3）
+        run: node scripts/assert-tests-ran.mjs property
 
       # Ruling 3：安全与架构两个 project 必须**自证不是空的**。
       # 直接 `vitest run --project X` 时，一个测试文件都没匹配到会让 vitest 自己失败；

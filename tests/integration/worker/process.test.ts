@@ -1,7 +1,12 @@
-import { spawn, type ChildProcess } from 'node:child_process';
-import path from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { testEnv } from '../../helpers/env.js';
+import {
+  buildWorker,
+  startWorker as spawnWorker,
+  waitForExit,
+  waitForOutput,
+  WORKER_STARTED as STARTED,
+  type WorkerRun,
+} from '../../helpers/worker-process.js';
 
 /**
  * worker **进程**的两件事：能不能起来、能不能自己停下来（C15）。
@@ -27,13 +32,14 @@ import { testEnv } from '../../helpers/env.js';
  * - 不依赖平台的「能起来并开始轮询」这一条在**所有**平台跑；
  * - 依赖信号的「SIGTERM 后以码 0 自己退出」这一条在 POSIX（CI）上跑，Windows 上显式跳过。
  * 关停**逻辑**本身由不依赖平台的单测覆盖。
+ *
+ * ## 起进程/等待的装置住在哪里（P2 / Task 3）
+ *
+ * `startWorker` / `waitForOutput` / `waitForExit` / `buildWorker` 已抽到
+ * `tests/helpers/worker-process.ts`：Task 3 的 `runtime-role.test.ts` 需要同一套装置，
+ * 而复制两份必然会漂移（抽取是纯搬运，本文件的用例行为逐字未改）。
  */
-const ENTRY = path.resolve(import.meta.dirname, '../../../apps/worker/dist/main.js');
-const WORKER_DIR = path.dirname(ENTRY);
-const REPO_ROOT = path.resolve(import.meta.dirname, '../../..');
-
-/** 启动标记（`runWorker` 的第一行日志）。 */
-const STARTED = /outbox 消费者已启动/;
+/** 启动标记（`WORKER_STARTED`，`runWorker` 的第一行日志）由 helpers 导出，此处以 `STARTED` 引用。 */
 /** 关停标记（`main.ts` 的信号处理器）。用它做**归属断言**：证明是信号让它退出的。 */
 const SHUTDOWN = /收到 SIGTERM/;
 /** 消费失败的标记：库指向死端口 ⇒ 失败是预期的，它同时证明循环真的在跑。 */
@@ -43,85 +49,28 @@ const STARTUP_TIMEOUT_MS = 30_000;
 const SHUTDOWN_TIMEOUT_MS = 20_000;
 
 /**
- * 子进程环境：测试夹具 + 一个**连不上**的库。
+ * 本用例的库：一个**连不上**的死端口。
  *
  * 指到死端口是刻意的：这样消费必然失败（可预期的可观测行为），而且**不会**因为开发机上
  * 恰好有一个本地 Postgres 而变成另一条路径（用例必须自足）。
- */
-function workerEnv(): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    ...testEnv,
-    DATABASE_URL: 'postgresql://app_user:test_pw@127.0.0.1:59999/vca_test',
-  };
-}
-
-interface ChildRun {
-  child: ChildProcess;
-  output: () => string;
-}
-
-function startWorker(): ChildRun {
-  const child = spawn(process.execPath, [ENTRY], {
-    cwd: WORKER_DIR,
-    env: workerEnv(),
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let out = '';
-  child.stdout?.on('data', (chunk: Buffer) => {
-    out += String(chunk);
-  });
-  child.stderr?.on('data', (chunk: Buffer) => {
-    out += String(chunk);
-  });
-  return { child, output: () => out };
-}
-
-/** 轮询等待某段输出出现（子进程的日志是异步流，断言不能只看某一瞬）。 */
-async function waitForOutput(run: ChildRun, pattern: RegExp, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    if (pattern.test(run.output())) return true;
-    if (Date.now() > deadline) return false;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-}
-
-/**
- * 等子进程自己退出。
  *
- * 超时**本身就是失败证据**（旧实现的形态），因此先 SIGKILL 收掉它，再让断言说话——
- * 与 `tests/unit/bootstrap.test.ts` 的子进程用例同一形状。
+ * 它同时是「连不上库 ⇒ 角色检查 `unverifiable` ⇒ **不**拒绝启动」这条边界的常驻见证
+ * （`db/runtime-role.ts` 的边界一节）：P2 / Task 3 把该检查装进 worker 之后，这条用例
+ * 若不红，就证明引导期没有把「连接故障」误当成「角色错误」——那会把「库暂时不可用」
+ * 变成「worker 永久起不来」。
  */
-function waitForExit(
-  child: ChildProcess,
-  timeoutMs: number,
-): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      resolve({ code: null, signal: 'SIGKILL' });
-    }, timeoutMs);
-    child.once('exit', (code, signal) => {
-      clearTimeout(timer);
-      resolve({ code, signal });
-    });
-  });
+const UNREACHABLE_DATABASE_URL = 'postgresql://app_user:test_pw@127.0.0.1:59999/vca_test';
+
+/** 起一个指向 {@link UNREACHABLE_DATABASE_URL} 的 worker 子进程。 */
+function startWorker(): WorkerRun {
+  return spawnWorker(UNREACHABLE_DATABASE_URL);
 }
 
 describe('worker 进程（C15）', () => {
   beforeAll(async () => {
     // worker 的 build 会先建 @vca/api：后者是它运行期解析 `@vca/api/*` 的前提
     // （`apps/api/package.json` 的 `node` 条件指向 `dist/*`，见报告 §打包）。
-    await new Promise<void>((resolve, reject) => {
-      const build = spawn('pnpm', ['--filter', '@vca/worker', 'build'], {
-        cwd: REPO_ROOT,
-        stdio: 'ignore',
-        shell: process.platform === 'win32',
-      });
-      build.once('exit', (code) => (code === 0 ? resolve() : reject(new Error(`worker 构建失败，退出码 ${String(code)}`))));
-      build.once('error', reject);
-    });
+    await buildWorker();
   }, 300_000);
 
   it('能引导起来并开始轮询（构建产物、模块图与子路径解析都对）', async () => {
@@ -137,6 +86,15 @@ describe('worker 进程（C15）', () => {
         await waitForOutput(run, CONSUME_FAILED, 10_000),
         `worker 没有在消费失败后记录可观测的一行。输出末段：${run.output().slice(-800)}`,
       ).toBe(true);
+      // **反空转**（P2 / Task 3）：只断言「它起来了」是不够的——如果运行期角色检查在
+      // 「连不上库」这条路径上**根本没跑**（例如被某段早退绕过），这一条也会绿。
+      // 断言那行 `unverifiable` 的 warn 存在，才证明检查**执行了并降级**，
+      // 而不是没执行。两种形态的差别正是「边界」与「缺口」的差别。
+      expect(
+        run.output(),
+        '运行期角色检查在连接故障时既没有检查、也没有记一行降级说明——' +
+          '「连不上不拒绝启动」这条边界没有被真正行使',
+      ).toContain('未能完成');
     } finally {
       run.child.kill('SIGKILL');
       await waitForExit(run.child, 5_000);

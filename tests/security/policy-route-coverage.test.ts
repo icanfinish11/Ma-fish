@@ -127,6 +127,28 @@ describe('每个路由都必须有策略声明（§9 / 验收 13.2）', () => {
         path: '/assets/upload',
         decl: { resource: 'Asset', action: 'create' },
       });
+
+      /**
+       * **Task 10 新增的那一条路由**（Step 6：让这道门包含它）。
+       *
+       * 它是 P2 里唯一一条外部可达的**造钱路径**（`POST /ledger/credits` 能把平台账户记成
+       * 负数、把用户余额记成正数），因此「门看得见它」这件事本身值得一条断言，
+       * 而不是靠「第一条用例的 `undeclared` 是空数组」间接成立：
+       * 若 `LedgerModule` 忘了进 `AppModule.imports`，那条路由在运行期是 **404**，
+       * 而第一条用例照样全绿（`undeclared` 依然是空数组）——那正是 `HealthController`
+       * 那一条存在的理由（同一个盲区在 P1 / Task 8 也出现过一次）。
+       *
+       * §9 矩阵里没有 `Ledger.grant` 这一行，因此这一格是「最保守并且在今天可判定」的一档：
+       * 只有管理员（条件 `ledgerAdminGrant` 由 `LedgerModule.onModuleInit` 注册）。
+       * 限流归属 `search`（表里唯一「按 IP、短窗口」的档）——理由与代价写在
+       * `ledger.controller.ts` 的类注释里。
+       */
+      expect(registry.find('LedgerController', 'grant'), '新路由没被注册表发现').toMatchObject({
+        path: '/ledger/credits',
+        isPublic: false,
+        decl: { resource: 'Ledger', action: 'grant', condition: 'ledgerAdminGrant' },
+        rateLimit: 'search',
+      });
     });
   });
 

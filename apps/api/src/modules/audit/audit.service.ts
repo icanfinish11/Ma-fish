@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../db/prisma.service.js';
 import { currentContext } from '../../common/context/request-context.js';
+import type { Prisma } from '../../generated/prisma/client.js';
 
 /** 一条审计记录的入参。`traceId` **不**在此：它来自请求上下文，由本服务统一盖戳。 */
 export interface AuditRecordInput {
@@ -61,25 +62,53 @@ export interface AuditRecordInput {
  * 写审计失败会让整个操作失败。理由是审计的用途是事后追责与合规：如果「写不进去也能继续」，
  * 那么一个被静默破坏的审计表在需要它之前不会有人发现。这与「日志」（写不进去就算了）
  * 是两类东西，别看错。代价如实记录：审计库不可用时**登录会 500**，审计表因此是登录路径的
- * 可用性依赖。**持久修法在 P2**：让审计行加入业务事务（在有事务的地方），
- * 而不是退化成吞掉异常。**复访触发条件：P2 账本落地时**——那是第一个审计必须与业务
- * 同生共死的地方，届时本取舍按「事务内写」重新实现。
+ * 可用性依赖。
+ *
+ * **P2 / Task 2 已落地**（P0 的原文保留作来路）：P0 在这里写着「**持久修法在 P2**：让审计行
+ * 加入业务事务（在有事务的地方），而不是退化成吞掉异常。**复访触发条件：P2 账本落地时**
+ * ——那是第一个审计必须与业务同生共死的地方，届时本取舍按『事务内写』重新实现」。
+ * 触发条件**已经到达**：账本（P2）是会回滚的，而**一个会回滚、审计行却留下的账本，其审计
+ * 轨迹在撒谎**——审计里会留下一次从未发生过的资金变动，而设计 §13.2 要求「审计日志可完整
+ * 重建任一次资金变动的链路」。预检 C.16 实测了这条机制：事务**外**写审计时账本回滚后仍剩
+ * 1 行，事务**内**写时 0 行。`record` 因此有了第二个参数 `tx`。
+ *
+ * **现在的规则（不是风格要求）：账本路径必须传 `tx`。** 其余路径（登录失败、登出、制品清理
+ * 失败）天然不在事务里，它们没有「与谁同生共死」的对象，传不传都行。
  */
 @Injectable()
 export class AuditService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async record(input: AuditRecordInput): Promise<void> {
+  /**
+   * 写入一行审计。
+   *
+   * ## `tx` 为什么是可选参数，以及为什么可选是安全的
+   *
+   * 有些路径**天然不在事务里**（登录失败、登出、定时任务），把它们一律塞进事务只是
+   * 仪式。因此签名是 `tx?`：传了就用调用方的事务，不传就用本服务自己的客户端。
+   *
+   * **可选性的代价是「忘传」这种失误不会在类型层被发现**（`PrismaService` 与
+   * `Prisma.TransactionClient` 结构上兼容，类型挡不住——与 `OutboxService.publish`
+   * 的注释记的是同一件事）。因此真正的守卫是**测试**：
+   * `tests/integration/audit/rollback.test.ts` 的第一条，以及 Task 6 在**账本路径**上
+   * 的另一条（`tests/integration/ledger/postings.test.ts` 的「账本回滚后审计 0 行」）。
+   * 谁把 `post` 里的 `tx` 去掉，那两条会给出「审计行留下了」的明确红灯。
+   */
+  async record(input: AuditRecordInput, tx?: Prisma.TransactionClient): Promise<void> {
     const traceId = currentContext()?.traceId ?? null;
-    await this.prisma.auditLog.create({
-      data: {
-        actorId: input.actorId ?? null,
-        action: input.action,
-        resource: input.resource,
-        resourceId: input.resourceId ?? null,
-        traceId,
-        metadata: (input.metadata ?? null) as never,
-      },
-    });
+    // 三元而不是 `tx ?? this.prisma` 再取方法：写成 `const client = tx ?? this.prisma`
+    // 时两个分支的类型是一个联合，Prisma 的委托签名在联合上仍然可解析，但**读的人**
+    // 要自己去确认这两个分支是不是同一个东西。这里保留三元的形状，让「同一份 data」
+    // 这件事在视觉上只有一个判断点。
+    const data = {
+      actorId: input.actorId ?? null,
+      action: input.action,
+      resource: input.resource,
+      resourceId: input.resourceId ?? null,
+      traceId,
+      metadata: (input.metadata ?? null) as never,
+    };
+    if (tx) await tx.auditLog.create({ data });
+    else await this.prisma.auditLog.create({ data });
   }
 }

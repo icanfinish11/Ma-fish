@@ -140,6 +140,23 @@ describe('每个路由都必须有明确的限流归属（修复轮 1 / C-4）',
           rateLimitSkipped: false,
         });
       }
+
+      /**
+       * **Task 10 新增的那一条路由**：同样归 `search` 那一层。
+       *
+       * 为什么不是新加一档：`RATE_LIMITS` 是设计文档 §4.1 威胁 #13 那张表的投影，
+       * 而威胁 #13 点名的五类端点里没有「管理动作」——**新增一个安全参数是一次设计裁定**
+       * （阈值多少、按什么分桶都要有依据），不是实现者可以顺手做的。
+       * `search` 是表里唯一「按 IP、短窗口」的档（60 次/分钟），对一条管理动作足够；
+       * 代价（名字叫 search 而挂的是额度发放）与改法写在 `ledger.controller.ts` 的类注释里。
+       *
+       * 判别力：把 `@RateLimited('search')` 从处理器上删掉 ⇒ 这条立刻红
+       * （`rateLimit` 变成 `null` 而 `rateLimitSkipped` 是 `false`，正是门的「漏声明」分支）。
+       */
+      expect(registry.find('LedgerController', 'grant'), 'LedgerController.grant 没有限流归属').toMatchObject({
+        rateLimit: 'search',
+        rateLimitSkipped: false,
+      });
     });
   });
 

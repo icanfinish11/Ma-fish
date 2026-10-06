@@ -16,6 +16,11 @@ import { AssetModule } from './modules/asset/asset.module.js';
 import { AuthModule } from './modules/auth/auth.module.js';
 import { SessionMiddleware } from './modules/auth/session.middleware.js';
 import { HealthModule } from './modules/health/health.module.js';
+// 组合根按设计就该认识每一个模块，因此这里直接 import 它的 module 文件而不是
+// `modules/ledger/index.ts`——豁免写在 `.dependency-cruiser.cjs` 的 `from.pathNot` 里
+// （`app.module.ts`），与上面几条 import 同一处置。P2 / Task 10 把账本装进来，
+// 于是 `POST /ledger/credits` 第一次真的存在（在那之前 `LedgerService` 没有任何消费者）。
+import { LedgerModule } from './modules/ledger/ledger.module.js';
 
 /**
  * 根模块。
@@ -111,6 +116,7 @@ import { HealthModule } from './modules/health/health.module.js';
     AuditModule,
     AuthModule,
     AssetModule,
+    LedgerModule,
     HealthModule,
   ],
   providers: [

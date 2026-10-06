@@ -71,8 +71,52 @@ const GATES = {
   // （4 端点 × 4 角色 + 1 条「矩阵覆盖全部已注册路由」）。**它必须进入被计数的门**：
   // 「未授权用户拿不到签名 URL」是 P1 的三条判据之一，而这条控制在 security 的账上
   // 才有「被静默删掉就会红」的性质。下限随之对齐到实际执行数：68 → 85。
-  security: 85,
+  //
+  // P2 / Task 10：**85 → 89**（+4）。把 **ledger 的越权矩阵**纳入 security 门
+  // （`tests/security/ledger/authz-matrix.test.ts`）：匿名 / 已登录非管理员 / 管理员 / 管理员同键重放
+  // 四条。这条路由是 P2 里**唯一一条外部可达的造钱路径**（`POST /ledger/credits`），
+  // 「未授权者发不出额度」因此必须计在 security 的账上——被静默删掉就会红，
+  // 而不是「少查了一件事但一切正常」。两条覆盖率门（policy / rate-limit）里新增的是
+  // **既有用例里的断言**（不新增条数），它们的判别力由探针 p-drop-policy / p-drop-module 证明。
+  //   ⇒ 实测值（不是预测）：`node scripts/assert-tests-ran.mjs security` = `Tests 89 passed (89)`；
+  //     把矩阵里任意一条 `it` 改成 `it.skip` ⇒ 88 < 89 ⇒ 以 `::error::` 变红（探针 `p-security-floor` 实测）。
+  security: 89,
   architecture: 5,
+  // P2 / Task 1：**判决 1 的病根就是这里**——设计 §8.3 的「≥10 万次属性测试」此前
+  // 没有任何执行者：`tests/property/` 不存在、`test:property` 带 `--passWithNoTests`
+  // （空 project 实测 exit 0）、CI 里 `property` 零匹配、本文件的 GATES 只有
+  // security/architecture 两项。于是「资金系统唯一真正可靠的验证方式」是一句
+  // 写在规格里的话。这条下限让它无法再静默停止运行：
+  // 「文件被改名 / 被删空 / project 名写错 / 用例被 skip」都会红。
+  // 数字与当前实际执行条数对齐（本文件的既定规矩）：新增属性用例时必须一起上调。
+  //
+  // 8 = 五条 100k-runs 金额属性 + 一条预算下限断言 + 一条 2^53 用例
+  //     + 一条 `@fast-check/vitest` 接线用例（预检 §G.5）。
+  //     实测值来自 `node scripts/assert-tests-ran.mjs property` 的输出，不是预测。
+  //
+  // P2 / Task 5：**8 → 11**（+3）。新增 `tests/property/ledger-fee-split.test.ts` 三条：
+  //   ① 控制器裁定 4 / C23 / 预检 §F.3 明写的那条属性——任意 `(gross, bps)` 下
+  //      `fee + net === gross`（bps 上界取到 100_000 ⇒ 顺带行使上限钳制分支）；
+  //   ② 向上取整的**全域**命题（`fee = ceil(gross·bps/10⁴)` 的最小性）——守恒那条钉不住
+  //      取整方向（向下取整 + 净额减出来照样守恒），这一条才钉得住；
+  //   ③ 反 vacuity 的生成器覆盖率（非零 fee / 「向上取整真的起作用」/ 钳制分支都被走到）。
+  //   三条的预算都是 `PROPERTY_NUM_RUNS = 100_000`（与设计 §8.3 的下限同源）。
+  //   ⚠️ 计划 Task 8 的算术表把「裁定 4 的费率属性」算作它自己的 +4 之一；那一条**已经在这里
+  //   交付**，因此 Task 8 落地 `ledger-invariants.test.ts` 时应当**重新读实测条数**再对齐
+  //   （本文件的既定规矩：数字与当前实际执行条数对齐，任何删除都会红一次）。
+  //
+  // P2 / Task 8：**11 → 15**（+4，且**没有**重复那条费率属性——它在 Task 5 已经交付并计在上面的 3 里）。
+  // 新增 `tests/property/ledger-invariants.test.ts` 四条，算术 = 8 + 3 + 4：
+  //   ① 随机序列 × 100_000 次 × 每序列 20 笔：五条不变式**每一个操作之后**都成立（设计 §13.3 的判据本体）；
+  //   ② 生成器覆盖率（反 vacuity）：五类操作各自都被**接受**过；
+  //   ③ ★ 不变式 #4 的残差不是「0 减 0」：抽样里真的有带手续费的释放（残差的非平凡性锚点）；
+  //   ④ 拒绝路径被行使过（余额不足 / 零金额），且每一类拒绝旁边都有被接受的同类操作。
+  //   ⇒ 实测值 `node scripts/assert-tests-ran.mjs property` = `Tests 15 passed (15)`，
+  //     不是预测；把其中任意一条 `it` 改成 `it.skip` ⇒ 14 < 15 ⇒ 这道门以 `::error::` 变红（Task 8 实测）。
+  //
+  // P2 / Task 10 **没有**动这一项：额度发放路由与越权矩阵**不新增属性用例**
+  // （属性测试的对象是纯核心与账本不变式，不是 HTTP 路由），实测仍 `Tests 15 passed (15)`。
+  property: 15,
 };
 
 /** vitest 自己的 JS 入口（读它 `package.json` 里声明的 `bin.vitest`，不猜路径）。 */
