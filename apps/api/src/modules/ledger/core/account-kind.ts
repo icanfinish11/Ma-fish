@@ -32,12 +32,44 @@ export const USER_ACCOUNT_KINDS: readonly AccountKind[] = [
   ACCOUNT_KINDS.USER_FROZEN,
 ];
 
-/** 系统账户：owner 为 NULL，天然为负（充值对手方与两个平台账户）。 */
+/** 系统账户：owner 为 NULL，**充值对手方**天然为负，另两个平台账户只收不放。 */
 export const SYSTEM_ACCOUNT_KINDS: readonly AccountKind[] = [
   ACCOUNT_KINDS.PLATFORM_ESCROW,
   ACCOUNT_KINDS.PLATFORM_REVENUE,
   ACCOUNT_KINDS.EXTERNAL_TOPUP,
 ];
+
+/**
+ * **允许为负的账户 kind 恰好只有一个**：注入端（`EXTERNAL_TOPUP`）—— 它代表「系统之外」，
+ * 充值就是从这个方向把钱**造进**账本，因此它必然越扣越负。
+ *
+ * ## 为什么这条规则必须有**唯一**的定义处
+ * 它是三个落点的共同依据（与上面「用户 / 系统」那两张表同一处置），任何一处写歪都静默出错：
+ *   ① `LedgerService.applyBalances` 的借方守卫（**并发权威**，C25/D8）；
+ *   ② 迁移里的条件化 CHECK（绕过应用的写路径）；
+ *   ③ 真库用例的目录断言（`tests/integration/db/ledger-enforcement.test.ts`：名单的排他性）。
+ * 三处今天逐字一致，而「三处一致」这件事本身由 ② 的目录断言 + ① 的行为用例各自看着。
+ *
+ * ## 为什么 `PLATFORM_ESCROW` / `PLATFORM_REVENUE` **不在**名单里（P2 最终审查 I1）
+ * 此前那条守卫写成「只有两个用户 kind 带 `balance >= x`」，于是**托管账户的借方是无条件扣减**：
+ * 一次「释放得比锁进来的更多」的调用会把托管扣成负的、把差额付给卖家——平台付出了它从未
+ * 持有的钱，而 Σ=0 成立、五条不变式全绿、对账全绿、审计也如实。
+ * §8.3 的不变式 #4 原文正是「`Σ PLATFORM_ESCROW ≥ Σ 未结算托管义务`（**托管不透支**）」，
+ * 因此「托管余额不得为负」不是这条规则的一个特例，**它就是 P2 里能强制的那一半**（独立义务
+ * 来源属 P3 的 `EscrowRecord`）。`PLATFORM_REVENUE` 同理：手续费只进不出，一次「退费超过
+ * 已收手续费」的支出同样不该被允许。
+ *
+ * 「系统账户天然为负」这句话**只对注入端成立**——把这句话读成「三个系统账户都可以透支」，
+ * 正是审查抓到的那处误解。
+ */
+export const NEGATIVE_ALLOWED_KINDS: readonly AccountKind[] = [ACCOUNT_KINDS.EXTERNAL_TOPUP];
+
+const NEGATIVE_ALLOWED_SET: ReadonlySet<string> = new Set(NEGATIVE_ALLOWED_KINDS);
+
+/** 这个 kind 的余额**允许**为负吗（只有注入端）。`applyBalances` 的借方守卫与迁移的 CHECK 同源。 */
+export function mayGoNegative(kind: string): boolean {
+  return NEGATIVE_ALLOWED_SET.has(kind);
+}
 
 const USER_KIND_SET: ReadonlySet<string> = new Set(USER_ACCOUNT_KINDS);
 const ALL_KIND_SET: ReadonlySet<string> = new Set(Object.values(ACCOUNT_KINDS));

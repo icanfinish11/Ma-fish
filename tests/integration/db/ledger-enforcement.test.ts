@@ -27,7 +27,7 @@ import { startPostgres, type TestPg } from '../../helpers/db.js';
  * 因此下面那条 `pg_proc` / `pg_trigger` / `pg_get_constraintdef` 的目录断言**不是**
  * 锦上添花：它是这三类手写对象**唯一**的机器见证。
  */
-describe('账本的数据库强制点（不变式 #1 / #3 / #5）', () => {
+describe('账本的数据库强制点（不变式 #1 / #3 / #4 / #5）', () => {
   let pg: TestPg;
   let owner: Client;
   let app: Client;
@@ -147,8 +147,11 @@ describe('账本的数据库强制点（不变式 #1 / #3 / #5）', () => {
     });
 
     // ③ 两条 CHECK：定义原文里必须**看得见**它们各自的条件。
-    //    `accounts_nonneg_by_kind` 的定义里出现那两个 kind，正是「条件化」本身——
-    //    把 CHECK 改成无条件的 `balance >= 0` 会让这条断言红（而行为用例那两条也会红）。
+    //    `accounts_nonneg_by_kind` 的**允许为负的名单恰好只有 `EXTERNAL_TOPUP`**——
+    //    这一条在 P2 最终审查（I1）之后被收紧过：此前名单是「两个用户 kind」，
+    //    于是 `PLATFORM_ESCROW` 被无条件放行，而「托管不透支」正是不变式 #4 的一半。
+    //    把 CHECK 改成无条件的 `balance >= 0` 会让这条断言红（充值路径被钉死），
+    //    把名单放宽回「两个用户 kind」同样会让它红（下面两条行为用例也会红）。
     const checks = await owner.query(
       `SELECT c.conname, c.contype, pg_get_constraintdef(c.oid) AS def
          FROM pg_constraint c
@@ -164,9 +167,15 @@ describe('账本的数据库强制点（不变式 #1 / #3 / #5）', () => {
     ]);
     expect(checks.rows.map((r) => r.contype)).toEqual(['c', 'c']);
     const byName = new Map(checks.rows.map((r) => [r.conname as string, r.def as string]));
-    expect(byName.get('accounts_nonneg_by_kind')).toContain('USER_AVAILABLE');
-    expect(byName.get('accounts_nonneg_by_kind')).toContain('USER_FROZEN');
-    expect(byName.get('accounts_nonneg_by_kind')).toMatch(/balance\s*>=\s*0/);
+    const nonneg = byName.get('accounts_nonneg_by_kind') as string;
+    expect(nonneg).toContain('EXTERNAL_TOPUP');
+    expect(nonneg).toMatch(/balance\s*>=\s*0/);
+    // ★ 名单的**排他性**：四个「可能被透支」的 kind 一个都不许出现在允许名单里。
+    //   只断言「出现了 EXTERNAL_TOPUP」是不够的——一个 `kind <> 'X' OR balance >= 0`
+    //   的写法照样含它，却把别的 kind 全放行了。
+    for (const kind of ['USER_AVAILABLE', 'USER_FROZEN', 'PLATFORM_ESCROW', 'PLATFORM_REVENUE']) {
+      expect(nonneg, `允许为负的名单里不该出现 ${kind}（I1：只有注入端可以天然为负）`).not.toContain(kind);
+    }
     expect(byName.get('entries_amount_nonzero')).toMatch(/amount\s*<>\s*0/);
   });
 
@@ -309,6 +318,9 @@ describe('账本的数据库强制点（不变式 #1 / #3 / #5）', () => {
   });
 
   it('不变式 #3：**用户**账户扣成负被拒（条件化 CHECK 的正面）', async () => {
+    // 与下面两条合成一组：名单里**两个用户 kind + 两个平台 kind** 都被拒，
+    // 而**注入端**（`EXTERNAL_TOPUP`）被放行。四条一起把 `accounts_nonneg_by_kind`
+    // 的允许名单钉成**恰好一个** kind（I1 修复后收紧的判据）。
     await expect(
       owner.query(
         `INSERT INTO ledger.accounts (id, kind, owner_user_id, balance)
@@ -317,7 +329,58 @@ describe('账本的数据库强制点（不变式 #1 / #3 / #5）', () => {
     ).rejects.toMatchObject({ code: '23514' });
   });
 
-  it('不变式 #3：**系统**账户扣到负被接受（条件化的证明——无条件 CHECK 会钉死充值路径）', async () => {
+  it('不变式 #4 的数据库侧：**托管 / 收入**账户扣到负被拒（I1：只有注入端可以天然为负）', async () => {
+    // 行为侧与上面那条目录断言互为独立的两条腿（目录说「条件是什么」，这里说「它真的有牙」）。
+    // 审查 I1 之前，这一句在 `PLATFORM_ESCROW` 上是**放行**的：托管被扣到 −1 而无人察觉，
+    // 于是「一次释放比锁进来的更多」在数据库层也没有任何东西拦着。
+    for (const kind of ['PLATFORM_ESCROW', 'PLATFORM_REVENUE']) {
+      await expect(
+        owner.query(
+          `UPDATE ledger.accounts SET balance = balance - 1 WHERE kind = $1 RETURNING balance`,
+          [kind],
+        ),
+        `${kind} 被扣到负却放行了 ⇒ 不变式 #4 在库层没有执行者`,
+      ).rejects.toMatchObject({ code: '23514' });
+      await resetTx(owner);
+    }
+    // 反面对照（同一形状的语句、同一张表）：名单里**唯一**允许为负的那个 kind 仍然放行——
+    // 否则上面那两条拒绝也可能只是「这张表根本改不动」。
+    await owner.query('BEGIN');
+    const r = await owner.query(
+      `UPDATE ledger.accounts SET balance = balance - 1 WHERE kind = 'EXTERNAL_TOPUP' RETURNING balance`,
+    );
+    expect(BigInt(r.rows[0].balance)).toBeLessThan(0n);
+    await owner.query('ROLLBACK'); // 复原：不让这 ±1 污染对账用例的 Σ=0
+
+    // ── ★ 顺带量清楚：一个**不在 §8.1 名单里**的 kind 在这条 CHECK 下的两个方向 ──────────
+    // 这不是题外话：收紧成「排他的允许名单」之后，未知 kind 会**落到「必须非负」那一侧**，
+    // 于是它的负余额也被拒了——**那仍然不是「数据库在枚举五个 kind」**。C30 的执行点依旧是
+    // 应用层的 `assertAccountKind`（`topup-route.test.ts` 的 C30 那条用例看着它）。
+    // 两条方向都量，免得下一份注释把这里说成「数据库挡住了未知 kind」。
+    await expect(
+      owner.query(
+        `INSERT INTO ledger.accounts (id, kind, owner_user_id, balance)
+         VALUES (gen_random_uuid(),'SELLER_AVAILABLE',gen_random_uuid(),-1)`,
+      ),
+      '未知 kind 的负余额：收紧之后它落到「必须非负」那一侧 ⇒ 被拒',
+    ).rejects.toMatchObject({ code: '23514' });
+    await resetTx(owner);
+    await owner.query('BEGIN');
+    await expect(
+      owner.query(
+        `INSERT INTO ledger.accounts (id, kind, owner_user_id, balance)
+         VALUES (gen_random_uuid(),'SELLER_AVAILABLE',gen_random_uuid(),1)`,
+      ),
+      '未知 kind 的**非负**余额照样被收下 ⇒ 这条 CHECK 挡不住「kind 集合与 §8.1 脱钩」',
+    ).resolves.toBeDefined();
+    await owner.query('ROLLBACK'); // 不留行：对账与其他用例都不该看见这个伪造 kind
+  });
+
+  it('注入端是**唯一**允许为负的账户：`EXTERNAL_TOPUP` 扣到负被接受（无条件 CHECK 会钉死充值路径）', async () => {
+    // 这条与上面那条（托管 / 收入被拒）是**同一条规则的两个方向**：条件化 CHECK 的允许名单
+    // 恰好是一个 kind。把 CHECK 写成无条件 `balance >= 0` ⇒ **这条**红（充值路径被钉死，
+    // 预检 B.3 实测过）；把名单放宽回「两个用户 kind」（I1 修复前的形态）⇒ **上面那条**红。
+    // 两条一起才说明名单既不空也不泛。
     const r = await owner.query(
       `UPDATE ledger.accounts SET balance = balance - 12345 WHERE kind = 'EXTERNAL_TOPUP' RETURNING balance`,
     );

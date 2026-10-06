@@ -74,9 +74,10 @@ export interface ReconciliationReport {
  *    一笔不平衡的分录**真的提交了**，该量立刻变成 −12 345。
  *    ⇒ 这条判据的强度**上限**等于不变式 #1 那道数据库防线的强度。
  * 3. **`kind` 不做校验**：§8.1 之外的 kind（例如 §8.2 里的 `SELLER_AVAILABLE`）若被直接
- *    插进 `ledger.accounts`，迁移里那条**条件化** CHECK 对它**不成立**（它只点名
- *    `USER_AVAILABLE` / `USER_FROZEN` 两个值），于是这一行会**正常地**计入 Σ，
- *    负余额也不会被拒。它只在余额非零时出现在 `nonzeroAccounts` 里。
+ *    插进 `ledger.accounts`，**计入 Σ 这件事不会被拦**（I1 之后那条 CHECK 的允许名单
+ *    恰好只有 `EXTERNAL_TOPUP`，因此一个未知 kind 落到「必须非负」那一侧：**负余额会被拒，
+ *    正余额照收**——数据库无法枚举五个 kind，那是应用层 `assertAccountKind` 的活，C30）。
+ *    它只在余额非零时出现在 `nonzeroAccounts` 里。
  *
  * ## 要让违反**不可能**，而不是「可发现」，需要什么（据实说清，不承诺）
  * 今天能绕过的路径是「写 `ledger.accounts` 而不写 `entries`」。三条可行方向，代价各不同：

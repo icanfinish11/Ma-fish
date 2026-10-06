@@ -27,7 +27,7 @@ import { startTestRedis, type TestRedis } from '../../helpers/redis.js';
  * | C22：金额在 HTTP 边界是十进制字符串，**`number` 一律拒绝** | ① ② | 预检 A.2 实测：`JSON.parse('{"a":9007199254740993}')` → `…992`，写库**成功、少 1 分、无异常** |
  * | D9/C26：幂等三态（新键 / 异腿 409 / 重放） | ③ ④ | 重试把同一笔发放记两次（外部可达的造钱路径上，这是最贵的缺陷） |
  * | D10/§13.2：审计可**完整重建**这次资金变动 | ⑤ | 「有审计行」但重建不出「谁发给了谁、多少」 |
- * | C30：§8.1 之外的 kind 必须由**应用**拒绝 | ⑥ | Task 9 实测：DB 的条件化 CHECK 只点名两个用户 kind，`SELLER_AVAILABLE` 会被放行并计入 Σ |
+ * | C30：§8.1 之外的 kind 必须由**应用**拒绝 | ⑥ | Task 9 实测：DB 的条件化 CHECK 枚举不了 kind，伪造 kind 只要非负就被放行并计入 Σ |
  *
  * ## 为什么响应体里**从不**出现 `bigint`
  *
@@ -213,9 +213,10 @@ describe('额度发放路由：POST /ledger/credits（C22 / D9 / D10 / C30）', 
 
   it('★ C30 的应用侧执行点：写路径拒绝 §8.1 之外的 kind，且**碰库之前**就拒绝', async () => {
     // 为什么这条必须有：Task 9 用真库实测过，迁移里那条**条件化** CHECK
-    // （`kind NOT IN ('USER_AVAILABLE','USER_FROZEN') OR balance >= 0`）对 §8.1 之外的
-    // kind **不成立**——`INSERT … 'SELLER_AVAILABLE', balance = -5000` 被放行、并被计入 Σ。
-    // 也就是说：**执行 kind 集合是应用层的工作**，数据库挡不住。
+    // （I1 之后的条件是 `kind = 'EXTERNAL_TOPUP' OR balance >= 0`）**枚举不了五个 kind**——
+    // 它只知道「允许为负的恰好是注入端」这一个取值，因此一个伪造 kind 只要**非负**就会被
+    // 收下并计入 Σ（`ledger-enforcement.test.ts` 的「不变式 #4 的数据库侧」把这两个方向
+    // 都量了一遍）。也就是说：**执行 kind 集合是应用层的工作**，数据库挡不住。
     //
     // 观测量的选择是承重的：`resolveAccounts` 里有**五处** `assertAccountKind`
     // （入参引用、读回的行、快照），它们抛的是**同一个**错误类，因此「抛没抛」分不开它们。

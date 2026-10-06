@@ -29,7 +29,8 @@ import { startPostgres, type TestPg } from '../../helpers/db.js';
  *
  * ## §8.2 里的 `SELLER_AVAILABLE` / `BUYER_AVAILABLE` 不是账户类型（C30 / D6）
  * §8.1 只有五个 kind；买家与卖家是**属于不同用户的 `USER_AVAILABLE`**。
- * 库里没有、也不得有 `SELLER_AVAILABLE` 这种 kind（那会让不变式 #3 的条件化 CHECK 失去依据）。
+ * 库里没有、也不得有 `SELLER_AVAILABLE` 这种 kind（那会让「哪些账户允许为负」这条
+ * 条件化 CHECK 失去依据——它今天枚举的是 `EXTERNAL_TOPUP` 这**一个**取值）。
  *
  * ## 每个用例都用新的 `uuidv7()` 当事人 ⇒ 互不干扰、无需清理。
  * 系统账户（托管 / 收入 / 充值对手方）是全局共享的，因此对它们的断言一律写成
@@ -60,6 +61,19 @@ const frozen = (userId: string) => ({ kind: ACCOUNT_KINDS.USER_FROZEN, ownerUser
 async function balanceOf(kind: string, ownerUserId: string | null): Promise<bigint> {
   const rows = await prisma.ledgerAccount.findMany({ where: { kind, ownerUserId }, select: { balance: true } });
   return rows[0]?.balance ?? 0n;
+}
+
+/**
+ * 一个**真的**存在于 `auth.users` 的用户（C1：额度发放的收款人必须是真用户）。
+ *
+ * 为什么这些用例不再用 `uuidv7()` 当当事人：那是 P2 最终审查的 C1 —— `grantCredit` 此前
+ * 可以给一个 `auth.users` 里不存在的 uuid 发额度（账平、五条不变式全绿、**钱永远花不掉**，
+ * 而它还是唯一一个凭空造钱的端点）。修好之后，发放的收款人必须是真用户；
+ * 而这些用例要的只是「一个正常用户」，因此在这里真的建一个。
+ */
+async function realUser(): Promise<string> {
+  const user = await prisma.user.create({ data: {} });
+  return user.id;
 }
 
 /** 一笔交易的分录（kind, amount），按 kind 排序——用来断言**符号约定**本身。 */
@@ -240,6 +254,55 @@ describe('五个原语（§8.2 / §8.4）', () => {
       [ACCOUNT_KINDS.PLATFORM_ESCROW, -100n],
       [ACCOUNT_KINDS.USER_AVAILABLE, 100n],
     ]);
+  });
+
+  it('★ 托管**不透支**（不变式 #4 在 P2 里可强制的那一半）：超出托管余额的释放被拒、恰好等于的释放被接受', async () => {
+    // ## 它挡的缺陷形态（P2 最终全分支审查的 I1）
+    //
+    // `applyBalances` 的守卫此前写成 `isUserAccountKind(snapshot.kind) ? {id, balance: {gte: x}} : {id}`
+    // ——而 `PLATFORM_ESCROW` 是**系统** kind（`account-kind.ts` 的三张表之一）⇒ 托管账户的借方
+    // 是**无条件**扣减。于是「释放得比锁进来的更多」这件事不会被任何东西拦住：
+    // 托管被扣成负的、差额付给卖家 ⇒ **平台付了它从未持有的钱**，而 Σ=0 成立、五条不变式全绿、
+    // 对账全绿、审计也如实。审查逐条核过 `tests/` 里全部 7 个 `releaseEscrow` 调用点：
+    // 每一个释放的都恰好是它锁进来的 ⇒ **此前没有任何见证看着这条规则**。
+    //
+    // 而 §8.3 的不变式 #4 原文就是「`Σ PLATFORM_ESCROW ≥ Σ 未结算托管义务`（**托管不透支**）」——
+    // 独立义务来源（`EscrowRecord`）属 P3，但「托管余额不得为负」这一半在 P2 里**是可强制的**，
+    // 本条用例看着它。两个方向都在，缺任何一半这条断言都可能只是「怎么都拒」或「怎么都放」：
+    //   ① 拒绝方向：释放 `托管余额 + 1` ⇒ 领域错误，托管与卖家两侧都一字未动；
+    //   ② 接受方向：释放**恰好**托管余额 ⇒ 成功，且托管归零。
+    const buyerId = await realUser();
+    const sellerId = await realUser();
+    // 先把托管撑起来（发 10000 给买家、全额锁进托管）。断言一律写成**前后差**：
+    // 托管是全局共享账户，别的用例也会动它。
+    await prisma.$transaction(async (tx) => {
+      await ledger.grantCredit(tx, { userId: buyerId, amount: 10_000n, idempotencyKey: `overrelease-topup:${buyerId}` });
+      await ledger.lockToEscrow(tx, { buyerId, amount: 10_000n, idempotencyKey: `overrelease-lock:${buyerId}` });
+    });
+    const escrowNow = await balanceOf(ACCOUNT_KINDS.PLATFORM_ESCROW, null);
+    expect(escrowNow, '托管余额必须为正，否则「超一分」这个构造没有判别力').toBeGreaterThan(0n);
+
+    // ① **拒绝方向**：多释放 1 分。
+    const refusedKey = `overrelease:${sellerId}`;
+    await expect(
+      prisma.$transaction((tx) =>
+        ledger.releaseEscrow(tx, { sellerId, gross: escrowNow + 1n, feeBps: 0, idempotencyKey: refusedKey }),
+      ),
+    ).rejects.toThrow(InsufficientFundsError);
+    // 拒绝必须**什么都没留下**：那笔交易不存在、托管余额一分未动、卖家一分未得。
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: refusedKey } })).toBe(0);
+    expect(await balanceOf(ACCOUNT_KINDS.PLATFORM_ESCROW, null)).toBe(escrowNow);
+    expect(await ledger.readBalances(prisma, sellerId)).toEqual({ available: 0n, frozen: 0n });
+
+    // ② **接受方向**（同一形状的请求、同一个原语）：释放**恰好**托管余额 ⇒ 成功，托管归零。
+    //    没有这一句，上面那条拒绝也可能只是「releaseEscrow 怎么都拒」。
+    const okKey = `exactrelease:${sellerId}`;
+    const ok = await prisma.$transaction((tx) =>
+      ledger.releaseEscrow(tx, { sellerId, gross: escrowNow, feeBps: 0, idempotencyKey: okKey }),
+    );
+    expect(ok.created).toBe(true);
+    expect(await balanceOf(ACCOUNT_KINDS.PLATFORM_ESCROW, null)).toBe(0n);
+    expect(await ledger.readBalances(prisma, sellerId)).toEqual({ available: escrowNow, frozen: 0n });
   });
 
   it('§8.2 行 3 / 悔拍没收由**通用 post** 走通（D12：金额规则属 P4，本用例只把它当参数），kind = FORFEIT', async () => {

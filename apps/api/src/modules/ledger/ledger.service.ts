@@ -3,7 +3,7 @@ import { uuidv7 } from '@vca/shared';
 import { PrismaService } from '../../db/prisma.service.js';
 import { AuditService } from '../audit/index.js';
 import {
-  ACCOUNT_KINDS, accountKey, assertAccountKind, isUserAccountKind, normalizeRef,
+  ACCOUNT_KINDS, accountKey, assertAccountKind, mayGoNegative, normalizeRef,
   SYSTEM_ACCOUNT_KINDS, USER_ACCOUNT_KINDS,
 } from './core/account-kind.js';
 import {
@@ -408,10 +408,19 @@ export class LedgerService {
   /**
    * ⑤ 落余额：**借方条件更新、以受影响行数为准**（C25 / D8），贷方无条件。
    *
-   * ## 为什么只有用户账户带守卫
-   * 系统账户（`EXTERNAL_TOPUP` / `PLATFORM_*`）**天然为负**——充值就是把它扣成负的。
-   * 给所有借方都加上 `balance >= x`，第一次充值就会失败（余额 0 扣 10000）。
+   * ## 哪些借方带守卫 —— **只有注入端不带**（P2 最终审查 I1 的落点）
+   * 名单来自 `account-kind.ts` 的 `mayGoNegative()`（**唯一**定义处），今天恰好只有
+   * `EXTERNAL_TOPUP`：充值是把钱从系统之外注入账本，它必然越扣越负——给所有借方都加上
+   * `balance >= x`，第一次充值就会失败（余额 0 扣 10000）。
    * 这与迁移里那条**条件化** CHECK 是同一条规则的两个落点，两处必须一致。
+   *
+   * ## ★ 这里此前漏掉了托管（I1：一条会**凭空付款**的路）
+   * 原来的条件是 `isUserAccountKind(snapshot.kind)`，而 `PLATFORM_ESCROW` 是**系统** kind
+   * ⇒ 托管账户的借方是**无条件**扣减。于是一次「释放得比锁进来的更多」的调用会把托管扣成
+   * 负的、把差额付给卖家：平台付出了它从未持有的钱，而 Σ=0 成立、五条不变式全绿、对账全绿、
+   * 审计也如实。审查逐条核过 `tests/` 里全部 7 个 `releaseEscrow` 调用点——**每一个释放的
+   * 都恰好是它锁进来的**，也就是说这条规则此前没有任何见证。
+   * 见证：`primitives.test.ts` 的「托管不透支」那条（超一分 ⇒ 拒绝、恰好等于 ⇒ 接受）。
    *
    * ## 为什么 `count !== 1` 就是「余额不足」
    * READ COMMITTED 之下，`UPDATE … WHERE balance >= x` 在拿到行锁之后会**重新求值**
@@ -438,9 +447,9 @@ export class LedgerService {
       if (leg.amount < 0n) {
         const needed = -leg.amount;
         const applied = await tx.ledgerAccount.updateMany({
-          where: isUserAccountKind(snapshot.kind)
-            ? { id: leg.accountId, balance: { gte: needed } }
-            : { id: leg.accountId },
+          where: mayGoNegative(snapshot.kind)
+            ? { id: leg.accountId }
+            : { id: leg.accountId, balance: { gte: needed } },
           data: { balance: { decrement: needed } },
         });
         if (applied.count !== 1) {
