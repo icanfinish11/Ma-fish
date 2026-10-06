@@ -71,7 +71,16 @@ const GATES = {
   // （4 端点 × 4 角色 + 1 条「矩阵覆盖全部已注册路由」）。**它必须进入被计数的门**：
   // 「未授权用户拿不到签名 URL」是 P1 的三条判据之一，而这条控制在 security 的账上
   // 才有「被静默删掉就会红」的性质。下限随之对齐到实际执行数：68 → 85。
-  security: 85,
+  //
+  // P2 / Task 10：**85 → 89**（+4）。把 **ledger 的越权矩阵**纳入 security 门
+  // （`tests/security/ledger/authz-matrix.test.ts`）：匿名 / 已登录非管理员 / 管理员 / 管理员同键重放
+  // 四条。这条路由是 P2 里**唯一一条外部可达的造钱路径**（`POST /ledger/credits`），
+  // 「未授权者发不出额度」因此必须计在 security 的账上——被静默删掉就会红，
+  // 而不是「少查了一件事但一切正常」。两条覆盖率门（policy / rate-limit）里新增的是
+  // **既有用例里的断言**（不新增条数），它们的判别力由探针 p-drop-policy / p-drop-module 证明。
+  //   ⇒ 实测值（不是预测）：`node scripts/assert-tests-ran.mjs security` = `Tests 89 passed (89)`；
+  //     把矩阵里任意一条 `it` 改成 `it.skip` ⇒ 88 < 89 ⇒ 以 `::error::` 变红（探针 `p-security-floor` 实测）。
+  security: 89,
   architecture: 5,
   // P2 / Task 1：**判决 1 的病根就是这里**——设计 §8.3 的「≥10 万次属性测试」此前
   // 没有任何执行者：`tests/property/` 不存在、`test:property` 带 `--passWithNoTests`
@@ -104,6 +113,9 @@ const GATES = {
   //   ④ 拒绝路径被行使过（余额不足 / 零金额），且每一类拒绝旁边都有被接受的同类操作。
   //   ⇒ 实测值 `node scripts/assert-tests-ran.mjs property` = `Tests 15 passed (15)`，
   //     不是预测；把其中任意一条 `it` 改成 `it.skip` ⇒ 14 < 15 ⇒ 这道门以 `::error::` 变红（Task 8 实测）。
+  //
+  // P2 / Task 10 **没有**动这一项：额度发放路由与越权矩阵**不新增属性用例**
+  // （属性测试的对象是纯核心与账本不变式，不是 HTTP 路由），实测仍 `Tests 15 passed (15)`。
   property: 15,
 };
 
