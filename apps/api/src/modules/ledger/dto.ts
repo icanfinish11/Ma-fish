@@ -1,5 +1,8 @@
 import { z } from 'zod';
-import { MINOR_UNITS_MAX_DIGITS, isCanonicalMinorUnits, parseMinorUnits } from '../../common/money/minor-units.js';
+import {
+  MINOR_UNITS_MAX_INT8, MINOR_UNITS_MAX_INT8_DIGITS,
+  isCanonicalMinorUnits, parseMinorUnits,
+} from '../../common/money/minor-units.js';
 
 /**
  * 额度发放的入参（C22 / D5）。
@@ -37,9 +40,13 @@ export const grantCreditsSchema: z.ZodType<GrantCreditsInput> = z.object({
   userId: z.uuid(),
   amount: z
     .string()
-    .max(MINOR_UNITS_MAX_DIGITS)
+    // ★ I3：第一条界是**位数**（便宜的前置筛），第二条界是**与 int8 上界比较**
+    //   （真正的契约上界）。此前这里是 `MINOR_UNITS_MAX_DIGITS = 100`——那是一个防 DoS 的
+    //   长度上限，而不是存储的上界，于是 19 位里大于 int8 的值会打到 Postgres 变成 500。
+    .max(MINOR_UNITS_MAX_INT8_DIGITS)
     .refine(isCanonicalMinorUnits, { message: '金额必须是规范的小单位十进制字符串（分）' })
     .transform(parseMinorUnits)
+    .refine((v) => v <= MINOR_UNITS_MAX_INT8, { message: '金额超出账本的存储上界（int8 / BIGINT）' })
     .refine((v) => v > 0n, { message: '发放额度必须为正' }),
   idempotencyKey: z.string().min(1).max(200),
 });

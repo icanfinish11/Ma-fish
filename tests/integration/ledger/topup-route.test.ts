@@ -96,6 +96,51 @@ describe('额度发放路由：POST /ledger/credits（C22 / D9 / D10 / C30）', 
     return user.id;
   }
 
+  it('★ 合同之内但**超出 int8** 的金额 ⇒ 400（不是 500）：I3 —— 声明的上界必须是库的上界', async () => {
+    // ## 它挡的缺陷形态（P2 最终全分支审查 I3）
+    //
+    // `grantCreditsSchema` 的金额上限此前是 `MINOR_UNITS_MAX_DIGITS = 100`（一个**防 DoS**
+    // 的位数上限），而 `accounts.balance` / `entries.amount` 都是 `BIGINT`（int8，上界
+    // `9223372036854775807`，19 位）。于是「合同说可以、库说不行」的那一段被放进服务层，
+    // 由 PostgreSQL 以 **22003** 拒绝，而 `ledger-error-map.ts` 没有这一档 ⇒
+    // **唯一一条造钱路由上，一个调用方的输入错误变成 500**。
+    //
+    // 判据是「状态码 + 库里一行都没有」两件事。400（不是 422）：这是**调用方给的数不对**，
+    // 与「库里的数据不可接受」是两回事（`ledger-error-map.ts` 的分档表）。
+    const userId = await realUser();
+    const key = `int8-over:${userId}`;
+    const topupBefore = await prisma.ledgerAccount.findFirst({
+      where: { kind: ACCOUNT_KINDS.EXTERNAL_TOPUP, ownerUserId: null },
+      select: { balance: true },
+    });
+    const res = await post({ userId, amount: '9223372036854775808', idempotencyKey: key }); // int8 上界 + 1，19 位
+
+    expect(res.status, `status=${String(res.status)} body=${JSON.stringify(res.body)}`).toBe(400);
+    expect(res.body.errors?.[0]?.path).toBe('amount');
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: key } })).toBe(0);
+    expect(await prisma.ledgerAccount.count({ where: { ownerUserId: userId } })).toBe(0);
+    // 系统账户那一列也一分未动（契约拒绝发生在任何 SQL 之前）。
+    expect(
+      await prisma.ledgerAccount.findFirst({
+        where: { kind: ACCOUNT_KINDS.EXTERNAL_TOPUP, ownerUserId: null },
+        select: { balance: true },
+      }),
+    ).toEqual(topupBefore);
+    // 20 位同样 400（旧的上限允许它进来，位数上限与存储上界是两条不同的界）。
+    const wide = await post({ userId, amount: '12345678901234567890', idempotencyKey: `int8-wide:${userId}` });
+    expect(wide.status, `status=${String(wide.status)} body=${JSON.stringify(wide.body)}`).toBe(400);
+    expect(wide.body.errors?.[0]?.path).toBe('amount');
+
+    // ★ 接受方向的同伴证据（同一形状的请求、同一条路由）：一个**在合同之内**的金额照常 200。
+    //   边界那一对（恰好 int8 上界 ⇒ 接受 / 上界 + 1 ⇒ 拒绝）落在单元层
+    //   （`tests/unit/ledger/dto.test.ts`）：在真库上发放 int8 上界会把**全局共享**的
+    //   EXTERNAL_TOPUP 推到 int8 下界，本文件后续每一条发放都会以 22003 溢出——
+    //   那会让这条断言的代价落到别人的用例头上。
+    const ok = await post({ userId, amount: '100', idempotencyKey: `int8-ok:${userId}` });
+    expect(ok.status).toBe(200);
+    expect(ok.body).toMatchObject({ created: true, balance: '100' });
+  });
+
   it('★ 未知用户 ⇒ 404 LEDGER_UNKNOWN_USER 且库里 0 行（C1：唯一造钱端点上的一次手误不再静默销毁额度）', async () => {
     // ## 它挡的缺陷形态（P2 最终全分支审查的 C1）
     //
