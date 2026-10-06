@@ -32,7 +32,8 @@
 -- P2 / Task 4：`ledger` 加进这一行——它是**前提**，不是可选的美化：没有 USAGE 时
 -- 下面那条 `GRANT … ON ALL TABLES IN SCHEMA ledger` 语法就通不过（schema 必须存在），
 -- 而即便它存在，运行期角色对 ledger 下的任何对象也会在解析阶段被挡。
-GRANT USAGE ON SCHEMA auth, audit, notify, asset, ledger TO app_user;
+-- P3 / Task 2：`exchange` 同款理由加进来（它由 p3 迁移创建，此刻已存在）。
+GRANT USAGE ON SCHEMA auth, audit, notify, asset, ledger, exchange TO app_user;
 
 -- ── auth：通用业务表，可读写（改密、注销需要 UPDATE/DELETE）──────
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA auth TO app_user;
@@ -158,6 +159,38 @@ REVOKE UPDATE, DELETE ON ledger.entries FROM app_user;
 GRANT SELECT, INSERT ON ledger.transactions TO app_user;
 REVOKE UPDATE, DELETE ON ledger.transactions FROM app_user;
 
+-- ── exchange：交换（P3 / Task 2；设计 §6 / §9）────────────────────────────
+-- 三张表都是**状态机表**：状态会变（`UPDATE` 必须有），但**没有任何删合约 / 删要约 /
+-- 删义务的代码路径**（没有路由、没有原语、没有 worker 任务——§6.3 的两张状态机里
+-- 没有任何一条箭头通向「删除」）。
+--
+-- ## 为什么逐表撤掉 `DELETE`（与 P2 撤 `ledger.accounts` 的 `DELETE` 同一处置）
+--   ① **没有被声明的使用者**：这个能力没有任何合法调用方；
+--   ② **删掉的合约无法被恢复**：义务行会随合约一起消失（`swap_obligations_contract_id_fkey`
+--      的 `ON DELETE RESTRICT` 会先挡住它，但那是完整性的兜底、不是可用性的保证），
+--      而不变式 #4 的右式会因此**凭空变小**——一次「删除合约」看起来像一次「义务被结清」；
+--   ③ 双角色模型的全部意义是最小权限，而这三张表上的 `DELETE` 不是最小权限。
+--
+-- ## ⚠️ 这一对语句**不能省**（P2 实测过的形态，本任务在 exchange 上重测）
+-- `GRANT … ON ALL TABLES` 会把 `DELETE` 一并授出去（P2 实测：schema 级广播之后
+-- `has_table_privilege(app_user, …, 'DELETE') = 'true'`，而 app_user **真的**删掉了那行）。
+-- 补上逐表 REVOKE 之后才拒绝、relacl 回到 `app_user=arw/vca_owner`。
+-- 见证（两层，缺一不可）：CI 的「运行期角色的权限事实」那一步查 19 项 `has_table_privilege`
+-- 与 exchange 的 relacl；`tests/integration/db/exchange-enforcement.test.ts` 再以
+-- **app_user 自己**发一次 DELETE，断言它被拒**且那一行还在**（「拒绝」本身不是判据）。
+-- **删掉下面任何一条 REVOKE 会让那两处一起变红**（探针 S-1 实测：拒绝面变成删除成功、
+-- ACL 变成 `DELETE,INSERT,SELECT,UPDATE`）。
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA exchange TO app_user;
+
+GRANT SELECT, INSERT, UPDATE ON exchange.swap_offers TO app_user;
+REVOKE DELETE ON exchange.swap_offers FROM app_user;
+
+GRANT SELECT, INSERT, UPDATE ON exchange.swap_contracts TO app_user;
+REVOKE DELETE ON exchange.swap_contracts FROM app_user;
+
+GRANT SELECT, INSERT, UPDATE ON exchange.swap_obligations TO app_user;
+REVOKE DELETE ON exchange.swap_obligations FROM app_user;
+
 -- ── 未来新建的表沿用同样默认权限 ──────────────────────────────────
 -- 放在本文件而非 roles.sql：`ALTER DEFAULT PRIVILEGES ... IN SCHEMA <名>` 要求该 schema
 -- 此刻已存在（只有属主或超级用户能执行，且 schema 必须存在），而这些 schema 由 Prisma
@@ -181,4 +214,10 @@ ALTER DEFAULT PRIVILEGES FOR ROLE vca_owner IN SCHEMA asset
 -- 必须像 `accounts` / `entries` / `transactions` 一样在下面补一条逐表 `REVOKE`——
 -- 这一行 `ALTER DEFAULT PRIVILEGES` 会把 `DELETE` 一并授予它。
 ALTER DEFAULT PRIVILEGES FOR ROLE vca_owner IN SCHEMA ledger
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_user;
+-- exchange 同 asset / ledger 的形状：三张状态机表**要可写**（状态会转），而
+-- `DELETE` 靠上面那三对逐表 `REVOKE` 例外出来。
+-- ⚠️ 因此**将来在 exchange 里新建的、不该被删的表**（例如任何 append-only 或只增不改的表）
+-- 必须像上面三张一样补一条逐表 `REVOKE`——这一行会把 `DELETE` 一并授予它。
+ALTER DEFAULT PRIVILEGES FOR ROLE vca_owner IN SCHEMA exchange
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_user;

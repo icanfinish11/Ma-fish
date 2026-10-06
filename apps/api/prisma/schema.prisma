@@ -26,7 +26,7 @@ generator client {
 // 因此**新增一个模块 schema 时，把名字加进这一行与声明它的 model 必须在同一个提交里**。
 datasource db {
   provider = "postgresql"
-  schemas  = ["auth", "audit", "notify", "asset", "ledger"]
+  schemas  = ["auth", "audit", "notify", "asset", "ledger", "exchange"]
 }
 
 // ── auth ──────────────────────────────────────────────────────────
@@ -132,6 +132,23 @@ model Asset {
   id        String   @id @default(uuid(7)) @db.Uuid
   /// 当前所有人。转让就是改**这一个指针**（§5.2 第 2 条），制品一个字节都不动。
   ownerId   String   @map("owner_id") @db.Uuid
+
+  /// ★ **交换锁定**（P3 / Task 2；设计 §6.3:284「双方均锁定（资产变为不可编辑 /
+  /// 不可另行上架 / 不可删除）」）。
+  ///
+  /// ## 为什么锁在**作品**行上，而不是合约行上
+  /// §6.3:284 那三个谓词的作用对象是**作品**。合约上的两个确认时间戳只记「谁在什么时候
+  /// 按了确认」，**两处一起**才表达得出「双方均锁定」；把锁写成合约上的一个布尔值，
+  /// 会让「这份作品现在能不能编辑」这个问题无法回答（一张作品可能同时出现在多份合约里）。
+  ///
+  /// ## 为什么是可空时间戳而不是布尔
+  /// 「锁了」与「谁在什么时候锁的」是同一个事实的两面，而排查一次锁死事故时后者才是有用的
+  /// 那个；`null` 与 `非 null` 已经提供了布尔语义，再加一列是重复表达（C16）。
+  ///
+  /// 见证：`tests/integration/db/exchange-enforcement.test.ts` 的
+  /// 「`asset.assets.locked_at`」那一条（列的形状 + 运行期角色锁得动、放得开两个方向）。
+  lockedAt DateTime? @map("locked_at") @db.Timestamptz(3)
+
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
 
   versions         AssetVersion[]
@@ -357,6 +374,220 @@ model LedgerEntry {
   /// 聚合（`AFTER ROW` 逐行触发 ⇒ 20 条腿 20 次聚合）。预检 §C.18 的实测开销
   /// （10 腿 11.4 ms / 200 腿 35.5 ms）就是在这条索引下量的。
   @@index([transactionId])
+
+  /// ★ P3 / Task 2（控制器裁定 ⑥）：**逐账户对账的使能条件**。
+  ///
+  /// P3 预检实测：逐账户对账**已经可行**（20 万行 / 1 万账户 40 ms），**但执行计划是
+  /// `Seq Scan on entries`**——`entries` 上当时只有 `entries_pkey` 与
+  /// `entries_transaction_id_idx`。为一个**已交付的功能**（Task 5 的 `reconcilePerAccount`）
+  /// 加索引不是投机抽象，是它的使能条件。
+  ///
+  /// 注意这条索引**不是**为过账路径加的：过账按账户 id 做的是**主键**条件更新，
+  /// 那条路径今天就走索引。
+  ///
+  /// 见证：`tests/integration/db/exchange-enforcement.test.ts` 的
+  /// 「`ledger.entries(account_id)` 索引在」那一条（`pg_indexes` 的 `indexdef` 逐字）。
+  @@index([accountId])
   @@schema("ledger")
   @@map("entries")
+}
+
+// ── exchange ── 交换（P3 / Task 2；设计 §6）────────────────────────────
+//
+// 三张表 + 它们的约束就是交换的全部状态：要约（谁向谁提了什么）、合约（互换的进行时）、
+// 义务（这份合约欠多少钱 —— 不变式 #4 的右式）。
+//
+// ## 刻意**没有**什么
+//   * 没有 `Listing` 表：§5.2 第 1 条说 `Asset ≠ Listing`，而 §2.1 的 P3 行只写「上架（交换）」
+//     ——「上架」在交换语境里的**全部可观测后果**就是「有一份 `ACTIVE` 的要约指向它」。
+//     为 P4 的拍卖建一张真正的 `Listing` 时再抽（C16）。
+//   * 没有 `Dispute` 表：§2.1 把「争议仲裁」归 **P6**；P3 的争议是合约上的一个状态
+//     （`DISPUTED`），D18 逐字说明了这个划界。
+//   * 没有「交换 → 拍卖升级」的任何列：§6.5 明写它 **P3.5 延后**（D15 / C16）。
+//
+// ## 没有跨 schema 外键
+// 与 `asset` / `ledger` 同一条理由（C5）：`proposer_id` / `counterparty_id` / `asset_*_id`
+// 都是别的 schema 的 UUID，归属由调用方给出的值表达，跨模块约束留在接口层。
+// 本 schema **内部**的两条外键（contract → offer、obligation → contract）都建了：
+// 它们是同一个模块自己的完整性。
+//
+// ## 手写的部分不在这个文件里（**别把 P2 的边界照抄过来，也别反过来**）
+// 三张表的表 / 列 / 索引 / 唯一约束都是 Prisma 建得出来的，因此零漂移门在这三张表上
+// **是真的见证**；但迁移里另有六条 `CHECK`（两张状态机的取值闭集 + 金额取值域 +
+// 一条条件化 CHECK），`prisma migrate diff` 对它们**结构性失明**——Task 2 用探针 S-2
+// 在本迁移上重测过（删掉一条 CHECK 之后 `migrate diff --exit-code` 照样以 0 退出）。
+// 那六条的唯一机器见证是 `tests/integration/db/exchange-enforcement.test.ts`
+// 的 `pg_get_constraintdef` 目录断言。
+
+/// 交换要约（§6.3 的第一个状态机）。
+model SwapOffer {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  /// 发起方。**必须是 `targetAssetId` 的当前所有人**（`proposeOffer` 里判，Task 6）。
+  proposerId String @map("proposer_id") @db.Uuid
+
+  /// 发起方拿出来的那件作品。
+  offeredAssetId String @map("offered_asset_id") @db.Uuid
+
+  /// 被要约的那件作品。**它的所有人 = 被要约方**（`counterpartyId` 在创建时由它派生）。
+  targetAssetId String @map("target_asset_id") @db.Uuid
+
+  /// 被要约方。冗余存一列的理由：每一次鉴权（`swapOfferSent` 条件）都要问
+  /// 「我是不是对手方」，而按 `targetAssetId` 反查 `asset.assets.owner_id` 会**跨模块**
+  /// （C5 禁止）。它是**创建那一刻的**所有人快照——作品此后转让不会改这一列，
+  /// 而那正是我们要的：要约是对**那个人**发出的。
+  counterpartyId String @map("counterparty_id") @db.Uuid
+
+  /// `DRAFT` / `SENT` / `ACCEPTED` / `REJECTED` / `WITHDRAWN` / `EXPIRED`（§6.3）。
+  /// 取值集合的定义处是 `core/types.ts`（Task 3）；迁移里有 `CHECK` 把它钉住，
+  /// **注意边界**：CHECK 保证「取值在闭集内」，**不**保证「迁移是合法的」——
+  /// 后者是 `core/state-machine.ts` 的迁移表（Task 3）。
+  status String @default("SENT")
+
+  /// 拒绝 / 撤回的理由（**原文落库**；与 `ownership_history.reason` 同一纪律：只放业务事由，
+  /// 绝不放凭证/令牌，C11）。
+  reason String?
+
+  /// 72 小时有效期（§6.3:280「EXPIRED（72 小时）」）。**由服务在创建时算出并落库**
+  /// （不是 `created_at + interval '72 hours'`）：契约是「要约在多长时间内有效」，
+  /// 而不是「72 这个魔数出现在查询里」——将来按类别给不同期限时，改的是写入侧一处。
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  /// 一份要约的 1:1 合约（`ACCEPTED` 时才存在）。
+  contract SwapContract?
+
+  /// 同一对 (作品, 对手方) 上的要约唯一。这是「重复发要约」的执行点：
+  /// 第二次同向要约撞唯一索引（P2002），而不是静默多出一行。
+  ///
+  /// **它的边界要据实写清**：
+  ///   * 它只挡 `(targetAssetId, counterpartyId)` 这一对，**不挡**同一份要约被接受两次
+  ///     （那由 `status` 的状态机守卫 + 合约上的 `offer_id` 唯一外键挡）；
+  ///   * 它带着**状态维度缺失**的代价：`REJECTED` 之后重新发要约也会撞上它。
+  ///     控制器裁定 ①（P3 计划落地时的那条）已定：唯一索引应写成**只覆盖非终态的
+  ///     部分唯一索引**（`WHERE state IN (非终态集合)`）。那是一次需要同时改 model、
+  ///     迁移与 `proposeOffer` 的改动，属 **Task 6** 的落点（本任务只建表，
+  ///     不替它选一个会改变语义的形状）。**据实记载**：今天这里是全线唯一。
+  @@unique([targetAssetId, counterpartyId])
+  @@schema("exchange")
+  @@map("swap_offers")
+}
+
+/// 交换合约（§6.3 的第二个状态机；**§6.3:294 的命题载体**）。
+model SwapContract {
+  id      String @id @default(uuid(7)) @db.Uuid
+  offerId String @unique @map("offer_id") @db.Uuid
+
+  /// 两方。`partyAId` 是被要约方（原 `targetAssetId` 的所有人），`partyBId` 是发起方——
+  /// **固定下来**，因为「谁确认过锁」是两个可空时间戳而不是一个集合。
+  partyAId String @map("party_a_id") @db.Uuid
+  partyBId String @map("party_b_id") @db.Uuid
+
+  /// 两件作品。**顺序无关**：`lockAssetIds()`（Task 3 的纯函数）负责把任何一对排成
+  /// 全局锁序（C35），业务代码不得依赖这里的先后。
+  assetAId String @map("asset_a_id") @db.Uuid
+  assetBId String @map("asset_b_id") @db.Uuid
+
+  /// `PENDING_BOTH_LOCK` / `VALIDATING` / `RELEASED` / `DISPUTED` / `SETTLED` / `CANCELLED`
+  /// （§6.3 + D18 对 `DISPUTED` 的落点说明）。CHECK 钉住闭集（见迁移）。
+  status String @default("PENDING_BOTH_LOCK")
+
+  /// 补差（**分**，`bigint`，恒 `>= 0`；方向由 `topUpPayerId` 表达，不由符号表达）。
+  /// `0` 表示等价互换。金额一律「分」且是 bigint（C3）；HTTP 边界上是十进制字符串（C22）。
+  topUpAmount BigInt @default(0) @map("top_up_amount")
+
+  /// 补差的付款方。冗余一列而不是靠正负号：`payerId` 与 `amount` 的符号是同一个事实的
+  /// 两种表达，而**负金额**会让 C3/C22 那条契约多一个必须处理的形状（`-` 前缀在
+  /// `parseMinorUnits` 里合法，但「一笔补差是负的」在业务上无意义）。
+  ///
+  /// 「有补差」与「有付款人」必须**同时**成立，两个方向都由迁移里的条件化 CHECK 挡
+  /// （一条 `CHECK` 表达两个方向的理由：它是同一个事实的两面，拆成两条会让人以为
+  /// 它们可以分别满足）。
+  topUpPayerId String? @map("top_up_payer_id") @db.Uuid
+
+  /// `PENDING_BOTH_LOCK` 的 24 小时期限（§6.3:283）。与 `SwapOffer.expiresAt` 同一理由：
+  /// 由服务在创建时算出并落库，而不是让「24」这个魔数出现在查询里。
+  lockDeadlineAt DateTime @map("lock_deadline_at") @db.Timestamptz(3)
+
+  /// 双方确认锁定（§9 的 `SwapContract confirmLock`）。null = 还没确认。
+  lockedByAAt DateTime? @map("locked_by_a_at") @db.Timestamptz(3)
+  lockedByBAt DateTime? @map("locked_by_b_at") @db.Timestamptz(3)
+
+  releasedAt DateTime? @map("released_at") @db.Timestamptz(3)
+  /// 7 天争议期的截止时刻（= `releasedAt + 7 天`）。`dueAutoConfirm` 读它（Task 3/10）。
+  disputeDeadlineAt DateTime? @map("dispute_deadline_at") @db.Timestamptz(3)
+  settledAt  DateTime? @map("settled_at") @db.Timestamptz(3)
+  cancelledAt DateTime? @map("cancelled_at") @db.Timestamptz(3)
+  disputedAt  DateTime? @map("disputed_at") @db.Timestamptz(3)
+
+  /// 争议的提出人（`DISPUTED` 时非空）。§2.1 把**裁决**归 P6，但「谁提的」是 P3 的事实。
+  disputedById String? @map("disputed_by_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  offer      SwapOffer        @relation(fields: [offerId], references: [id])
+  obligation SwapObligation?
+
+  /// 「谁在哪份合约里」这条读法（P6 的仲裁界面、以及任何「我的合约」列表）今天**没有**
+  /// 消费者，因此**不建**索引（C16）。下面这两条是被一个真实查询逼出来的：
+  /// Task 10 的计时器按 `(status, lock_deadline_at)` 与 `(status, dispute_deadline_at)`
+  /// 取到期集合，两条都是「按状态筛 + 按截止时刻排序」的形状。
+  @@index([status, lockDeadlineAt])
+  @@index([status, disputeDeadlineAt])
+  @@schema("exchange")
+  @@map("swap_contracts")
+}
+
+/// 托管义务（**P3 不变式 #4 的右式来源**；D2 / 控制器裁定 ⑤）。
+///
+/// ## 它为什么必须存在（预检 §0.3 的证伪，逐字）
+///
+/// 两个合约各锁 1000，其中一笔释放 **1500** ⇒ **接受**、ESCROW = 500（≥ 0）、
+/// `isBalanced = true`、审计如实。**平台为该合约付出了它从未为这份合约持有的 500 分，
+/// 而没有任何一条不变式看得见。** 托管只有 **1 行**账户；`entries` 只有
+/// `(id, transaction_id, account_id, amount, created_at)`；`transactions` 只有
+/// `kind/idempotency_key` ⇒ **「这笔钱属于哪份合约」在库里无处可查。**
+///
+/// 这张表就是那个「无处」。它**不记钱**（钱的唯一载体仍是账本，C27）——它记
+/// 「哪份合约欠多少钱、什么状态」，于是 `Σ PLATFORM_ESCROW ≥ Σ 未结算义务` 这条不等式
+/// （§8.3 不变式 #4）第一次有了**右式**。
+model SwapObligation {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  /// 义务的唯一身份：`('swap', contractId)`。**确定性派生**（`core/idempotency.ts`，Task 3），
+  /// 因此「同一份合约登记两次」在**数据库层**被拒 —— 这正是 D3 选的形态。
+  ///
+  /// ## ★ 控制器裁定 ⑤：链的形态是 `(producer, key)` 唯一索引，不是 `settle:` 前缀约定
+  ///
+  /// 理由逐字：那个前缀今天**五处全是注释、零检查**（`ledger.service.ts:84-102`，
+  /// 「声明了但未强制」那一类），而**唯一索引由数据库检查**，且它顺带吸收命名空间问题。
+  /// **不做前缀校验**（D8 的据实记账）：那需要先定「谁拥有哪些前缀」（一次契约变更）。
+  /// 代价如实记录：`ledger.transactions.idempotency_key` 仍是**单列**唯一索引，
+  /// 因此**账本的命名空间仍然是全局的**——P3 的键一律带 `producer` 前缀（`exchange:`），
+  /// 而账本侧那条约定**仍未变成守卫**（复访触发条件：出现第三个生产者时）。
+  ///
+  /// 见证：`tests/integration/db/exchange-enforcement.test.ts` 里那条「同一份合约登记两次
+  /// 义务 ⇒ 23505」（探针 S-3 删掉索引 ⇒ 第二次 INSERT 成功 ⇒ 那条变红）。
+  producer String
+  key      String
+
+  contractId String @unique @map("contract_id") @db.Uuid
+
+  /// 义务金额（**分**，bigint，恒 `>= 0`）。0 是合法的（等价互换不产生补差义务）。
+  amount BigInt
+
+  /// `LOCKED`（已进托管、争议期内）/ `SETTLED`（已释放）。**两个值**（D2）——
+  /// 多一个 `REVERSED` 都是多余：C31 决定了「争议裁决 = 一次冻结释放」，
+  /// 而那个动作的账本语义与 `SETTLED` 的释放**逐字相同**（都是 `ESCROW_RELEASE`）。
+  state String @default("LOCKED")
+
+  lockedAt  DateTime  @default(now()) @map("locked_at") @db.Timestamptz(3)
+  settledAt DateTime? @map("settled_at") @db.Timestamptz(3)
+
+  contract SwapContract @relation(fields: [contractId], references: [id])
+
+  @@unique([producer, key])
+  @@schema("exchange")
+  @@map("swap_obligations")
 }

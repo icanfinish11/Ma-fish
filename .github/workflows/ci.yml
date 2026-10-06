@@ -79,13 +79,19 @@ jobs:
           psql "$MIGRATE_DATABASE_URL" -v ON_ERROR_STOP=1 -f infra/db/apply-grants.sql
 
       # Ruling 1 的闭环：上一步「没报错」不等于「授权真的生效」。这里直接问 PostgreSQL
-      # **十五件事**——运行期角色**能用**什么、**不能用**什么，以及能不能碰到迁移台账。
+      # **十九件事**——运行期角色**能用**什么、**不能用**什么，以及能不能碰到迁移台账。
       #
       # 扩到 ledger（P2 / Task 4）与 asset.ownership_history（补 P1 的漏）的理由：
       # 预检实测这条断言此前**只覆盖 auth/audit 五项**，连 P1 新增的 append-only 表都不查
       # ——也就是说「ownership_history 不可改写」与「ledger 不可改写」这两条不变式在 CI 里
       # **没有见证**，只有集成用例（那是本机的，不是流水线的）。
-      # 期望值 t|t|f|f|f|f|f|t|t|f|t|f|f|f|f 的逐项含义见下面的 echo。
+      # 扩到 exchange（P3 / Task 2）的理由同款：三张状态机表**必须可写**（offers 的
+      # `UPDATE` = t 是**验收面**——把 `GRANT SELECT, INSERT, UPDATE` 收窄成只有
+      # SELECT/INSERT 时，状态机第一次转状态就 `permission denied`，而那只在生产上暴露），
+      # 而**一条删除路径都没有**（三格的 `DELETE` = f）。
+      # 期望值 t|t|f|f|f|f|f|t|t|f|t|f|f|f|f|t|f|f|f 的逐项含义见下面的 echo。
+      # （这个字符串不是手写的猜测：Task 2 的验证脚本把它**从本文件解析出来**，
+      #  对着真库跑了一遍再逐字比对，见 evidence/t2-migration-verify-*.txt。）
       #
       # 第 10 项（`ledger.accounts` 的 `DELETE` = **f**）是控制器 2026-10-06 的裁定：
       # P2 没有任何删账户的路径 ⇒ 这个能力没有合法使用者，而删掉的行恢复不回来
@@ -95,7 +101,8 @@ jobs:
       # 判」，而 `aclexplode(relacl)` 读的是**授权记录本身**。两者一起才排得掉
       # 「某台库上被人手工 GRANT 过」与「某条 REVOKE 被删掉」这两类分歧。它同时把
       # 「schema 级 ALL TABLES 广播过、随后被逐表收回」这段历史钉进证据里。
-      - name: 运行期角色的权限事实（不变式 #5 / Ruling 1 / P2 Task 4）
+      # P3 / Task 2 给 exchange 加了**同款的第二条腿**（下面第三段）。
+      - name: 运行期角色的权限事实（不变式 #5 / Ruling 1 / P2 Task 4 / P3 Task 2）
         env:
           MIGRATE_DATABASE_URL: postgresql://vca_owner:owner_pw@127.0.0.1:5432/vca
         run: |
@@ -115,11 +122,15 @@ jobs:
                    has_table_privilege('app_user','ledger.entries','UPDATE'),
                    has_table_privilege('app_user','ledger.entries','DELETE'),
                    has_table_privilege('app_user','ledger.transactions','UPDATE'),
-                   has_table_privilege('app_user','ledger.transactions','DELETE')")
-          echo "auth.users SELECT | audit_logs INSERT/UPDATE/DELETE | migrations SELECT | ownership_history UPDATE/DELETE | accounts UPDATE/INSERT/DELETE | entries INSERT/UPDATE/DELETE | transactions UPDATE/DELETE = $actual"
-          if [ "$actual" != "t|t|f|f|f|f|f|t|t|f|t|f|f|f|f" ]; then
-            echo "::error::运行期角色权限不符合预期（期望 t|t|f|f|f|f|f|t|t|f|t|f|f|f|f）：$actual"
-            echo "::error::多半是引导顺序错了（授权跑在迁移之前 → 对空 schema 静默授予零个对象），或 append-only 的 REVOKE UPDATE, DELETE 被删，或 ledger.accounts 那条 REVOKE DELETE 被删。"
+                   has_table_privilege('app_user','ledger.transactions','DELETE'),
+                   has_table_privilege('app_user','exchange.swap_offers','UPDATE'),
+                   has_table_privilege('app_user','exchange.swap_offers','DELETE'),
+                   has_table_privilege('app_user','exchange.swap_contracts','DELETE'),
+                   has_table_privilege('app_user','exchange.swap_obligations','DELETE')")
+          echo "auth.users SELECT | audit_logs INSERT/UPDATE/DELETE | migrations SELECT | ownership_history UPDATE/DELETE | accounts UPDATE/INSERT/DELETE | entries INSERT/UPDATE/DELETE | transactions UPDATE/DELETE | offers UPDATE/DELETE | contracts DELETE | obligations DELETE = $actual"
+          if [ "$actual" != "t|t|f|f|f|f|f|t|t|f|t|f|f|f|f|t|f|f|f" ]; then
+            echo "::error::运行期角色权限不符合预期（期望 t|t|f|f|f|f|f|t|t|f|t|f|f|f|f|t|f|f|f）：$actual"
+            echo "::error::多半是引导顺序错了（授权跑在迁移之前 → 对空 schema 静默授予零个对象），或 append-only 的 REVOKE UPDATE, DELETE 被删，或 ledger.accounts / exchange 三张表那些 REVOKE DELETE 被删。"
             exit 1
           fi
 
@@ -143,6 +154,28 @@ jobs:
             exit 1
           fi
 
+          # P3 / Task 2：`exchange` 的第二条腿（同款理由，同一个查询换一个 schema）。
+          # 三张状态机表必须**恰好** `INSERT,SELECT,UPDATE`——多一个 `DELETE` 就意味着
+          # 「删掉的合约无法被恢复」那条理由没有执行者。
+          # 判别力（探针 S-1 实测）：把 apply-grants.sql 里那三条 `REVOKE DELETE` 删掉之后，
+          # 这里打印 `swap_contracts=DELETE,INSERT,SELECT,UPDATE|…` 并以 `::error::` 退出 1，
+          # 而集成层那条「删不掉」的拒绝用例**同时**变红（两条腿都真的在工作）。
+          acl_exchange=$(psql "$MIGRATE_DATABASE_URL" -tA -v ON_ERROR_STOP=1 -c "
+            SELECT string_agg(c.relname || '=' || p.privs, '|' ORDER BY c.relname)
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              CROSS JOIN LATERAL (
+                SELECT COALESCE(string_agg(a.privilege_type, ',' ORDER BY a.privilege_type), '(none)') AS privs
+                  FROM aclexplode(c.relacl) a WHERE a.grantee = 'app_user'::regrole
+              ) p
+             WHERE n.nspname = 'exchange' AND c.relkind = 'r'")
+          echo "exchange relacl（app_user 的直接授权）: $acl_exchange"
+          if [ "$acl_exchange" != "swap_contracts=INSERT,SELECT,UPDATE|swap_obligations=INSERT,SELECT,UPDATE|swap_offers=INSERT,SELECT,UPDATE" ]; then
+            echo "::error::exchange 的 ACL 不符合预期（期望三张表都恰好 INSERT,SELECT,UPDATE）：$acl_exchange"
+            echo "::error::最可能的原因：apply-grants.sql 里 exchange 段的那三条 REVOKE DELETE 被删了。"
+            exit 1
+          fi
+
       # P2 / Task 1：手写 DDL（延迟约束触发器 / 条件化 CHECK）不在 Prisma 的模型里，
       # 因此「迁移被谁改过」只能靠 migrate diff 的**退出码**看。这一步必须在数据库引导
       # （migrate deploy + apply-grants）之后——它比的是**库**与**模型**，不是文件。
@@ -162,6 +195,13 @@ jobs:
       # Task 4 前置条件：`ledger` 必须已经进了 `datasource db` 的 `schemas` 数组
       # （加三个 model 时本来就要加，否则 Prisma 根本不管理 `ledger`）。两者必须在同一个
       # 提交里，否则这条门在 ledger 上是绿的**且看不见任何东西**。
+      #
+      # P3 / Task 2 补一句**实测**（P3 计划 Step 2 曾乐观地写成「本迁移整体是这条门的见证对象」，
+      # 那是错的）：`exchange` 的迁移里也有六条手写 `CHECK`，其中一条是**条件化**的；
+      # 删掉它之后这条门**照样以 0 退出**（探针 S-2 在本迁移上重测），而
+      # `tests/integration/db/exchange-enforcement.test.ts` 真的变红。
+      # ⇒ 边界与 P2 逐字相同：**Prisma 建模的那半**（三张表 / 列 / 索引 / 外键 / 唯一约束）
+      # 由这条门见证；**手写的那半**由真库的 `pg_get_constraintdef` 断言见证。
       - name: 迁移零漂移（Prisma 建模面与库一致）
         env:
           MIGRATE_DATABASE_URL: postgresql://vca_owner:owner_pw@127.0.0.1:5432/vca

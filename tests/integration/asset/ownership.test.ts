@@ -186,6 +186,14 @@ describe('asset schema：迁移落地的形状（C4 / C5 / C6）', () => {
       'assets.id:uuid',
       'assets.owner_id:uuid',
       'assets.created_at:timestamp with time zone(3)',
+      // ★ P3 / Task 2：`locked_at` 是**列全集**里新增的那一格（D10 / 设计 §6.3:284）。
+      // 它排在 `created_at` **之后**，因为迁移是一条 `ALTER TABLE … ADD COLUMN`——
+      // PostgreSQL 把新列追加在末尾（`ordinal_position` 因此是 4）。这一条**实测**过：
+      // 本断言在加列之前是绿的、加列之后立刻以
+      // `+ "assets.locked_at:timestamp with time zone?(3)"` 变红（`evidence/t2-full-test.txt`）。
+      // 两个方向都在：可空（`?`）与 `timestamptz(3)` 都由这一行钉住——把它写成非空或
+      // 裸 `timestamp` 都会让这一行红（C6 的精度与 D10 的「null = 没锁」都靠它）。
+      'assets.locked_at:timestamp with time zone?(3)',
       'ownership_history.id:uuid',
       'ownership_history.asset_id:uuid',
       'ownership_history.from_user_id:uuid',

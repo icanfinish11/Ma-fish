@@ -31,11 +31,11 @@ describe('每模块独占 schema（C5）', () => {
    * 对一个空 schema 是静默授予零个对象，不报错——所以只能靠这条断言兜住。
    * `public` 里唯一允许存在的是 Prisma 自己的迁移台账 `_prisma_migrations`。
    */
-  it('十二张业务表各归其模块 schema，且 public 里没有业务表（C5）', async () => {
+  it('十五张业务表各归其模块 schema，且 public 里没有业务表（C5）', async () => {
     const r = await owner.query(
       `SELECT table_schema, table_name
          FROM information_schema.tables
-        WHERE table_schema IN ('auth','audit','notify','asset','ledger','public')
+        WHERE table_schema IN ('auth','audit','notify','asset','ledger','exchange','public')
         ORDER BY table_schema, table_name`,
     );
     // `asset` 的四张表（P1 Task 7 / D12）与 P0 的五张一起被**精确**断言：新模块的 schema
@@ -43,11 +43,14 @@ describe('每模块独占 schema（C5）', () => {
     // 会让这里红，而那种失误在引导期**不会**报错（`GRANT ... ON ALL TABLES IN SCHEMA
     // asset` 对一个空 schema 是静默授予零个对象）。
     //
-    // P2 / Task 4：`ledger` 的三张表（P2 账本）进同一份精确断言。这里的两处登记**缺一不可**：
-    //   * 漏了上面 `IN` 列表里的 `'ledger'` ⇒ 查询根本看不到 ledger 的表，断言照样绿；
+    // P2 / Task 4：`ledger` 的三张表（P2 账本）进同一份精确断言。
+    // P3 / Task 2：`exchange` 的三张表（要约 / 合约 / 义务）进同一份精确断言。
+    // 这里的两处登记**缺一不可**：
+    //   * 漏了上面 `IN` 列表里的 `'exchange'` ⇒ 查询根本看不到 exchange 的表，断言照样绿；
     //   * 漏了下面数组里的三行 ⇒ 表被建到别的 schema（或掉进 public）时不会被发现。
-    // 「把两处一起删掉」这条变异探针演示的正是这个形态，它是本仓库反复抓到的那类
-    // 「一个能被少写一行满足的门」（`scripts/assert-tests-ran.mjs` 头部那段话）。
+    // 探针 S-4a / S-4b / S-4c 把这两句话变成实测：**只删一处 ⇒ 变红**（每一处都承重），
+    // **两处一起删 ⇒ 照样绿**（「少写两行」就能满足这个门——那正是它要防的形态，
+    // 同 `scripts/assert-tests-ran.mjs` 头部那段话）。
     expect(r.rows.map((x) => `${x.table_schema}.${x.table_name}`)).toEqual([
       'asset.asset_metadata',
       'asset.asset_versions',
@@ -56,6 +59,9 @@ describe('每模块独占 schema（C5）', () => {
       'audit.audit_logs',
       'auth.identities',
       'auth.users',
+      'exchange.swap_contracts',
+      'exchange.swap_obligations',
+      'exchange.swap_offers',
       'ledger.accounts',
       'ledger.entries',
       'ledger.transactions',
