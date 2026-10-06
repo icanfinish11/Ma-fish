@@ -527,7 +527,10 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
       new AuditService(prisma),
       versions,
     );
-    ownership = new OwnershipService(prisma);
+    // P3 / Task 2（Item 0 债务 B）：`OwnershipService` **不再持有**任何数据库客户端，
+    // 因此这里不能再传 `prisma`（传了是编译错误：构造函数收零个参数）。
+    // 「转让只能写进调用方的 tx」因此是**结构上**成立的，而不是靠这条用例记得别传。
+    ownership = new OwnershipService();
   }, 240_000);
 
   afterAll(async () => {

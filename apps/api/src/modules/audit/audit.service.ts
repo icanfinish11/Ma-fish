@@ -82,19 +82,52 @@ export class AuditService {
   /**
    * 写入一行审计。
    *
-   * ## `tx` 为什么是可选参数，以及为什么可选是安全的
+   * ## `tx` 为什么是可选参数
    *
    * 有些路径**天然不在事务里**（登录失败、登出、定时任务），把它们一律塞进事务只是
    * 仪式。因此签名是 `tx?`：传了就用调用方的事务，不传就用本服务自己的客户端。
    *
-   * **可选性的代价是「忘传」这种失误不会在类型层被发现**（`PrismaService` 与
-   * `Prisma.TransactionClient` 结构上兼容，类型挡不住——与 `OutboxService.publish`
-   * 的注释记的是同一件事）。因此真正的守卫是**测试**：
-   * `tests/integration/audit/rollback.test.ts` 的第一条，以及 Task 6 在**账本路径**上
-   * 的另一条（`tests/integration/ledger/postings.test.ts` 的「账本回滚后审计 0 行」）。
-   * 谁把 `post` 里的 `tx` 去掉，那两条会给出「审计行留下了」的明确红灯。
+   * ## ★ 但「可选」不是本方法的类型层缺口 —— `PrismaService` 那一侧被**否定约束**挡住
+   *
+   * 旧注释在这里写着「可选性的代价是『忘传』不会在类型层被发现（`PrismaService` 与
+   * `Prisma.TransactionClient` 结构上兼容，类型挡不住）」。那半句**是对的**，
+   * 但它描述的缺口**不是**「传错对象」：真正需要挡住的是
+   * `record(input, this.prisma)` —— 一个**看起来在事务里、其实不在**的调用。
+   *
+   * P2 的裁定 C-1 与 P3/Task 1 的实测（后者推翻了前者所依赖的前提）把这件事量清了：
+   *
+   * ```
+   * '$transaction' extends keyof Prisma.TransactionClient  === true
+   *   （Prisma 7.10.0 的 denylist 是 ["$connect","$disconnect","$on","$use","$extends"]；
+   *     Prisma ≤6 把 `$transaction` 放在里面 ⇒ 计划 D1 那句「它没有 $transaction」今天不成立）
+   * const tx: Prisma.TransactionClient = prismaService;     ← **编译通过**
+   * ```
+   *
+   * ⇒ **「必填」本身不是机器判据**，裸的 `Prisma.TransactionClient` 也不是：TS 的结构化
+   * 判定不惩罚多出来的成员，`PrismaService` 因此满足它。唯一的结构差异在 denylist 里
+   * 那五个成员上——`PrismaService` **有** `$connect`，事务客户端**没有**：
+   *
+   * ```
+   * const bad: Prisma.TransactionClient & { readonly $connect?: never } = prismaService;
+   *   ⇒ TS2322: Types of property '$connect' are incompatible.
+   *      Type '() => Promise<void>' is not assignable to type 'undefined'.
+   * 真实 $transaction 回调的 tx、以及 Prisma.TransactionClient 本身 ⇒ **编译通过**
+   * ```
+   *
+   * 于是「把 `this.prisma` 当 `tx` 传」是一行红波浪线，而「忘了传 `tx`」（那条被刻意
+   * 允许的形状，见上面第一段）不受影响。见证在
+   * `tests/unit/db/transaction-client-guard.test.ts`（拒绝面 + 验收对照各一条），
+   * 判别力由探针 D-A1 实测。
+   *
+   * 行为层的守卫**一条都没撤**：`tests/integration/audit/rollback.test.ts` 的第一条，
+   * 以及账本路径上的另一条（`tests/integration/ledger/postings.test.ts` 的
+   * 「账本回滚后审计 0 行」）。谁把 `post` 里的 `tx` 去掉，那两条会给出「审计行留下了」的
+   * 明确红灯——类型层那条约束管的是**另一个**失误（传错对象）。
    */
-  async record(input: AuditRecordInput, tx?: Prisma.TransactionClient): Promise<void> {
+  async record(
+    input: AuditRecordInput,
+    tx?: Prisma.TransactionClient & { readonly $connect?: never },
+  ): Promise<void> {
     const traceId = currentContext()?.traceId ?? null;
     // 三元而不是 `tx ?? this.prisma` 再取方法：写成 `const client = tx ?? this.prisma`
     // 时两个分支的类型是一个联合，Prisma 的委托签名在联合上仍然可解析，但**读的人**

@@ -1,6 +1,5 @@
 import { Injectable } from '@nestjs/common';
 import type { Prisma } from '../../generated/prisma/client.js';
-import { PrismaService } from '../../db/prisma.service.js';
 
 /**
  * 所有权转让（P1 / Task 7；设计决定 D11，设计文档 §5.2 第 2 条）。
@@ -108,6 +107,22 @@ import { PrismaService } from '../../db/prisma.service.js';
  * 两条都响亮，不会静默失效。若 `$transaction` 被移**回** denylist，本判据仍然成立，
  * 此后可以简化成裸的 `Prisma.TransactionClient`（那时 TS2578 会提示这件事）。
  *
+ * ### ★ 本类**不再持有任何数据库客户端**（P3 / Task 2 / Item 0 债务 B）
+ *
+ * 收到调用方的 `tx` 之后，`private readonly prisma: PrismaService` 这个字段
+ * **一个调用点都没有了**（实测 `this.prisma` 在方法体里零匹配）。控制器裁定**移除**它，
+ * 理由逐字：**它唯一可能的用途就是绕开调用方的事务**——也就是构造出设计 §6.3:294 所禁止
+ * 的那个缺陷（`RELEASED` 必须在单一数据库事务内完成…不留半成品所有权）的**最后一条路**。
+ * 「一个没有所有者、却能开启禁区模式的把手，不是无害残留，是一把上了膛的枪。」
+ *
+ * 这与本项目自己的标准一致（P2 记录 `no-orphans` 警告而不是加 depcruise 例外）：
+ * **结构性不可能 > 约定**。留着字段、靠「大家记得别在这里 `$transaction`」约束，
+ * 正是本仓库反复抓到的那类「声明了但未强制」；删掉之后，Task 1 探针 P-2 用来复现
+ * 预检 `[B6]` 构造的那个变异**连写都写不出来**（类里没有一个能开事务的对象）。
+ *
+ * 见证在 `tests/unit/asset/ownership-escape.test.ts`：构造函数收**零个**参数（编译期），
+ * 实例的自有属性集合**为空**（运行期，实测删之前是 `['prisma']`）；判别力由探针 D-B1 实测。
+ *
  * ### 迁移说明（给既有调用方）
  *
  * 落地时 `apps/api/src` 下**零**个生产调用点（`grep` 复核：`dist/` 与
@@ -118,14 +133,13 @@ import { PrismaService } from '../../db/prisma.service.js';
  */
 @Injectable()
 export class OwnershipService {
-  constructor(private readonly prisma: PrismaService) {}
-
   /**
    * 把作品转让给另一个用户：指针变更 + 追加一行所有权史，**在调用方的 `tx` 里**。
    *
-   * 本方法**不再自己开事务**：`this.prisma.$transaction` 在方法体里零匹配，因此
-   * 「转让有自己的 `COMMIT`」这件事在结构上不可能——外层事务回滚时，指针与历史行
-   * **一起**回滚（`tests/integration/asset/ownership.test.ts` 的两条方向用例）。
+   * 本方法**不持有**任何数据库客户端（见类注释的债务 B 一节），因此「转让自己开一个
+   * 事务、有自己的 `COMMIT`」这件事不是「约定上不该做」，而是**结构上做不到**：
+   * 外层事务回滚时，指针与历史行**一起**回滚
+   * （`tests/integration/asset/ownership.test.ts` 的两条方向用例）。
    *
    * @param tx 调用方的事务客户端。**必填**，且类型上有否定约束（`$connect`）——
    *           理由见类注释。`PrismaService` 因此**不**满足它。

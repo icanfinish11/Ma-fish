@@ -49,16 +49,34 @@ export class AdminDirectory {
    * 审计如实，而**没有任何路由或任务能花掉那笔钱**（没人能以此身份登录）——
    * 管理员的一次手误因此静默地销毁额度。它是 P2 里唯一一条外部可达的造钱路径上的缺陷。
    *
-   * ## 为什么 `tx` 是**必填**的（不是可选参数）
+   * ## ★ `tx` 必填**加上**否定约束（`& { readonly $connect?: never }`）
    *
-   * Task 2 给 `AuditService.record` 加过一个**可选**的 `tx`，控制器当时的裁定 C-1 记下了
-   * 那个形状的代价：`PrismaService` 在结构上满足 `Prisma.TransactionClient` ⇒
-   * 一次忘记传 `tx` 的调用**能编译通过**，而类型系统在这里帮不上忙。这里不重复那个形状：
-   * 参数必填，调用方必须明确说出「在哪条连接、哪个快照上问」。
+   * P2 收尾波把 `tx` 改成必填，控制器当时把它批准为「机器守卫」。**那条批准的前提是错的**
+   * （P3 / Task 1 的实测，见 `apps/api/src/modules/asset/ownership.service.ts` 的类注释与
+   * `tests/unit/db/transaction-client-guard.test.ts`）：
+   *
+   * ```
+   * '$transaction' extends keyof Prisma.TransactionClient  === true
+   * const tx: Prisma.TransactionClient = prismaService;     ← **编译通过**
+   * ```
+   *
+   * Prisma 7 把 `$transaction` 从 denylist 里移出去了，而 `PrismaService` 继承
+   * `PrismaClient`（成员更多）——TS 的结构化判定**不惩罚多出来的成员**。因此
+   * 「必填的 `tx: Prisma.TransactionClient`」挡不住 `this.prisma`：类型层允许
+   * `userExists(id, this.prisma)`，而那正是「读一个和那笔过账无关的快照」的形状。
+   *
+   * 参数类型因此写成「事务客户端 **且** 没有 `$connect`」：真实事务客户端没有 `$connect`
+   * （它在 denylist 里），而 `PrismaService` 有 ⇒ 编译期拒收，真实调用方不受影响
+   * （`ledger.service.ts` 的 `assertUserExists(tx: Prisma.TransactionClient, …)` 传进来
+   * 的那一个照样赋得进去——实测 `Prisma.TransactionClient` 满足这条约束）。
+   *
    * 传**调用方自己的事务**还有一个实际好处：这一次读与那笔过账在同一个快照里，
    * 不额外占一条连接（额度发放总是已经在一个事务里）。
    */
-  async userExists(userId: string, tx: Prisma.TransactionClient): Promise<boolean> {
+  async userExists(
+    userId: string,
+    tx: Prisma.TransactionClient & { readonly $connect?: never },
+  ): Promise<boolean> {
     const user = await tx.user.findUnique({ where: { id: userId }, select: { id: true } });
     return user !== null;
   }
