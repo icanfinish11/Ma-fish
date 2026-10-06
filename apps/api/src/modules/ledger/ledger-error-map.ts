@@ -3,6 +3,7 @@ import {
   ConflictException,
   HttpException,
   InternalServerErrorException,
+  NotFoundException,
   UnprocessableEntityException,
 } from '@nestjs/common';
 import {
@@ -17,6 +18,7 @@ import {
   SystemAccountMissingError,
   UnbalancedPostingError,
   UnknownAccountKindError,
+  UnknownUserError,
   ZeroAmountLegError,
 } from './core/errors.js';
 
@@ -29,6 +31,7 @@ import {
  * | `InsufficientFundsError` | **409** | 资源**当前状态**不允许这次过账（与 P1 的 `SelfTransferRejectedError` 同档） |
  * | `IdempotencyKeyReusedError` | **409** | 同一个键被用在**不同**的请求上（客户端的键管理错了） |
  * | `InvalidAmountError` / `InvalidFeeRateError` | **400** | 调用方给的数不对（正常路径上被 DTO 挡在前面） |
+ * | `UnknownUserError` | **404** | 这次请求引用的用户**不存在**（C1：额度不能发给一个没人能登录的账户） |
  * | `MissingAccountError` / `SystemAccountMissingError` | 500 | 服务端数据缺失（迁移没跑 / 账户该在而不在） |
  * | `UnbalancedPostingError` / `EmptyPostingError` / `ZeroAmountLegError` / `NetZeroLegError` / `SelfMoveError` | **500** | 服务端**自己的** bug（C28：这些断言的存在就是为了在这里响亮） |
  * | `UnknownAccountKindError` | 422 | 数据里出现了 §8.1 之外的 kind（C30：五个之外一律不认） |
@@ -67,6 +70,13 @@ export function ledgerErrorToHttp(error: unknown): HttpException | null {
   }
   if (error instanceof InvalidFeeRateError) {
     return new BadRequestException({ code: 'LEDGER_INVALID_FEE_RATE' });
+  }
+  if (error instanceof UnknownUserError) {
+    // 404：**这次引用**指向的用户不存在（C1）。刻意不是 400 —— `userId` 的**格式**是对的
+    // （DTO 的 `z.uuid()` 已经放行），缺的是那一行；也不是 422 —— 那在本仓库的既定含义是
+    // 「**库里的数据**本身不可接受」（`UnknownAccountKindError`）。
+    // 响应体同样只有 `code`：不回显 uuid、不吐内部 id（C11 的边界）。
+    return new NotFoundException({ code: 'LEDGER_UNKNOWN_USER' });
   }
   if (error instanceof UnknownAccountKindError) {
     // 422：**数据里**出现了 §8.1 之外的 kind（C30）。刻意不是 400——调用方交给我们的

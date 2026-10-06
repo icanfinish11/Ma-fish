@@ -2,13 +2,16 @@ import { Injectable } from '@nestjs/common';
 import { uuidv7 } from '@vca/shared';
 import { PrismaService } from '../../db/prisma.service.js';
 import { AuditService } from '../audit/index.js';
+// 跨模块引用**一律**经对方的 `index.ts`（设计 §3.3 第 2 条）——`no-cross-module-internals`
+// 由 `pnpm arch` 守着，深引 `../auth/admin-directory.service.js` 会直接报错。
+import { AdminDirectory } from '../auth/index.js';
 import {
   ACCOUNT_KINDS, accountKey, assertAccountKind, mayGoNegative, normalizeRef,
   SYSTEM_ACCOUNT_KINDS, USER_ACCOUNT_KINDS,
 } from './core/account-kind.js';
 import {
   IdempotencyKeyReusedError, InsufficientFundsError, MissingAccountError,
-  SystemAccountMissingError, UnknownAccountKindError,
+  SystemAccountMissingError, UnknownAccountKindError, UnknownUserError,
 } from './core/errors.js';
 import { applyPosting, assertBalanced, movesToLegs, sameLegs } from './core/posting.js';
 import {
@@ -85,6 +88,7 @@ export class LedgerService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    private readonly admins: AdminDirectory,
   ) {}
 
   /**
@@ -221,12 +225,31 @@ export class LedgerService {
 
   /** 额度发放：§8.1「MVP 由管理员发放虚拟额度」⇒ `DR EXTERNAL_TOPUP / CR USER_AVAILABLE`。 */
   async grantCredit(tx: Prisma.TransactionClient, input: UserAmountInput): Promise<PostingResult> {
+    await this.assertUserExists(tx, input.userId);
     return this.post(tx, {
       kind: TRANSACTION_KINDS.TOPUP,
       idempotencyKey: input.idempotencyKey,
       actorId: input.actorId ?? null,
       moves: [{ from: TOPUP_REF, to: availableRef(input.userId), amount: input.amount }],
     });
+  }
+
+  /**
+   * 收款人必须**存在**（P2 最终全分支审查 C1 的执行点）。
+   *
+   * ## 为什么它在这**一个**原语上，而不是所有原语上
+   * `grantCredit` 是五个原语里唯一**凭空造钱**的那一个：其余四个的借方都必须先有余额，
+   * 而余额只能来自一次发放 ⇒ 「钱在某人的可用账户里」这件事本身已经蕴含那个用户存在。
+   * 因此这里是唯一的入口，而把它放在**服务层**（不是控制器）意味着 P3/P4 直接调用
+   * `grantCredit` 时**继承**这道门——绕过 HTTP 也绕不过它。
+   *
+   * ## 为什么排在 `post` 之前、且用调用方的事务读
+   * 排在前面：拒绝时**一行都不写**（连账户行都不建——那正是缺陷的另一半「每个不同 uuid
+   * 永久多两行」）。用 `tx` 读：与那笔过账同一个快照、同一条连接（见 `AdminDirectory.userExists`
+   * 关于「参数必填而不是可选」的理由，那是 Task 2 裁定 C-1 记下的形状）。
+   */
+  private async assertUserExists(tx: Prisma.TransactionClient, userId: string): Promise<void> {
+    if (!(await this.admins.userExists(userId, tx))) throw new UnknownUserError(userId);
   }
 
   /**

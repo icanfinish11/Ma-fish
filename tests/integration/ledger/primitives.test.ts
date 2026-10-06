@@ -2,11 +2,12 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Client } from 'pg';
 import { uuidv7 } from '@vca/shared';
 import { AuditService } from '@vca/api/modules/audit/audit.service.js';
+import { AdminDirectory } from '@vca/api/modules/auth/admin-directory.service.js';
 import { PrismaService } from '@vca/api/db/prisma.service.js';
 import { LedgerService } from '@vca/api/modules/ledger/ledger.service.js';
 import { ACCOUNT_KINDS } from '@vca/api/modules/ledger/core/account-kind.js';
 import { TRANSACTION_KINDS } from '@vca/api/modules/ledger/core/types.js';
-import { InsufficientFundsError } from '@vca/api/modules/ledger/core/errors.js';
+import { InsufficientFundsError, UnknownUserError } from '@vca/api/modules/ledger/core/errors.js';
 import { startPostgres, type TestPg } from '../../helpers/db.js';
 
 /**
@@ -32,9 +33,15 @@ import { startPostgres, type TestPg } from '../../helpers/db.js';
  * 库里没有、也不得有 `SELLER_AVAILABLE` 这种 kind（那会让「哪些账户允许为负」这条
  * 条件化 CHECK 失去依据——它今天枚举的是 `EXTERNAL_TOPUP` 这**一个**取值）。
  *
- * ## 每个用例都用新的 `uuidv7()` 当事人 ⇒ 互不干扰、无需清理。
+ * ## 每个用例都用新的当事人（**真实的**用户，C1）⇒ 互不干扰、无需清理。
  * 系统账户（托管 / 收入 / 充值对手方）是全局共享的，因此对它们的断言一律写成
  * **前后差**，不写成绝对值。
+ *
+ * ## 为什么当事人是「真用户」而不是任意的 `uuidv7()`
+ * P2 最终审查的 **C1**：`grantCredit` 此前只校验 `userId` 的**格式**，而 `resolveAccounts`
+ * 会把 `(USER_AVAILABLE, <任意 uuid>)` 按需插进 `ledger.accounts`。于是给一个 `auth.users`
+ * 里不存在的 uuid 发额度会**成功**——账平、五条不变式全绿、对账全绿、审计如实，
+ * 而**没有任何路由或任务能花掉那笔钱**。修好之后收款人必须存在，因此这里真的建用户。
  */
 let pg: TestPg;
 let prisma: PrismaService;
@@ -44,7 +51,7 @@ beforeAll(async () => {
   pg = await startPostgres();
   prisma = new PrismaService(pg.appUri);
   await prisma.$connect();
-  ledger = new LedgerService(prisma, new AuditService(prisma));
+  ledger = new LedgerService(prisma, new AuditService(prisma), new AdminDirectory(prisma));
 }, 180_000);
 
 afterAll(async () => {
@@ -131,8 +138,47 @@ async function waitForLockWaiters(client: Client, n: number): Promise<string[]> 
 }
 
 describe('五个原语（§8.2 / §8.4）', () => {
+  it('★ 额度只能发给**存在**的用户（C1）：格式合法但库里没有的 uuid 被拒，真用户被接受', async () => {
+    // ## 它挡的缺陷形态（P2 最终全分支审查的 C1）
+    //
+    // `grantCredit` 此前对 `userId` 只做**格式**校验（DTO 的 `z.uuid()`），而
+    // `resolveAccounts` 会把 `(USER_AVAILABLE, <任意 uuid>)` 按需 `INSERT` 进
+    // `ledger.accounts`。于是给一个 `auth.users` 里**不存在**的 uuid 发额度会成功：
+    // `created=true`、`USER_AVAILABLE +100`、`EXTERNAL_TOPUP −100` —— Σ=0 成立、
+    // 五条不变式全绿、对账全绿、审计完整**且如实**，而**没有任何路由或任务能花掉这笔钱**
+    // （没人能以此身份登录）。一次管理员的手误（UUID 差一个字符）因此**静默地销毁额度**，
+    // 除了这一次发放，什么都不失败；每个不同的 uuid 还会永久留下两行。
+    // 它是 P2 里**唯一一条外部可达的造钱路径**上的缺陷。
+    //
+    // 判据是**两件事**，缺一不可：
+    //   ① 领域错误类型（`UnknownUserError`）——它让 HTTP 层能翻成 404，也让 P3 直接调用
+    //      `grantCredit` 时**继承**这道门（服务层守卫，不是控制器守卫）；
+    //   ② 库里**两行都没有**被造出来——错误类型对了但已经写进去再回滚，是另一回事。
+    const ghost = uuidv7(); // 形状合法（RFC 9562）但 auth.users 里没有这一行
+    const key = `ghost:${ghost}`;
+    await expect(
+      prisma.$transaction((tx) =>
+        ledger.grantCredit(tx, { userId: ghost, amount: 100n, idempotencyKey: key }),
+      ),
+    ).rejects.toThrow(UnknownUserError);
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: key } })).toBe(0);
+    expect(await prisma.ledgerAccount.count({ where: { ownerUserId: ghost } })).toBe(0);
+    expect(await ledger.readBalances(prisma, ghost)).toEqual({ available: 0n, frozen: 0n });
+
+    // ★ 接受方向的同伴（同一形状的调用 + 同一个入口）：一个**真的**用户 ⇒ 正常发放。
+    //   没有它，上面那三条「0」也可能只是「grantCredit 怎么都拒」。
+    const real = await realUser();
+    const okKey = `ghost-ok:${real}`;
+    await prisma.$transaction((tx) =>
+      ledger.grantCredit(tx, { userId: real, amount: 100n, idempotencyKey: okKey }),
+    );
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: okKey } })).toBe(1);
+    expect(await prisma.ledgerAccount.count({ where: { ownerUserId: real } })).toBe(1);
+    expect(await ledger.readBalances(prisma, real)).toEqual({ available: 100n, frozen: 0n });
+  });
+
   it('§8.2 行 1 / 充值：DR EXTERNAL_TOPUP CR USER_AVAILABLE，kind = TOPUP', async () => {
-    const userId = uuidv7();
+    const userId = await realUser();
     const key = `topup:${userId}`;
     await prisma.$transaction((tx) =>
       ledger.grantCredit(tx, { userId, amount: 10_000n, idempotencyKey: key, actorId: userId }),
@@ -154,7 +200,7 @@ describe('五个原语（§8.2 / §8.4）', () => {
   });
 
   it('§8.2 行 2 / 出价冻结保证金：DR USER_AVAILABLE CR USER_FROZEN，kind = FREEZE', async () => {
-    const userId = uuidv7();
+    const userId = await realUser();
     await prisma.$transaction(async (tx) => {
       await ledger.grantCredit(tx, { userId, amount: 10_000n, idempotencyKey: `topup:${userId}` });
       await ledger.freeze(tx, { userId, amount: 6_000n, idempotencyKey: `freeze:${userId}` });
@@ -168,7 +214,7 @@ describe('五个原语（§8.2 / §8.4）', () => {
   });
 
   it('解冻（「冻结与释放」的字面另一半，**不在 §8.2 六行里**）：冻结 → 可用，两步后回到原值', async () => {
-    const userId = uuidv7();
+    const userId = await realUser();
     await prisma.$transaction(async (tx) => {
       await ledger.grantCredit(tx, { userId, amount: 1_000n, idempotencyKey: `topup:${userId}` });
       await ledger.freeze(tx, { userId, amount: 1_000n, idempotencyKey: `freeze:${userId}` });
@@ -184,7 +230,7 @@ describe('五个原语（§8.2 / §8.4）', () => {
   });
 
   it('§8.2 行 4 / 成交：DR BUYER_AVAILABLE CR PLATFORM_ESCROW，kind = ESCROW_LOCK', async () => {
-    const buyerId = uuidv7();
+    const buyerId = await realUser();
     const escrowBefore = await balanceOf(ACCOUNT_KINDS.PLATFORM_ESCROW, null);
     await prisma.$transaction(async (tx) => {
       await ledger.grantCredit(tx, { userId: buyerId, amount: 10_000n, idempotencyKey: `topup:${buyerId}` });
@@ -200,8 +246,8 @@ describe('五个原语（§8.2 / §8.4）', () => {
   });
 
   it('§8.2 行 5 / 释放：托管 −10000、卖家 +9500、平台 +500（§8.4 的 5%），kind = ESCROW_RELEASE', async () => {
-    const buyerId = uuidv7();
-    const sellerId = uuidv7();
+    const buyerId = await realUser();
+    const sellerId = await realUser();
     const escrowBefore = await balanceOf(ACCOUNT_KINDS.PLATFORM_ESCROW, null);
     const revenueBefore = await balanceOf(ACCOUNT_KINDS.PLATFORM_REVENUE, null);
     await prisma.$transaction(async (tx) => {
@@ -221,8 +267,8 @@ describe('五个原语（§8.2 / §8.4）', () => {
   });
 
   it('释放的**最小反例**：gross=1 分 ⇒ 平台 1、卖家 0，`fee+net=gross` 在真库路径上同样成立', async () => {
-    const buyerId = uuidv7(); // 1 分钱的托管也能建起来（发 1 分、锁 1 分）
-    const sellerId = uuidv7();
+    const buyerId = await realUser(); // 1 分钱的托管也能建起来（发 1 分、锁 1 分）
+    const sellerId = await realUser();
     const revenueBefore = await balanceOf(ACCOUNT_KINDS.PLATFORM_REVENUE, null);
     await prisma.$transaction(async (tx) => {
       await ledger.grantCredit(tx, { userId: buyerId, amount: 1n, idempotencyKey: `topup:${buyerId}` });
@@ -240,8 +286,8 @@ describe('五个原语（§8.2 / §8.4）', () => {
   });
 
   it('释放的零腿被**丢弃**而不是写成 0：`feeBps=0` 时只有两条腿（`net` 那条）', async () => {
-    const buyerId = uuidv7();
-    const sellerId = uuidv7();
+    const buyerId = await realUser();
+    const sellerId = await realUser();
     const result = await prisma.$transaction(async (tx) => {
       await ledger.grantCredit(tx, { userId: buyerId, amount: 100n, idempotencyKey: `topup:${buyerId}` });
       await ledger.lockToEscrow(tx, { buyerId, amount: 100n, idempotencyKey: `lock:${buyerId}` });
@@ -306,8 +352,8 @@ describe('五个原语（§8.2 / §8.4）', () => {
   });
 
   it('§8.2 行 3 / 悔拍没收由**通用 post** 走通（D12：金额规则属 P4，本用例只把它当参数），kind = FORFEIT', async () => {
-    const loserId = uuidv7();
-    const sellerId = uuidv7();
+    const loserId = await realUser();
+    const sellerId = await realUser();
     const revenueBefore = await balanceOf(ACCOUNT_KINDS.PLATFORM_REVENUE, null);
     await prisma.$transaction(async (tx) => {
       await ledger.grantCredit(tx, { userId: loserId, amount: 1_000n, idempotencyKey: `topup:${loserId}` });
@@ -339,8 +385,8 @@ describe('五个原语（§8.2 / §8.4）', () => {
     // RECEIVER_AVAILABLE`），因此不需要第七个 `TRANSACTION_KINDS` 取值，也不需要一个新的
     // 包装函数（D12 / C16）——但它**必须有一条用例**，否则「够用」只是声称。
     // ★ 对应关系在这里是**可判定**的：左半句的 `kind` 与行 4 **同一个**（`ESCROW_LOCK`）。
-    const payerId = uuidv7();
-    const receiverId = uuidv7();
+    const payerId = await realUser();
+    const receiverId = await realUser();
     const escrowBefore = await balanceOf(ACCOUNT_KINDS.PLATFORM_ESCROW, null);
     const revenueBefore = await balanceOf(ACCOUNT_KINDS.PLATFORM_REVENUE, null);
     await prisma.$transaction(async (tx) => {
@@ -361,7 +407,7 @@ describe('五个原语（§8.2 / §8.4）', () => {
   });
 
   it('余额不足的冻结被拒，且库里**一行都没留下**（交易 / 审计都为 0；它们的接受对侧在同一条里）', async () => {
-    const userId = uuidv7();
+    const userId = await realUser();
     const okKey = `freeze-ok:${userId}`;
     await prisma.$transaction((tx) =>
       ledger.grantCredit(tx, { userId, amount: 100n, idempotencyKey: `topup:${userId}` }),
@@ -403,7 +449,7 @@ describe('五个原语（§8.2 / §8.4）', () => {
     //   A：另一笔解冻（同样 6000）⇒ 读到的快照是旧的 10000 ⇒ 预判放行 ⇒ 卡在那把行锁上；
     //   观察者逐字确认**等锁的语句就是那条带守卫的 UPDATE**（否则这条用例证明的不是这回事）；
     //   放行 W ⇒ A 的条件更新重新求值（4000 >= 6000 为假）⇒ count = 0 ⇒ conditional-update。
-    const userId = uuidv7();
+    const userId = await realUser();
     // 两行账户都要先建出来：`grantCredit` 建 `USER_AVAILABLE`、`freeze` 建 `USER_FROZEN`。
     // 不先建的话先到的那个请求会卡在**账户 INSERT** 上，等它提交后另一笔才读快照 ⇒
     // 由纯核心的预判拦下（`predicted`），条件更新那条路一次都走不到（Task 6 的 p1/p2 实测）。

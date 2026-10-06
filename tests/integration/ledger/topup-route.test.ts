@@ -84,8 +84,55 @@ describe('额度发放路由：POST /ledger/credits（C22 / D9 / D10 / C30）', 
     return request(app.getHttpServer()).post('/ledger/credits').set('Cookie', adminCookie).set(CSRF_HEADER, csrf).send(body);
   }
 
+  /**
+   * 一个**真的**存在于 `auth.users` 的用户（C1：发放的收款人必须存在）。
+   *
+   * 本文件此前把 `uuidv7()` 当目标用户——那正是 P2 最终审查 C1 指出的**被测试锁住的缺陷**：
+   * 那些用例断言 200 / `created:true`，于是「给不存在的 uuid 发额度」被写成了正确行为。
+   * 修好之后它们必须发给真用户（见下面那条 C1 用例的两个方向）。
+   */
+  async function realUser(): Promise<string> {
+    const user = await prisma.user.create({ data: {} });
+    return user.id;
+  }
+
+  it('★ 未知用户 ⇒ 404 LEDGER_UNKNOWN_USER 且库里 0 行（C1：唯一造钱端点上的一次手误不再静默销毁额度）', async () => {
+    // ## 它挡的缺陷形态（P2 最终全分支审查的 C1）
+    //
+    // 这条路由是 P2 里**唯一一条外部可达的造钱路径**，而它此前对 `userId` 只校验**格式**
+    // （`z.uuid()`）——`ee85cee` 那两条新见证因此是**格式**见证，不是**存在性**见证。
+    // 于是一个「形状合法、库里没有」的 uuid 会走完全程：200 + `created:true` + 库里多两行，
+    // 而**没有任何路由或任务能花掉那笔钱**。管理员的一次手误（UUID 差一个字符）静默销毁额度。
+    //
+    // 判据三条，缺一不可：
+    //   ① 状态码 404（**资源不存在**，不是 400 参数格式错、不是 422 数据不可接受——
+    //      格式是对的，缺的是那一行）；
+    //   ② 响应体**只有** `code` 一个键（C11 的边界：不回显余额、不吐内部 id）；
+    //   ③ 库里那**两行**（账户 + 交易）一行都没被造出来。
+    const ghost = uuidv7();
+    const key = `ghost:${ghost}`;
+    const res = await post({ userId: ghost, amount: '100', idempotencyKey: key });
+
+    expect(res.status, `status=${String(res.status)} body=${JSON.stringify(res.body)}`).toBe(404);
+    expect(res.body).toEqual({ code: 'LEDGER_UNKNOWN_USER' });
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: key } })).toBe(0);
+    expect(await prisma.ledgerAccount.count({ where: { ownerUserId: ghost } })).toBe(0);
+    expect(await ledger.readBalances(prisma, ghost)).toEqual({ available: 0n, frozen: 0n });
+
+    // ★ 接受方向的同伴证据（同一形状的请求、同一条路由、同一个管理员）：真用户 ⇒ 200。
+    //   没有它，上面那个 404 也可能只是「这条路由怎么都拒」。
+    const real = await realUser();
+    const okKey = `ghost-ok:${real}`;
+    const ok = await post({ userId: real, amount: '100', idempotencyKey: okKey });
+
+    expect(ok.status, `status=${String(ok.status)} body=${JSON.stringify(ok.body)}`).toBe(200);
+    expect(ok.body).toMatchObject({ created: true, balance: '100' });
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: okKey } })).toBe(1);
+    expect(await prisma.ledgerAccount.count({ where: { ownerUserId: real } })).toBe(1);
+  });
+
   it('★ >2^53：请求体是字符串、响应体的余额也是字符串，且**库里那一列**逐分无损（预检 A.2 / §G.3）', async () => {
-    const userId = uuidv7();
+    const userId = await realUser();
     const amount = '9007199254740993'; // 2^53 + 1 —— JSON number 装不下的那个数
     const res = await post({ userId, amount, idempotencyKey: `big:${userId}` });
 
@@ -100,7 +147,7 @@ describe('额度发放路由：POST /ledger/credits（C22 / D9 / D10 / C30）', 
   });
 
   it('同一个金额写成 JSON **number** ⇒ 400，且库里余额不变（C22 的执行点）', async () => {
-    const userId = uuidv7();
+    const userId = await realUser();
     const res = await post({ userId, amount: 9007199254740993, idempotencyKey: `n:${userId}` });
 
     expect(res.status, `status=${String(res.status)} body=${JSON.stringify(res.body)}`).toBe(400);
@@ -131,7 +178,7 @@ describe('额度发放路由：POST /ledger/credits（C22 / D9 / D10 / C30）', 
     // （`idempotency_key` 是 `TEXT NOT NULL`，没有非空约束）——也就是说，放它进来不会报错，
     // 只会让「第二次发放」看起来像一次重放（或反过来）。因此必须在 400 这一层拒绝。
     // 判别力：把 `.min(1)` 换成 `.min(0)`（探针 `p-dto-empty-key`）⇒ 这条红（200 ≠ 400）。
-    const userId = uuidv7();
+    const userId = await realUser();
     const res = await post({ userId, amount: '100', idempotencyKey: '' });
 
     expect(res.status, `status=${String(res.status)} body=${JSON.stringify(res.body)}`).toBe(400);
@@ -139,7 +186,7 @@ describe('额度发放路由：POST /ledger/credits（C22 / D9 / D10 / C30）', 
   });
 
   it('同键**不同金额** ⇒ 409 LEDGER_IDEMPOTENCY_KEY_REUSED，且库里没有新行、余额不变（幂等②）', async () => {
-    const userId = uuidv7();
+    const userId = await realUser();
     const key = `diff:${userId}`;
     await post({ userId, amount: '100', idempotencyKey: key }).expect(200);
 
@@ -152,7 +199,7 @@ describe('额度发放路由：POST /ledger/credits（C22 / D9 / D10 / C30）', 
   });
 
   it('同键同额重放 ⇒ 200 created=false，余额不翻倍、交易一笔、审计一行（幂等①）', async () => {
-    const userId = uuidv7();
+    const userId = await realUser();
     const key = `replay:${userId}`;
     const first = await post({ userId, amount: '100', idempotencyKey: key }).expect(200);
     expect(first.body).toMatchObject({ created: true, balance: '100' });
@@ -172,7 +219,7 @@ describe('额度发放路由：POST /ledger/credits（C22 / D9 / D10 / C30）', 
     // §13.2 要求「审计日志可完整重建任一次资金变动的链路」。这条链路是：
     //   审计行 --resourceId--> ledger.transactions --entries--> ledger.accounts
     // 因此判据不是「审计行里有几个字段」，而是**顺着这条链真的走得回去**。
-    const userId = uuidv7();
+    const userId = await realUser();
     const key = `audit:${userId}`;
     const res = await post({ userId, amount: '1234', idempotencyKey: key }).expect(200);
     const transactionId = res.body.transactionId as string;
@@ -224,7 +271,7 @@ describe('额度发放路由：POST /ledger/credits（C22 / D9 / D10 / C30）', 
     // 捕获异常之后再查一次库：拒绝发生时，那个伪造 kind 的账户行**一行都不该存在**。
     // 把第一处断言删掉（探针 `p-kind-gate`）时，`post` 会先 INSERT 那一行、再由读回时
     // 的断言抛出：错误类型完全相同，而这一句会红。
-    const userId = uuidv7();
+    const userId = await realUser();
     const key = `foreign-kind:${userId}`;
     // 这个值模拟「来自类型系统之外的数据」（库里的行、JSON、别的服务的入参）：
     // `AccountKind` 是编译期类型，而 §8.1 是**运行期**契约。

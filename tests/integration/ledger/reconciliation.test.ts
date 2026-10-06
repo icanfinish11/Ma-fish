@@ -2,6 +2,7 @@ import { Client } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { uuidv7 } from '@vca/shared';
 import { AuditService } from '@vca/api/modules/audit/audit.service.js';
+import { AdminDirectory } from '@vca/api/modules/auth/admin-directory.service.js';
 import { PrismaService } from '@vca/api/db/prisma.service.js';
 import { LedgerService } from '@vca/api/modules/ledger/ledger.service.js';
 import { LedgerReconciliationService } from '@vca/api/modules/ledger/reconciliation.service.js';
@@ -40,7 +41,8 @@ import { startPostgres, type TestPg } from '../../helpers/db.js';
  * 见 `reconciliation.service.ts` 文件头的「它看不见什么」一节。
  *
  * ## 装置
- * 每个用例用新的 `uuidv7()` 当事人 ⇒ 互不干扰；对**全局系统账户**的断言一律写成**前后差**。
+ * 每个用例用新的**真实**用户当事人（C1：`grantCredit` 的收款人必须存在于 `auth.users`）
+ * ⇒ 互不干扰；对**全局系统账户**的断言一律写成**前后差**。
  * 用例 1 用**自己的** testcontainer（它断言的是「一条分录都没有」的形态，与共享容器互相污染）。
  */
 let pg: TestPg;
@@ -52,7 +54,7 @@ beforeAll(async () => {
   pg = await startPostgres();
   prisma = new PrismaService(pg.appUri);
   await prisma.$connect();
-  ledger = new LedgerService(prisma, new AuditService(prisma));
+  ledger = new LedgerService(prisma, new AuditService(prisma), new AdminDirectory(prisma));
   recon = new LedgerReconciliationService(prisma);
 }, 180_000);
 
@@ -60,6 +62,17 @@ afterAll(async () => {
   await prisma?.$disconnect().catch(() => undefined);
   await pg?.stop();
 });
+
+/**
+ * 一个**真的**存在于 `auth.users` 的用户（C1：额度发放的收款人必须存在）。
+ *
+ * 为什么这些用例不再用 `uuidv7()` 当当事人：审查 C1 之前 `grantCredit` 会给一个
+ * `auth.users` 里不存在的 uuid 发额度（账平、五条不变式全绿、**钱永远花不掉**）。
+ */
+async function realUser(): Promise<string> {
+  const user = await prisma.user.create({ data: {} });
+  return user.id;
+}
 
 /** 某个用户账户的当前余额（`ownerUserId` 传 null 表示系统账户）。 */
 async function balanceOf(kind: string, ownerUserId: string | null): Promise<bigint> {
@@ -91,9 +104,9 @@ async function derivedBalance(accountId: string): Promise<bigint> {
 
 /** 用例 2 的六行操作序列（§8.2），返回三个当事人。 */
 async function runDesignExample(): Promise<{ buyer: string; seller: string; loser: string }> {
-  const buyer = uuidv7();
-  const seller = uuidv7();
-  const loser = uuidv7();
+  const buyer = await realUser();
+  const seller = await realUser();
+  const loser = await realUser();
   await prisma.$transaction(async (tx) => {
     await ledger.grantCredit(tx, { userId: buyer, amount: 10_000n, idempotencyKey: `recon:topup:${buyer}` });
     await ledger.freeze(tx, { userId: buyer, amount: 2_000n, idempotencyKey: `recon:freeze:${buyer}` });
@@ -193,7 +206,7 @@ describe('对账：不变式 #2（全局 Σ 余额 = 0 且 Σ 分录 = 0）', ()
     // 为什么受害者是一个**新建的**用户账户而不是随便挑一行：断言要能指认**哪一个**账户，
     // 而「恰好一条余额为 1」这种写法依赖「别的账户恰好没有 1 分」——那是一个跨用例的隐含前提。
     // 这里把它变成身份：我改的是 `victim` 的可用账户，报告里就必须出现 **victim 这一行**。
-    const victim = uuidv7();
+    const victim = await realUser();
     await prisma.$transaction((tx) =>
       ledger.grantCredit(tx, { userId: victim, amount: 7n, idempotencyKey: `recon:victim:${victim}` }),
     );
@@ -237,7 +250,11 @@ describe('对账：不变式 #2（全局 Σ 余额 = 0 且 Σ 分录 = 0）', ()
   it('余额非零的**系统**账户不得被当成异常（`PLATFORM_*` / `EXTERNAL_TOPUP` 天然为负）', async () => {
     // 判据只有两个量：`nonzeroAccounts` 是**给人看的**，不是判据。
     // 这条用例把这件事写死，免得下一个人把「有非零账户」当成失败条件。
-    const userId = uuidv7();
+    // ★ P2 最终审查 I1 的措辞更正：「系统账户天然为负」这句话**只对注入端成立**——
+    //   `PLATFORM_ESCROW` / `PLATFORM_REVENUE` 今天不允许为负（`mayGoNegative()` 的名单
+    //   恰好只有 `EXTERNAL_TOPUP`）。本用例真正说的是「非零**不是**失败条件」，
+    //   负余额这一半由读路径**原样报出来**（正是这条断言看的东西）。
+    const userId = await realUser();
     await prisma.$transaction((tx) =>
       ledger.grantCredit(tx, { userId, amount: 1n, idempotencyKey: `recon:system-visible:${userId}` }),
     );
@@ -254,8 +271,8 @@ describe('对账：不变式 #2（全局 Σ 余额 = 0 且 Σ 分录 = 0）', ()
     // 全局零和是**一个数**。它只能发现「总量上多出/少了钱」，发现不了「钱被搬到了别的账户上」。
     // 这条用例把那个边界变成可判定的，并且**同时证明漂移真的发生了**（否则「对账说平衡」
     // 在「其实什么都没改」的世界里同样成立——那正是本文件开头说的那种空转）。
-    const a = uuidv7();
-    const b = uuidv7();
+    const a = await realUser();
+    const b = await realUser();
     await prisma.$transaction(async (tx) => {
       await ledger.grantCredit(tx, { userId: a, amount: 1_000n, idempotencyKey: `recon:drift-a:${a}` });
       await ledger.grantCredit(tx, { userId: b, amount: 1_000n, idempotencyKey: `recon:drift-b:${b}` });
@@ -363,8 +380,8 @@ describe('对账：不变式 #2（全局 Σ 余额 = 0 且 Σ 分录 = 0）', ()
     //    所以判据必须是「**每一条**的余额都不为 0」。
     // ② 「稳定排序」——报告是给人做 diff 的，同一状态两次读出来的顺序必须一致。
     // 自带的非空转前提：先用两个新当事人造出至少两行非零余额，否则 `every(...)` 在空数组上恒真。
-    const a = uuidv7();
-    const b = uuidv7();
+    const a = await realUser();
+    const b = await realUser();
     await prisma.$transaction(async (tx) => {
       await ledger.grantCredit(tx, { userId: a, amount: 5n, idempotencyKey: `recon:shape-a:${a}` });
       await ledger.grantCredit(tx, { userId: b, amount: 9n, idempotencyKey: `recon:shape-b:${b}` });

@@ -59,6 +59,25 @@ export class UnknownAccountKindError extends Error {
     this.name = 'UnknownAccountKindError';
   }
 }
+/**
+ * 引用的用户**不存在**（P2 最终全分支审查 C1）。
+ *
+ * ## 为什么它与 `UnknownAccountKindError`（422）分开
+ * 那个说的是「**库里的数据**出现了 §8.1 之外的取值」——不可接受的是**数据**；
+ * 这个说的是「**你这次请求**指向了一个不存在的用户」——不可接受的是**这次引用**。
+ * HTTP 层因此是 **404**：不是 400（`userId` 的**格式**是对的，缺的是那一行），
+ * 也不是 422（本仓库给 422 的含义是「数据本身不可接受」，见 `ledger-error-map.ts`）。
+ *
+ * ## 它挡的是什么（一句话）
+ * 一次管理员的手误（UUID 差一个字符）此前会**静默地销毁额度**：那笔钱记进了一个没人能
+ * 登录的账户，永远花不掉，而所有不变式、对账与审计都是绿的。
+ */
+export class UnknownUserError extends Error {
+  constructor(readonly userId: string) {
+    super(`用户不存在：${userId}——额度不能发给一个不存在的账户（没人能以此身份登录，这笔钱永远花不掉）`);
+    this.name = 'UnknownUserError';
+  }
+}
 export class SystemAccountMissingError extends Error {
   constructor(readonly kind: string) {
     super(`系统账户不存在：${kind}——迁移没跑？（D2：系统账户只由迁移种子化）`);

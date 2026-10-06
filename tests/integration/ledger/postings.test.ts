@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Client } from 'pg';
 import { uuidv7 } from '@vca/shared';
 import { AuditService } from '@vca/api/modules/audit/audit.service.js';
+import { AdminDirectory } from '@vca/api/modules/auth/admin-directory.service.js';
 import { PrismaService } from '@vca/api/db/prisma.service.js';
 import { LedgerService } from '@vca/api/modules/ledger/ledger.service.js';
 import { TRANSACTION_KINDS } from '@vca/api/modules/ledger/core/types.js';
@@ -137,7 +138,7 @@ beforeAll(async () => {
   pg = await startPostgres();
   prisma = new PrismaService(pg.appUri);
   await prisma.$connect();
-  ledger = new LedgerService(prisma, new AuditService(prisma));
+  ledger = new LedgerService(prisma, new AuditService(prisma), new AdminDirectory(prisma));
 }, 180_000);
 
 afterAll(async () => {

@@ -13,6 +13,7 @@ import {
   SystemAccountMissingError,
   UnbalancedPostingError,
   UnknownAccountKindError,
+  UnknownUserError,
   ZeroAmountLegError,
 } from '@vca/api/modules/ledger/core/errors.js';
 
@@ -112,6 +113,12 @@ const ROWS: Row[] = [
     code: 'LEDGER_SELF_MOVE',
   },
   {
+    label: 'UnknownUserError（C1：这次请求引用的用户不存在）',
+    error: () => new UnknownUserError('01920000-0000-7000-8000-0000000000ff'),
+    status: 404,
+    code: 'LEDGER_UNKNOWN_USER',
+  },
+  {
     label: 'UnknownAccountKindError（C30：数据里出现了 §8.1 之外的 kind）',
     error: () => new UnknownAccountKindError('SELLER_AVAILABLE'),
     status: 422,
@@ -134,8 +141,10 @@ describe('领域错误 → HTTP 的翻译表（唯一出口）', () => {
 
   it('两张表不许撞码：每一档的 `code` 两两不同（撞码 = 责任方再也分不开）', () => {
     const codes = ROWS.map((row) => row.code);
-    // 非空转前提：先证明这一组确实有 12 档（否则「两两不同」在空数组上恒真）。
-    expect(codes).toHaveLength(12);
+    // 非空转前提：先证明这一组确实有 13 档（否则「两两不同」在空数组上恒真）。
+    // 12 → 13 是 P2 最终审查 C1 加的 `UnknownUserError`（404）；这条下限的用途正是
+    // 「表里少了一档时必须红一次」，因此它跟着表一起改，不许单独放宽。
+    expect(codes).toHaveLength(13);
     expect(new Set(codes).size).toBe(codes.length);
     // 再看运行期：每一种错误实例真的翻译出上表里那个 code（而不是只在表面上不同）。
     const actual = ROWS.map((row) => (ledgerErrorToHttp(row.error())?.getResponse() as { code: string }).code);

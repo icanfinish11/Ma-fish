@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import type { INestApplication } from '@nestjs/common';
-import { ROLES, uuidv7 } from '@vca/shared';
+import { ROLES } from '@vca/shared';
 import { CSRF_COOKIE, CSRF_HEADER } from '@vca/api/common/security/csrf.middleware.js';
 import { SESSION_COOKIE } from '@vca/api/common/http/cookie.js';
 import { PrismaService } from '@vca/api/db/prisma.service.js';
@@ -40,7 +40,8 @@ import { startTestRedis, type TestRedis } from '../../helpers/redis.js';
  *
  * ## 每个用例自带当事人（不依赖用例之间的执行顺序）
  *
- * 每个用例用**新**的 `uuidv7()` 目标用户与**新**的幂等键，因此 `-t` 单独点一条也能过。
+ * 每个用例用**新**的**真实**目标用户（C1：`grantCredit` 的收款人必须存在于 `auth.users`）与
+ * **新**的幂等键，因此 `-t` 单独点一条也能过。
  * 余额断言因此永远是「这一条注入之后的绝对值」，不是跨用例累加出来的数。
  *
  * ## 限流在**本文件**被显式关掉（复用 P0 的开关，不是发明一个）
@@ -96,6 +97,19 @@ describe('越权矩阵：ledger 的额度发放路由 × 每个角色（§9 / �
     await redis?.stop();
   });
 
+  /**
+   * 一个**真的**存在于 `auth.users` 的用户（C1：额度发放的收款人必须存在）。
+   *
+   * 本文件此前把 `uuidv7()` 当目标用户，并在「管理员 ⇒ 200 created=true」与那条重放用例里
+   * 断言 `created:true`——**那正是把缺陷写成正确行为**（审查 C1）。拒绝那两条（匿名 / 非管理员）
+   * 的目标用户是谁都不影响（守卫在处理器之前就拒了），但为了整份矩阵只有一种当事人形状，
+   * 这里一律用真用户：这样「被拒绝不留行」那几句也不会因为目标用户不存在而变成同义反复。
+   */
+  async function realUser(): Promise<string> {
+    const user = await prisma.user.create({ data: {} });
+    return user.id;
+  }
+
   /** 发一次额度发放（写路由必须带 CSRF 头，双提交令牌两处都要有）。 */
   function grant(cookie: string, body: Record<string, unknown>): request.Test {
     return request(app.getHttpServer()).post('/ledger/credits').set('Cookie', cookie).set(CSRF_HEADER, csrf).send(body);
@@ -114,7 +128,7 @@ describe('越权矩阵：ledger 的额度发放路由 × 每个角色（§9 / �
   }
 
   it('匿名 ⇒ 403 需要登录（守卫要求身份，资源判定还没开始）', async () => {
-    const target = uuidv7();
+    const target = await realUser();
     const key = `m-anon:${target}`;
     const res = await grant(cookies.anonymous, { userId: target, amount: '100', idempotencyKey: key });
 
@@ -125,7 +139,7 @@ describe('越权矩阵：ledger 的额度发放路由 × 每个角色（§9 / �
   });
 
   it('已登录非管理员 ⇒ 403（条件 `ledgerAdminGrant` 为假），库里没有任何行', async () => {
-    const target = uuidv7();
+    const target = await realUser();
     const key = `m-stranger:${target}`;
     const res = await grant(cookies.stranger, { userId: target, amount: '100', idempotencyKey: key });
 
@@ -134,14 +148,14 @@ describe('越权矩阵：ledger 的额度发放路由 × 每个角色（§9 / �
     expect(res.body.message).toBe('该资源未被授权访问');
     expect(await countTransactionsFor(key)).toBe(0);
     // ★ 同伴证据（同一查询形状，一次**被接受**的发放）：
-    const control = uuidv7();
+    const control = await realUser();
     const controlKey = `m-stranger-control:${control}`;
     await grant(cookies.admin, { userId: control, amount: '100', idempotencyKey: controlKey }).expect(200);
     expect(await countTransactionsFor(controlKey), '那个查询形状本身是坏的（对已提交的发放也返回 0）').toBe(1);
   });
 
   it('管理员 ⇒ 200，created=true，余额增加（正面对照：矩阵不能「怎么都拒」）', async () => {
-    const target = uuidv7();
+    const target = await realUser();
     const key = `m-admin:${target}`;
     const res = await grant(cookies.admin, { userId: target, amount: '100', idempotencyKey: key });
 
@@ -153,7 +167,7 @@ describe('越权矩阵：ledger 的额度发放路由 × 每个角色（§9 / �
   });
 
   it('管理员同键重放 ⇒ 200 created=false，余额**没有翻倍**，且只有一笔交易与一行审计', async () => {
-    const target = uuidv7();
+    const target = await realUser();
     const key = `m-replay:${target}`;
     const first = await grant(cookies.admin, { userId: target, amount: '100', idempotencyKey: key }).expect(200);
     expect(first.body).toMatchObject({ created: true, balance: '100' });
