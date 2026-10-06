@@ -60,10 +60,11 @@
 | 而预览是**按版本**出的（`PreviewManifest.assetVersionId`） | P3 计划行 3840 |
 | 版本级摘要**已经存在但没被用**：`AssetVersion.sha256`（明文 sha256，上传时算出） | `apps/api/prisma/schema.prisma:171` |
 | 上传新版本的路径不在 P3 的改动半径内，且 `locked_at` 在整个 `apps/` 下**零读取者** | `grep lockedAt\|locked_at` over `apps/` ⇒ 0 匹配；P3 计划文件结构未列 `asset-version.service.ts` |
+| **今天根本没有任何「往已有作品加版本」的生产路径**（比上一条更强）：`POST /assets/upload` 只创建**新**作品，而 `persistIngested({ assetId })` 那一条分支**零生产调用方**——文件头自己写着这件事（"`persistIngested` 一直没有生产调用方……因此多了一种入参形态 `{ ownerId }`"），今天只有 `tests/` 在调它 | `apps/api/src/modules/asset/asset-version.service.ts:23-26`；生产侧唯一调用点是 `apps/api/src/modules/asset/asset.service.ts:319` 的 `{ ownerId }` 形态；`{ assetId }` 的调用点全在 `tests/integration/asset/` 与 `tests/security/asset/` |
 | 释放事务只转让作品、不做任何内容核对 | P3 计划行 3599–3680 的 `releaseContract` |
 
 ⇒ 「交付的就是判过的那一份」既没有**承诺**，也没有**证据**。用户担心的「维权难」，一半难在这里无据可查。
-**（据实记好消息）**：版本今天**不可删**（`delete` 只存在于制品存储的清理路径），所以「预览的版本被删掉」这一类攻击今天不成立；这条取证的意义是**证据**（争议可重建），不是拦截。
+**（据实记两条好消息）**：版本今天**不可删**（`delete` 只存在于制品存储的清理路径），所以「预览的版本被删掉」这一类攻击今天不成立；而且**「看 v1、交 v2」今天根本没有路**（上面第三行）——本条取证的意义因此是**证据与将来**：一旦那条写入路径有了调用方，它必须已经带着锁检查，而不是等人想起来。
 
 ### 2.3 售后对「纯等值互换」是空的
 
@@ -327,7 +328,7 @@ unlockAssets    只在两个终态之一：SETTLED（含 RESOLVED_*）或 CANCEL
 **必须落地的三件事**：
 
 1. **`CANCELLED` 与 `SETTLED` 两个终态都要解锁** —— 今天计划里 `unlockAssets` **零调用方**（§2.4），不修就是「作品永久卡死」。
-2. **上传路径要检查 `locked_at`** —— §6.3:284 的「不可编辑」今天没有任何执行点。
+2. **唯一的版本写入边界要检查 `locked_at`** —— 落点是 `AssetVersionService.persistIngested` 的 `{ assetId }` 分支（`asset-version.service.ts:94-130`），那是**唯一**能把版本加到一件已存在作品上的写入点。**据实记载：它今天零生产调用方**（§2.2 第三行），所以这条检查的验收面是**服务层的集成用例**，不是 HTTP 用例。放它的理由是本项目自己的标准——**结构性不可能 > 约定**：等那条路径第一次有调用方时，锁已经在它里面了。
 3. **`RELEASED` 之后、争议期内不解锁** —— 这正是 §7.2「不可判定时押金保持冻结」在作品侧的对应物：`proposeOffer` 已经拒被锁定的作品（P3 计划行 2973），因此**欺诈方在争议期内无法把刚到手的作品再换出去**。
 
 **复访触发条件**：P4 的拍卖路径落地时，必须把同一条检查接上（`locked_at` 非空 ⇒ 不得上架/成交），否则 lien 会在拍卖那一侧漏掉。这一条要写进 P4 的计划前言。
@@ -348,7 +349,7 @@ unlockAssets    只在两个终态之一：SETTLED（含 RESOLVED_*）或 CANCEL
 | Task 4（账本执行者） | 已合并 `b606caf`（+ `d949389` 门下限扩展） | 罚没形状的过账用例归**增量 B** 的测试面（`FORFEIT` 已在 kind 闭集，**不改 kind 表**） |
 | **Task 5**（对账 / worker） | **进行中，不得打断** | 逐账户对账的口径说明：押金属 `USER_FROZEN`，**不进**托管义务（增量 B 会用到）。若它落地时增量 A 未生效，则在同一处补一条小附录 |
 | **Task 6**（要约） | 未实现 | `claims` 的闭集校验与存储（§6）；**钉住 `pinned*` / `dossierDigest*` + 接受请求带回承诺（TOCTOU）**（D1 / §5.1）；`stakeFloor` 的基线计算（增量 B 消费）；lien 检查（已有 `AssetLockedError`） |
-| **Task 7**（双锁） | 未实现 | **上传路径的 `locked_at` 检查**（§10 第 2 条 —— 与 `lockAssets` 同一处落地，锁的语义在这里被定义）；钉住与校验**不在本任务**（分别在 Task 6 与 Task 8），本任务不为它增加任何动作 |
+| **Task 7**（双锁） | 未实现 | **版本写入边界的 `locked_at` 检查**（§10 第 2 条）：`persistIngested` 的 `{ assetId }` 分支 —— 与 `lockAssets` 同一处落地，锁的语义在这里被定义；**零生产调用方 ⇒ 验收面是集成用例**。钉住与校验**不在本任务**（分别在 Task 6 与 Task 8） |
 | **Task 8**（原子释放） | 未实现 | 释放前的钉住值校验（§5.2 校验点 1） |
 | **Task 9**（预览） | 未实现 | `canonicalizeDossier()` + `dossierDigest`（§5.1）；`codeLines` 落列（把今天「诚实的 `null`」改成真值）；dossier 每项的 `source` 标注（§5.3） |
 | **Task 10**（结算 / 争议） | 未实现 | **解锁点**：`SETTLED`（含到期自动确认）与 `CANCELLED` 两个终态都解锁（§10 第 1 条） |
@@ -397,7 +398,8 @@ unlockAssets    只在两个终态之一：SETTLED（含 RESOLVED_*）或 CANCEL
 - [ ] 五条断言各自有「声明为真 ⇒ 通过」与「声明为假 ⇒ 违约成立」两条用例；每条断言配一条**变异探针**（把它弄坏、看它变红、再改回来）
 - [ ] dossier 的每一项都带 `source`；越权矩阵中不得出现把 `author` 项当作平台产出呈现的路径
 - [ ] `unlockAssets` 有真实调用方（`SETTLED` / `CANCELLED`），且 `CANCELLED` 后作品可以再次发要约（端到端）
-- [ ] 上传路径拒绝被 `locked_at` 锁定的作品（拒绝面 + 验收对照）
+- [ ] `persistIngested({ assetId })` 为一件被锁定的作品写入版本时**拒绝**（拒绝面 + 验收对照；服务层集成用例，理由见 §10 第 2 条）
+- [ ] `asset_metadata` 的**列全集断言**按预期变红一次，然后逐字更新（`tests/integration/asset/ownership.test.ts:151-196`，`locked_at` 那一格就是先例）
 
 **增量 B**（P3.5 的验收，先列形状，细节由它自己的计划给出）
 
