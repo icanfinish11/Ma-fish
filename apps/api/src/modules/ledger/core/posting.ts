@@ -83,6 +83,13 @@ export function applyPosting(accounts: readonly AccountSnapshot[], legs: readonl
  * 顺序无关（按 accountId 排序后逐项比较）——腿的生成顺序取决于 `Map` 的插入顺序，
  * 而「同一笔」这件事与顺序无关；把它写成顺序敏感会让一个**合法重放**变成 409
  * （调用方拿到一个它无法理解的冲突，而交易其实已经在库里了）。
+ *
+ * ## ★ 它**不是**完整的重放判别式（据实划界，P2 审查 I2）
+ * 它只回答「腿一不一样」。「同一个请求」还包含 **`kind`**，而 `kind` 不住在腿上
+ * （库里在 `ledger.transactions.kind`）⇒ 判别式的另一半由调用方补：
+ * `LedgerService.postLegs` 里的 `existing.kind === request.kind`。**两者缺一不可**：
+ * 少了这一半，同键 + 同腿 + 不同 kind 会被回成 `created:false` 与**库里那一笔的 id**，
+ * 于是调用方以为它的 `FORFEIT` 生效了，而账本里是 `TOPUP`。
  */
 export function sameLegs(
   a: readonly { accountId: string; amount: bigint }[],

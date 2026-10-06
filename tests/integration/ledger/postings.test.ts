@@ -216,6 +216,51 @@ describe('过账：LedgerService.post（C25 / C26 / C28 / D9 / D10）', () => {
     expect(await prisma.ledgerEntry.count({ where: { transactionId: first.transactionId } })).toBe(2);
   });
 
+  it('★ 幂等②′：同键、**同一组腿**、但 `kind` 不同 ⇒ 抛 IdempotencyKeyReusedError（D9 的判别式里 kind 是承重的）', async () => {
+    // ## 它挡的缺陷形态（P2 最终全分支审查的 I2，`sameLegs` 只看 `(accountId, amount)`）
+    //
+    // `postLegs` 的重放判定此前只比**腿**，而 `findUnique` 连 `kind` 都没 select。于是
+    // **同键 + 同腿 + 不同 kind** 会被判成一次「重放」，返回**库里那一笔的 id** 与
+    // `created:false`——调用方以为自己的 `FORFEIT` 已经落账，而账本里躺着的是 `TOPUP`。
+    // 五个原语到不了这里（它们的腿形状两两不同），但**通用 `post` 到得了**：§8.2 第 3/6 行
+    // 正是 P4 用调用方自选的键走这条门（D12），而 D9 的契约原文是「**同一个键 + 同一个请求**」
+    // ——`kind` 是这个「请求」里的一部分，缺了它，判别式就少一个维度。
+    //
+    // 两条方向都在：拒绝（异 kind）之后紧跟**接受**（同 kind 同腿 ⇒ 真的重放），否则
+    // 上面那条 409 也可能只是「这个键怎么都拒」。
+    const userId = uuidv7();
+    const key = `kind-conflict:${userId}`;
+    const moves = [{ from: topup, to: available(userId), amount: 100n }] as const;
+    const first = await prisma.$transaction((tx) =>
+      ledger.post(tx, { kind: TRANSACTION_KINDS.TOPUP, idempotencyKey: key, moves }),
+    );
+    const mark = await footprintOf(first.transactionId);
+    expect(mark).toEqual({ entries: 2, audits: 1 });
+
+    // ① **拒绝方向**：腿逐条相同，只有 kind 不同。
+    await expect(
+      prisma.$transaction((tx) =>
+        ledger.post(tx, { kind: TRANSACTION_KINDS.FORFEIT, idempotencyKey: key, moves }),
+      ),
+    ).rejects.toThrow(IdempotencyKeyReusedError);
+    // 库里那一笔**仍是 TOPUP**、行数一元未增（没有第二笔，也没有被改写）：
+    const stored = await prisma.ledgerTransaction.findUnique({ where: { idempotencyKey: key }, select: { kind: true, id: true } });
+    expect(stored?.kind).toBe(TRANSACTION_KINDS.TOPUP);
+    expect(stored?.id).toBe(first.transactionId);
+    expect(await footprintOf(first.transactionId)).toEqual(mark);
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: key } })).toBe(1);
+    expect(await ledger.readBalances(prisma, userId)).toEqual({ available: 100n, frozen: 0n });
+
+    // ② **接受方向**（同一形状的请求、同一个 entry point）：同键 + 同腿 + **同 kind** ⇒ 重放。
+    //    没有这一句，「同键必拒」也能骗过上面那条。
+    const replay = await prisma.$transaction((tx) =>
+      ledger.post(tx, { kind: TRANSACTION_KINDS.TOPUP, idempotencyKey: key, moves }),
+    );
+    expect(replay).toMatchObject({ created: false, transactionId: first.transactionId });
+    expect(await footprintOf(first.transactionId)).toEqual(mark);
+    expect(await ledger.readBalances(prisma, userId)).toEqual({ available: 100n, frozen: 0n });
+  });
+
   it('幂等③：3 个并发同键请求 ⇒ 恰好 1 个 created=true、其余 created=false、库里恰好 1 笔交易', async () => {
     // **这一条断言的是结果，不是路径。** 计划原本写着它「行使的是 runWithIdempotentRetry 的
     // P2002 路径（预检 C.5：3 并发 → 1 成功 / 2 × P2002）」——**实测不是**：这里用的是全新的

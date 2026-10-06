@@ -155,12 +155,23 @@ export class LedgerService {
 
     const existing = await tx.ledgerTransaction.findUnique({
       where: { idempotencyKey: request.idempotencyKey },
-      select: { id: true, entries: { select: { accountId: true, amount: true } } },
+      select: { id: true, kind: true, entries: { select: { accountId: true, amount: true } } },
     });
     if (existing) {
       // 同键同腿 = 重放（**不是**静默去重：调用方拿到 created:false，这是它需要知道的事实）。
       // 比腿用的是纯核心的 `sameLegs`（顺序无关）——顺序敏感会让一个合法重放变成 409。
-      if (sameLegs(existing.entries, legs)) return { transactionId: existing.id, created: false };
+      //
+      // ## ★ `kind` 是判别式里承重的一维（P2 最终全分支审查 I2 的落点）
+      //
+      // 只比腿不算重放：`kind` **不在**腿上，因此「同键 + 同腿 + 不同 kind」曾被判成一次重放，
+      // 返回**库里那一笔的 id** 与 `created:false`——调用方以为自己的 `FORFEIT` 落了账，
+      // 而账本里躺着的是 `TOPUP`。五个原语到不了那里（腿形状两两不同，审查逐对核过），
+      // 但**通用 `post` 到得了**：§8.2 的第 3 / 6 行正是 P4 带着调用方自选的键走这条门（D12）。
+      // 而 D9 的契约原文是「**同一个键 + 同一个请求**」——`kind` 属于那个请求。
+      // 见证：`postings.test.ts` 的「幂等②′」（同键同腿异 kind ⇒ 409，同 kind ⇒ 重放）。
+      if (existing.kind === request.kind && sameLegs(existing.entries, legs)) {
+        return { transactionId: existing.id, created: false };
+      }
       throw new IdempotencyKeyReusedError(request.idempotencyKey);
     }
 
