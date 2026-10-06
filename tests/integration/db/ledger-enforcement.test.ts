@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { Client } from 'pg';
+import { ACCOUNT_KINDS, NEGATIVE_ALLOWED_KINDS } from '@vca/api/modules/ledger/core/account-kind.js';
 import { startPostgres, type TestPg } from '../../helpers/db.js';
 
 /**
@@ -170,10 +171,18 @@ describe('账本的数据库强制点（不变式 #1 / #3 / #4 / #5）', () => {
     const nonneg = byName.get('accounts_nonneg_by_kind') as string;
     expect(nonneg).toContain('EXTERNAL_TOPUP');
     expect(nonneg).toMatch(/balance\s*>=\s*0/);
-    // ★ 名单的**排他性**：四个「可能被透支」的 kind 一个都不许出现在允许名单里。
-    //   只断言「出现了 EXTERNAL_TOPUP」是不够的——一个 `kind <> 'X' OR balance >= 0`
-    //   的写法照样含它，却把别的 kind 全放行了。
-    for (const kind of ['USER_AVAILABLE', 'USER_FROZEN', 'PLATFORM_ESCROW', 'PLATFORM_REVENUE']) {
+    // ★ 名单的**排他性**，判据**从代码派生**（不是在这里再抄一份）：
+    //   ① 代码里那个唯一名单恰好只有注入端一个 kind（多一个都要有人显式改这条断言）；
+    //   ② §8.1 的**每一个** kind，只要不在那个名单里，就**不许**出现在 CHECK 的允许名单里
+    //      ——将来加第六个 kind 时这一条自动覆盖它，不会漏。
+    //   这同时是「两处逐字同一条规则」这句话的机器判据（代码侧 = `mayGoNegative()`，
+    //   库侧 = 这条 CHECK）。只断言「出现了 EXTERNAL_TOPUP」是不够的——一个
+    //   `kind <> 'X' OR balance >= 0` 的写法照样含它，却把别的 kind 全放行了。
+    expect(NEGATIVE_ALLOWED_KINDS, '允许为负的名单变了：这是一次需要显式决定的改动').toEqual([
+      ACCOUNT_KINDS.EXTERNAL_TOPUP,
+    ]);
+    for (const kind of Object.values(ACCOUNT_KINDS)) {
+      if (NEGATIVE_ALLOWED_KINDS.includes(kind)) continue;
       expect(nonneg, `允许为负的名单里不该出现 ${kind}（I1：只有注入端可以天然为负）`).not.toContain(kind);
     }
     expect(byName.get('entries_amount_nonzero')).toMatch(/amount\s*<>\s*0/);
