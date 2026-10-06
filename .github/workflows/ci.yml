@@ -265,8 +265,11 @@ jobs:
       # `::error::exchange-core：只执行了 46 条…` 且退出 1；把文件改名搬走 ⇒ 同样以
       # `::error::<组名>` 退出 1；而把一个**作用域之外**的文件搬走 ⇒ 照样绿（证明它是按
       # 路径跑的，不是整跑 project）。
-      - name: 按路径作用域的下限（真库强制点 + 交换纯核心）
-        run: node scripts/assert-tests-ran.mjs exchange-enforcement exchange-core
+      #
+      # Task 4 又登记了两组**它自己新增的用例**（纯判据 36 条 + 真库 9 条）：同一条纪律必须
+      # 对新用例立刻生效，否则「未受保护面」会在下一个任务里从零再算一遍。
+      - name: 按路径作用域的下限（真库强制点 + 交换纯核心 + 账本写路径）
+        run: node scripts/assert-tests-ran.mjs exchange-enforcement exchange-core ledger-write-path ledger-write-path-db
 
       # 威胁 #14（供应链）。
       #

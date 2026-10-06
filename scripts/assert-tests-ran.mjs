@@ -172,6 +172,30 @@ const SCOPED_GATES = {
     floor: 47,
     why: 'P3 Task 3 的交换纯核心（状态机 / 全局锁序 / 确定性幂等键 / 三个计时器 / 资格 / 义务判据）',
   },
+  // P3 / Task 4 的账本写路径（本任务自己新增的 36 条）。实测：22 + 4 + 10 = 36 条，0 条 skip。
+  // **为什么连新用例也一起钉**：上面那 62 条之所以成为「当时最大的开放项」，正是因为
+  // 新用例落在 unit / integration 里没人管；同一条纪律必须对新用例**立刻**生效，
+  // 否则下一个任务又要从零算一遍「未受保护面」。
+  'ledger-write-path': {
+    project: 'unit',
+    paths: [
+      'tests/unit/db/retryable-conflict.test.ts',
+      'tests/unit/db/lock-order.test.ts',
+      'tests/unit/ledger/transaction-kind.test.ts',
+    ],
+    floor: 36,
+    why: 'P3 Task 4 的纯判据（两档可重试判别式 / 行锁共享顺序 / 交易 kind 的执行者）',
+  },
+  // P3 / Task 4 的真库用例（本任务自己新增的 9 条）。实测：6 + 3 = 9 条，0 条 skip。
+  'ledger-write-path-db': {
+    project: 'integration',
+    paths: [
+      'tests/integration/ledger/account-lock-order.test.ts',
+      'tests/integration/ledger/transaction-kind.test.ts',
+    ],
+    floor: 9,
+    why: 'P3 Task 4 的真库见证（账户行取锁顺序 / 两档真死锁 / 非法 kind 经真实服务被拒）',
+  },
 };
 
 /** vitest 自己的 JS 入口（读它 `package.json` 里声明的 `bin.vitest`，不猜路径）。 */
