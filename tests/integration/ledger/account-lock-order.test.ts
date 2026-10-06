@@ -169,65 +169,81 @@ async function deadlockThenRetry(opts: {
 }): Promise<{ attempts: number; retries: Array<[number, unknown]>; firstError: unknown; finalError: unknown }> {
   const rival = new Client({ connectionString: pg.appUri });
   await rival.connect();
-  await rival.query('BEGIN');
-  await rival.query('SELECT id FROM ledger.accounts WHERE id = $1::uuid FOR UPDATE', [opts.y]);
-
-  let attempts = 0;
-  let firstError: unknown = null;
-  const retries: Array<[number, unknown]> = [];
-
-  const victim = withBoundedConflictRetry(
-    async () => {
-      attempts += 1;
-      const nth = attempts;
-      try {
-        await prisma.$transaction(
-          async (tx) => {
-            await opts.lock(tx, opts.x);
-            await opts.lock(tx, opts.y); // ← 竞争者持有它 ⇒ 卡住
-          },
-          { timeout: 20_000 },
-        );
-      } catch (error) {
-        // **第一次**那个错误单独留下：判别式若把它判成「不可重试」，`onRetry` 一次都不会被调用、
-        // 整笔直接以原错误失败——而「实测到的错误形状」恰恰是那一刻最需要出现在失败信息里的东西
-        // （探针 `P-DISC-P2010-INT` 就是靠这一句把它逐字打出来的）。
-        if (nth === 1) firstError = error;
-        throw error;
-      }
-    },
-    { onRetry: (attempt, error) => retries.push([attempt, error]) },
-  );
-
-  const observer = new Client({ connectionString: pg.appUri });
-  await observer.connect();
-  let blockedStatement: string;
+  // ★ 失败路径也必须**放手**（修复轮第 2 步）：这条连接在 `BEGIN` 之后持有 `y`，而
+  //   「构造失败」是**抛异常**离开这个函数的。留在原地的那条连接会让受害者那一笔永远
+  //   等不到 `y`，于是 `afterAll` 收不掉它——实测多花 180 s（`Hook timed out in 180000ms`），
+  //   并因此多出一条会让人误判的红（报告 §15：修好之后同一条红是秒级，消息就是真那条）。
+  //   `releaseRival` 是幂等的，因此成功路径上的释放时机逐字未变。
+  let rivalReleased = false;
+  const releaseRival = async (): Promise<void> => {
+    if (rivalReleased) return;
+    rivalReleased = true;
+    await rival.end().catch(() => undefined);
+  };
   try {
-    blockedStatement = await waitForBlockedStatement(observer, opts.blockedPattern);
+    await rival.query('BEGIN');
+    await rival.query('SELECT id FROM ledger.accounts WHERE id = $1::uuid FOR UPDATE', [opts.y]);
+
+    let attempts = 0;
+    let firstError: unknown = null;
+    const retries: Array<[number, unknown]> = [];
+
+    const victim = withBoundedConflictRetry(
+      async () => {
+        attempts += 1;
+        const nth = attempts;
+        try {
+          await prisma.$transaction(
+            async (tx) => {
+              await opts.lock(tx, opts.x);
+              await opts.lock(tx, opts.y); // ← 竞争者持有它 ⇒ 卡住
+            },
+            { timeout: 20_000 },
+          );
+        } catch (error) {
+          // **第一次**那个错误单独留下：判别式若把它判成「不可重试」，`onRetry` 一次都不会被调用、
+          // 整笔直接以原错误失败——而「实测到的错误形状」恰恰是那一刻最需要出现在失败信息里的东西
+          // （探针 `P-DISC-P2010-INT` 就是靠这一句把它逐字打出来的）。
+          if (nth === 1) firstError = error;
+          throw error;
+        }
+      },
+      { onRetry: (attempt, error) => retries.push([attempt, error]) },
+    );
+
+    const observer = new Client({ connectionString: pg.appUri });
+    await observer.connect();
+    let blockedStatement: string;
+    try {
+      blockedStatement = await waitForBlockedStatement(observer, opts.blockedPattern);
+    } finally {
+      await observer.end();
+    }
+    expect(
+      blockedStatement,
+      `构造见证：受害者必须卡在**它自己那一句**上（实测：${blockedStatement}）。若它卡在别处，这条用例证明的就不是这一档。`,
+    ).toMatch(opts.blockedPattern);
+
+    await new Promise((resolve) => setTimeout(resolve, 50)); // 让牺牲者的等待计时**先**起跑一个相位
+    try {
+      // 这一句会阻塞到牺牲者被中止（环形成 ⇒ 探测器把牺牲者干掉 ⇒ x 的锁归竞争者）。
+      await rival.query('SELECT id FROM ledger.accounts WHERE id = $1::uuid FOR UPDATE', [opts.x]);
+    } catch (error) {
+      // **构造失败**（而不是断言失败）：竞争者自己成了牺牲者。这说明「谁先开始等待」的时序没成立，
+      // 这一轮的测量作废——响亮地抛，绝不把它当成一次「如期」。
+      throw new Error(`构造失败：竞争者自己成了死锁牺牲者（${shapeOf(error)}）——时序前提不成立，这一轮不能据此判任何事`);
+    }
+    await rival.query('ROLLBACK');
+    await releaseRival();
+
+    // 重试那一次：两行这时都空了。**不在这里抛**——收敛与否是**用例**要断言的东西
+    // （判别式漏档时它会是一个错误对象，而不是一条被驱动装置吞掉的异常）。
+    const finalError = await victim.then(() => null, (e: unknown) => e);
+    return { attempts, retries, firstError, finalError };
   } finally {
-    await observer.end();
+    // ★ 构造失败 / 断言失败 / 任何一处提前抛出：这一条必须走，否则 180 s 空挂（见上面那段注释）。
+    await releaseRival();
   }
-  expect(
-    blockedStatement,
-    `构造见证：受害者必须卡在**它自己那一句**上（实测：${blockedStatement}）。若它卡在别处，这条用例证明的就不是这一档。`,
-  ).toMatch(opts.blockedPattern);
-
-  await new Promise((resolve) => setTimeout(resolve, 50)); // 让牺牲者的等待计时**先**起跑一个相位
-  try {
-    // 这一句会阻塞到牺牲者被中止（环形成 ⇒ 探测器把牺牲者干掉 ⇒ x 的锁归竞争者）。
-    await rival.query('SELECT id FROM ledger.accounts WHERE id = $1::uuid FOR UPDATE', [opts.x]);
-  } catch (error) {
-    // **构造失败**（而不是断言失败）：竞争者自己成了牺牲者。这说明「谁先开始等待」的时序没成立，
-    // 这一轮的测量作废——响亮地抛，绝不把它当成一次「如期」。
-    throw new Error(`构造失败：竞争者自己成了死锁牺牲者（${shapeOf(error)}）——时序前提不成立，这一轮不能据此判任何事`);
-  }
-  await rival.query('ROLLBACK');
-  await rival.end();
-
-  // 重试那一次：两行这时都空了。**不在这里抛**——收敛与否是**用例**要断言的东西
-  // （判别式漏档时它会是一个错误对象，而不是一条被驱动装置吞掉的异常）。
-  const finalError = await victim.then(() => null, (e: unknown) => e);
-  return { attempts, retries, firstError, finalError };
 }
 
 describe('账户行锁序与两档重试判别式（C35 / C36；真库 + 真服务）', () => {
@@ -263,40 +279,54 @@ describe('账户行锁序与两档重试判别式（C35 / C36；真库 + 真服�
       { timeout: 20_000 },
     );
 
-    const observer = new Client({ connectionString: pg.appUri });
-    await observer.connect();
-    let blocked: string;
-    try {
-      blocked = await waitForBlockedStatement(observer, /FROM "?ledger"?\."?accounts"?[\s\S]*ORDER BY id FOR UPDATE/);
-    } finally {
-      await observer.end();
-    }
-    expect(
-      blocked,
-      `那一笔必须卡在**按 id 升序取全部账户行锁**的那一句上（卡在别处说明这次测的不是锁序）。实测：${blocked}`,
-    ).toMatch(/ORDER BY id FOR UPDATE/);
+    // ★ 失败路径上**没有人** await `poster`（那一刻这条用例已经抛了），而 `afterAll` 的
+    //   `$disconnect()` 会把仍在飞的那笔交互式事务取消 ⇒ 它会以 P2028 拒绝。实测（报告 §15）：
+    //   那条拒绝出现在 `disconnect START` **之后 12 ms**、且那一笔已经跑到 `applyBalances`
+    //   —— 也就是说它是**收尾**造成的，不是放锁造成的。这里挂一个处理器**只为**不让它变成
+    //   一条会让人误判的 `Unhandled Rejection`（否则修好的红里会多出一行 `Errors 1 error`）；
+    //   绿路径的判据仍然是下面那句 `await expect(poster).resolves.toMatchObject(...)`，未放宽。
+    void poster.catch(() => undefined);
 
-    // 第二档：它**还没碰过** `second`。反向取锁的实现会先锁住 `second` ⇒ NOWAIT 报 55P03。
-    const probe = new Client({ connectionString: pg.appUri });
-    await probe.connect();
-    let probeError: unknown = null;
     try {
-      await probe.query('BEGIN');
-      probeError = await probe
-        .query('SELECT id FROM ledger.accounts WHERE id = $1::uuid FOR UPDATE NOWAIT', [second])
-        .then(() => null, (e: unknown) => e);
-      await probe.query('ROLLBACK');
+      const observer = new Client({ connectionString: pg.appUri });
+      await observer.connect();
+      let blocked: string;
+      try {
+        blocked = await waitForBlockedStatement(observer, /FROM "?ledger"?\."?accounts"?[\s\S]*ORDER BY id FOR UPDATE/);
+      } finally {
+        await observer.end();
+      }
+      expect(
+        blocked,
+        `那一笔必须卡在**按 id 升序取全部账户行锁**的那一句上（卡在别处说明这次测的不是锁序）。实测：${blocked}`,
+      ).toMatch(/ORDER BY id FOR UPDATE/);
+
+      // 第二档：它**还没碰过** `second`。反向取锁的实现会先锁住 `second` ⇒ NOWAIT 报 55P03。
+      const probe = new Client({ connectionString: pg.appUri });
+      await probe.connect();
+      let probeError: unknown = null;
+      try {
+        await probe.query('BEGIN');
+        probeError = await probe
+          .query('SELECT id FROM ledger.accounts WHERE id = $1::uuid FOR UPDATE NOWAIT', [second])
+          .then(() => null, (e: unknown) => e);
+        await probe.query('ROLLBACK');
+      } finally {
+        await probe.end();
+      }
+      expect(
+        probeError,
+        `第二个账户（${second}）已经被那一笔锁住了 ⇒ 取锁顺序**不是**升序（这正是 ABBA 的一半）。实测：${shapeOf(probeError)}`,
+      ).toBeNull();
     } finally {
-      await probe.end();
+      // ★ 失败路径也必须**放手**（与 `deadlockThenRetry` 同一处修复）：`holder` 持有 `first`，
+      //   留在原地会让那一笔永远等不到锁 ⇒ `afterAll` 收不掉它 ⇒ 多花 180 s 并多出一条会让人
+      //   误判的 `Hook timed out`（实测见报告 §15）。放行之后那一笔照旧正常完成。
+      await holder.query('ROLLBACK').catch(() => undefined);
+      await holder.end().catch(() => undefined);
     }
-    expect(
-      probeError,
-      `第二个账户（${second}）已经被那一笔锁住了 ⇒ 取锁顺序**不是**升序（这正是 ABBA 的一半）。实测：${shapeOf(probeError)}`,
-    ).toBeNull();
 
     // 放行第三方连接 ⇒ 那一笔应当正常完成（这不是一次「谁都没做」的空过账）。
-    await holder.query('ROLLBACK');
-    await holder.end();
     await expect(poster).resolves.toMatchObject({ created: true });
     expect(await ledger.readBalances(prisma, userId)).toEqual(
       first === ids.available ? { available: 98n, frozen: 2n } : { available: 100n, frozen: 0n },
