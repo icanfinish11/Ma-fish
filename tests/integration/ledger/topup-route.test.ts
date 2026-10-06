@@ -114,6 +114,30 @@ describe('额度发放路由：POST /ledger/credits（C22 / D9 / D10 / C30）', 
     expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: `n-ok:${userId}` } })).toBe(1);
   });
 
+  it('入参契约：非 UUID 的 `userId` ⇒ 400（不能让它走到库上变成 500，也不能被静默接受）', async () => {
+    // 这一条问的是 DTO 的另外两个字段里那一个**有数据库后果**的：`owner_user_id` 是 `uuid` 列，
+    // 一个非 UUID 的字符串打到 Postgres 会以 `22P02` 失败 ⇒ 500。而这是**调用方**的错误，
+    // 因此必须在 DTO 这一层变成 400（与 `asset.controller.ts` 用 `UUID_IDENTIFIER` 在碰库
+    // 之前回 404 是同一条理由）。
+    // 判别力：把 `z.uuid()` 换成 `z.string()`（探针 `p-dto-loose-uuid`）⇒ 这条红（500 ≠ 400）。
+    const res = await post({ userId: 'not-a-uuid', amount: '100', idempotencyKey: `bad-uuid:${uuidv7()}` });
+
+    expect(res.status, `status=${String(res.status)} body=${JSON.stringify(res.body)}`).toBe(400);
+    expect(res.body.errors?.[0]?.path).toBe('userId');
+  });
+
+  it('入参契约：空的 `idempotencyKey` ⇒ 400（一个空的幂等键会让「重放」与「新发放」再也分不开）', async () => {
+    // 幂等键是这条路由**唯一**的重复保护（D9/C26），而空串在库里是合法的一行
+    // （`idempotency_key` 是 `TEXT NOT NULL`，没有非空约束）——也就是说，放它进来不会报错，
+    // 只会让「第二次发放」看起来像一次重放（或反过来）。因此必须在 400 这一层拒绝。
+    // 判别力：把 `.min(1)` 换成 `.min(0)`（探针 `p-dto-empty-key`）⇒ 这条红（200 ≠ 400）。
+    const userId = uuidv7();
+    const res = await post({ userId, amount: '100', idempotencyKey: '' });
+
+    expect(res.status, `status=${String(res.status)} body=${JSON.stringify(res.body)}`).toBe(400);
+    expect(res.body.errors?.[0]?.path).toBe('idempotencyKey');
+  });
+
   it('同键**不同金额** ⇒ 409 LEDGER_IDEMPOTENCY_KEY_REUSED，且库里没有新行、余额不变（幂等②）', async () => {
     const userId = uuidv7();
     const key = `diff:${userId}`;
