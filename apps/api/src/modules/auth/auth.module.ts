@@ -6,6 +6,7 @@ import type { Env } from '../../config/env.schema.js';
 // `no-cross-module-internals` 守着（Task 9）。
 import { AuditModule } from '../audit/index.js';
 import { RedisModule } from '../../db/redis.module.js';
+import { AdminDirectory } from './admin-directory.service.js';
 import { AuthController } from './auth.controller.js';
 import { AuthService } from './auth.service.js';
 import { GithubOauthService } from './github-oauth.service.js';
@@ -78,6 +79,10 @@ import { SessionService } from './session.service.js';
     AuthService,
     PasswordService,
     SessionService,
+    // P2 / Task 10：auth 对外的**唯一**新增能力（判管理员）。它住在 auth 里是因为
+    // `role` 列归 auth（C5：禁止跨模块直接读对方表），而 ledger 的额度发放路由必须
+    // 知道「这个人是不是管理员」。判定细节与最小披露的理由见那个文件的头注释。
+    AdminDirectory,
     {
       provide: GithubOauthService,
       inject: [ConfigService],
@@ -91,6 +96,6 @@ import { SessionService } from './session.service.js';
         ),
     },
   ],
-  exports: [SessionService, PasswordService],
+  exports: [SessionService, PasswordService, AdminDirectory],
 })
 export class AuthModule {}

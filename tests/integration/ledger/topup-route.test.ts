@@ -1,0 +1,249 @@
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import request from 'supertest';
+import type { INestApplication } from '@nestjs/common';
+import { ROLES, uuidv7 } from '@vca/shared';
+import { CSRF_COOKIE, CSRF_HEADER } from '@vca/api/common/security/csrf.middleware.js';
+import { SESSION_COOKIE } from '@vca/api/common/http/cookie.js';
+import { PrismaService } from '@vca/api/db/prisma.service.js';
+import { REDIS } from '@vca/api/db/redis.module.js';
+import { SessionService } from '@vca/api/modules/auth/session.service.js';
+import { LedgerService } from '@vca/api/modules/ledger/ledger.service.js';
+import { TRANSACTION_KINDS } from '@vca/api/modules/ledger/core/types.js';
+import { ACCOUNT_KINDS, type AccountKind } from '@vca/api/modules/ledger/core/account-kind.js';
+import { UnknownAccountKindError } from '@vca/api/modules/ledger/core/errors.js';
+import { createTestApp } from '../../helpers/app.js';
+import { fetchCsrfToken } from '../../helpers/csrf.js';
+import { startPostgres, type TestPg } from '../../helpers/db.js';
+import { disableRateLimit } from '../../helpers/rate-limit.js';
+import { startTestRedis, type TestRedis } from '../../helpers/redis.js';
+
+/**
+ * 管理员额度发放路由的**端到端**判据（P2 / Task 10；§2.1 / §8.1 / C22）。
+ *
+ * ## 四条判据各自问的东西
+ *
+ * | 判据 | 用例 | 它挡的缺陷形态 |
+ * |---|---|---|
+ * | C22：金额在 HTTP 边界是十进制字符串，**`number` 一律拒绝** | ① ② | 预检 A.2 实测：`JSON.parse('{"a":9007199254740993}')` → `…992`，写库**成功、少 1 分、无异常** |
+ * | D9/C26：幂等三态（新键 / 异腿 409 / 重放） | ③ ④ | 重试把同一笔发放记两次（外部可达的造钱路径上，这是最贵的缺陷） |
+ * | D10/§13.2：审计可**完整重建**这次资金变动 | ⑤ | 「有审计行」但重建不出「谁发给了谁、多少」 |
+ * | C30：§8.1 之外的 kind 必须由**应用**拒绝 | ⑥ | Task 9 实测：DB 的条件化 CHECK 只点名两个用户 kind，`SELLER_AVAILABLE` 会被放行并计入 Σ |
+ *
+ * ## 为什么响应体里**从不**出现 `bigint`
+ *
+ * `JSON.stringify(1n)` 直接抛 `TypeError`（预检 A.2），而 Nest 的响应链路对 `bigint`
+ * 的行为是预检 §G.3 明确留白的**未验证面**。这条路由**结构性绕开**它：
+ * 进出都是字符串（`formatMinorUnits` / `parseMinorUnits`），因此那条未验证面在 P2 里不可达。
+ * 判别性见证见探针 `p-number-balance`（把 `formatMinorUnits(balance)` 换成 `Number(balance)`）。
+ *
+ * ## 装置
+ *
+ * 真 Postgres + 真 Redis；管理员是一个**真的** `role='ADMIN'` 用户，凭 `SessionService.create`
+ * 造出的真会话 + 双提交 CSRF 令牌发请求（与 `tests/security/ledger/authz-matrix.test.ts`
+ * 同一套手法，那条矩阵负责「四种角色各自放不放行」，本文件负责「放行之后发生的事」）。
+ */
+describe('额度发放路由：POST /ledger/credits（C22 / D9 / D10 / C30）', () => {
+  let app: INestApplication;
+  let redis: TestRedis;
+  let pg: TestPg;
+  let prisma: PrismaService;
+  let ledger: LedgerService;
+  let csrf = '';
+  let adminCookie = '';
+  let adminId = '';
+
+  beforeAll(async () => {
+    redis = await startTestRedis();
+    pg = await startPostgres();
+    prisma = new PrismaService(pg.appUri);
+    await prisma.$connect();
+    app = await createTestApp({
+      overrides: [
+        disableRateLimit,
+        (builder) => builder.overrideProvider(REDIS).useValue(redis.newClient()),
+        (builder) => builder.overrideProvider(PrismaService).useValue(prisma),
+      ],
+    });
+    ledger = app.get(LedgerService);
+    csrf = await fetchCsrfToken(app);
+    const admin = await prisma.user.create({ data: { role: ROLES.ADMIN } });
+    adminId = admin.id;
+    const { sessionId } = await app.get(SessionService).create(adminId, { ip: '127.0.0.1', userAgent: 'vitest' });
+    adminCookie = `${SESSION_COOKIE}=${sessionId}; ${CSRF_COOKIE}=${csrf}`;
+  }, 180_000);
+
+  afterAll(async () => {
+    await app?.close();
+    await prisma?.$disconnect().catch(() => undefined);
+    await pg?.stop();
+    await redis?.stop();
+  });
+
+  /** 以管理员身份发一次额度发放。 */
+  function post(body: Record<string, unknown>): request.Test {
+    return request(app.getHttpServer()).post('/ledger/credits').set('Cookie', adminCookie).set(CSRF_HEADER, csrf).send(body);
+  }
+
+  it('★ >2^53：请求体是字符串、响应体的余额也是字符串，且**库里那一列**逐分无损（预检 A.2 / §G.3）', async () => {
+    const userId = uuidv7();
+    const amount = '9007199254740993'; // 2^53 + 1 —— JSON number 装不下的那个数
+    const res = await post({ userId, amount, idempotencyKey: `big:${userId}` });
+
+    expect(res.status, `status=${String(res.status)} body=${JSON.stringify(res.body)}`).toBe(200);
+    // ↓ 这两条一起把预检 §G.3 的未验证面（bigint 在 Nest 响应链路上的行为）**结构性绕开**：
+    //   我们从不把 bigint 放进响应体，因此那条未验证面在 P2 里不可达。
+    expect(typeof res.body.balance).toBe('string');
+    expect(res.body.balance).toBe(amount);
+    // 而真正的判据在库里：字符串 → bigint → int8 列 → 再读回来，**一分不差**。
+    // 预检实测的那条静默路径（少 1 分且无异常）只有这一句看得见。
+    expect(await ledger.readBalances(prisma, userId)).toEqual({ available: 9007199254740993n, frozen: 0n });
+  });
+
+  it('同一个金额写成 JSON **number** ⇒ 400，且库里余额不变（C22 的执行点）', async () => {
+    const userId = uuidv7();
+    const res = await post({ userId, amount: 9007199254740993, idempotencyKey: `n:${userId}` });
+
+    expect(res.status, `status=${String(res.status)} body=${JSON.stringify(res.body)}`).toBe(400);
+    expect(res.body.errors?.[0]?.path).toBe('amount');
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: `n:${userId}` } })).toBe(0);
+    expect(await ledger.readBalances(prisma, userId)).toEqual({ available: 0n, frozen: 0n });
+
+    // ★ 接受方向的同伴证据：同一形状的查询对一次**被接受**的发放必须返回 1，
+    //   否则上面那个 0 也可能只是「查询写错了」。
+    await post({ userId, amount: '1', idempotencyKey: `n-ok:${userId}` }).expect(200);
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: `n-ok:${userId}` } })).toBe(1);
+  });
+
+  it('同键**不同金额** ⇒ 409 LEDGER_IDEMPOTENCY_KEY_REUSED，且库里没有新行、余额不变（幂等②）', async () => {
+    const userId = uuidv7();
+    const key = `diff:${userId}`;
+    await post({ userId, amount: '100', idempotencyKey: key }).expect(200);
+
+    const res = await post({ userId, amount: '200', idempotencyKey: key });
+
+    expect(res.status, `status=${String(res.status)} body=${JSON.stringify(res.body)}`).toBe(409);
+    expect(res.body.code).toBe('LEDGER_IDEMPOTENCY_KEY_REUSED');
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: key } })).toBe(1);
+    expect(await ledger.readBalances(prisma, userId)).toEqual({ available: 100n, frozen: 0n });
+  });
+
+  it('同键同额重放 ⇒ 200 created=false，余额不翻倍、交易一笔、审计一行（幂等①）', async () => {
+    const userId = uuidv7();
+    const key = `replay:${userId}`;
+    const first = await post({ userId, amount: '100', idempotencyKey: key }).expect(200);
+    expect(first.body).toMatchObject({ created: true, balance: '100' });
+    expect(await prisma.auditLog.count({ where: { resourceId: first.body.transactionId as string } })).toBe(1);
+
+    const replay = await post({ userId, amount: '100', idempotencyKey: key });
+
+    expect(replay.status).toBe(200);
+    expect(replay.body).toMatchObject({ created: false, balance: '100' }); // ← 不是 200
+    expect(replay.body.transactionId).toBe(first.body.transactionId);
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: key } })).toBe(1);
+    // ★ 重放**不写**第二行审计：审计与业务同生共死（D10），而重放没有产生新的业务写入。
+    expect(await prisma.auditLog.count({ where: { resourceId: first.body.transactionId as string } })).toBe(1);
+  });
+
+  it('★ 审计行能**完整重建**这次发放：谁（actorId）/ 发给谁（分录）/ 多少（分录）/ 哪个幂等键', async () => {
+    // §13.2 要求「审计日志可完整重建任一次资金变动的链路」。这条链路是：
+    //   审计行 --resourceId--> ledger.transactions --entries--> ledger.accounts
+    // 因此判据不是「审计行里有几个字段」，而是**顺着这条链真的走得回去**。
+    const userId = uuidv7();
+    const key = `audit:${userId}`;
+    const res = await post({ userId, amount: '1234', idempotencyKey: key }).expect(200);
+    const transactionId = res.body.transactionId as string;
+
+    const audit = await prisma.auditLog.findFirst({
+      where: { resourceId: transactionId },
+      select: { actorId: true, action: true, resource: true, metadata: true },
+    });
+    expect(audit).not.toBeNull();
+    // 谁：发起这次发放的管理员（不是被发放的人，也不是 null）。
+    expect(audit?.actorId).toBe(adminId);
+    expect(audit?.action).toBe('ledger.posted');
+    expect(audit?.resource).toBe('LedgerTransaction');
+    // 哪个幂等键（审计 metadata 里那一个，与请求逐字相同）。
+    expect(audit?.metadata).toMatchObject({ kind: TRANSACTION_KINDS.TOPUP, idempotencyKey: key });
+
+    // 发给谁 / 多少：顺着 resourceId → transactions → entries → accounts 读回来。
+    const transaction = await prisma.ledgerTransaction.findUnique({
+      where: { id: transactionId },
+      select: {
+        kind: true,
+        idempotencyKey: true,
+        entries: { select: { amount: true, account: { select: { kind: true, ownerUserId: true } } } },
+      },
+    });
+    expect(transaction?.kind).toBe(TRANSACTION_KINDS.TOPUP);
+    expect(transaction?.idempotencyKey).toBe(key);
+    const decoded = (transaction?.entries ?? [])
+      .map((entry) => ({ kind: entry.account.kind, owner: entry.account.ownerUserId, amount: entry.amount }))
+      .sort((a, b) => (a.kind < b.kind ? -1 : 1));
+    expect(decoded).toEqual([
+      // 借：充值对手方账户（系统账户，天然为负）——§8.1 明写 MVP 由管理员发放虚拟额度
+      { kind: ACCOUNT_KINDS.EXTERNAL_TOPUP, owner: null, amount: -1234n },
+      // 贷：被发放人的**可用**账户（to whom + how much 都在这一行上）
+      { kind: ACCOUNT_KINDS.USER_AVAILABLE, owner: userId, amount: 1234n },
+    ]);
+  });
+
+  it('★ C30 的应用侧执行点：写路径拒绝 §8.1 之外的 kind，且**碰库之前**就拒绝', async () => {
+    // 为什么这条必须有：Task 9 用真库实测过，迁移里那条**条件化** CHECK
+    // （`kind NOT IN ('USER_AVAILABLE','USER_FROZEN') OR balance >= 0`）对 §8.1 之外的
+    // kind **不成立**——`INSERT … 'SELLER_AVAILABLE', balance = -5000` 被放行、并被计入 Σ。
+    // 也就是说：**执行 kind 集合是应用层的工作**，数据库挡不住。
+    //
+    // 观测量的选择是承重的：`resolveAccounts` 里有**五处** `assertAccountKind`
+    // （入参引用、读回的行、快照），它们抛的是**同一个**错误类，因此「抛没抛」分不开它们。
+    // 能分开的只有**顺序**：入参那一处在**任何 SQL 之前**。于是判据是——在同一个事务里，
+    // 捕获异常之后再查一次库：拒绝发生时，那个伪造 kind 的账户行**一行都不该存在**。
+    // 把第一处断言删掉（探针 `p-kind-gate`）时，`post` 会先 INSERT 那一行、再由读回时
+    // 的断言抛出：错误类型完全相同，而这一句会红。
+    const userId = uuidv7();
+    const key = `foreign-kind:${userId}`;
+    // 这个值模拟「来自类型系统之外的数据」（库里的行、JSON、别的服务的入参）：
+    // `AccountKind` 是编译期类型，而 §8.1 是**运行期**契约。
+    const foreign = 'SELLER_AVAILABLE' as unknown as AccountKind;
+
+    let observedForeignRows: string[] = [];
+    const error = await prisma
+      .$transaction(async (tx) => {
+        try {
+          await ledger.post(tx, {
+            kind: TRANSACTION_KINDS.TOPUP,
+            idempotencyKey: key,
+            moves: [
+              { from: { kind: foreign, ownerUserId: userId }, to: { kind: ACCOUNT_KINDS.USER_AVAILABLE, ownerUserId: userId }, amount: 1n },
+            ],
+          });
+          return null;
+        } catch (thrown: unknown) {
+          // 在**同一个事务**里读：上一条语句有没有真的写进去过。
+          const rows = await tx.ledgerAccount.findMany({ where: { kind: 'SELLER_AVAILABLE' }, select: { kind: true } });
+          observedForeignRows = rows.map((row) => row.kind);
+          throw thrown; // 让事务回滚（否则那个伪造账户会被提交进库）
+        }
+      })
+      .then(() => null, (thrown: unknown) => thrown);
+
+    expect(error).toBeInstanceOf(UnknownAccountKindError);
+    expect((error as UnknownAccountKindError).kind).toBe('SELLER_AVAILABLE');
+    expect(observedForeignRows, '拒绝之前已经往库里写过那一行 ⇒ 这道门没有挡住（C30 的应用侧执行点失效）').toEqual([]);
+    // 拒绝方向：那笔交易不存在、那个 kind 一行都没有。
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: key } })).toBe(0);
+    expect(await prisma.ledgerAccount.count({ where: { kind: 'SELLER_AVAILABLE' } })).toBe(0);
+
+    // ★ 接受方向的同伴证据（同一形状的查询 + 同一个入口）：一个**合法**的 kind 走同一条路时，
+    //   账户行与交易行都真的被建出来了。没有这一句，上面那两个 0 也可能只是查询写错了。
+    const ok = uuidv7();
+    await prisma.$transaction((tx) =>
+      ledger.post(tx, {
+        kind: TRANSACTION_KINDS.TOPUP,
+        idempotencyKey: `ok-kind:${ok}`,
+        moves: [{ from: { kind: ACCOUNT_KINDS.EXTERNAL_TOPUP, ownerUserId: null }, to: { kind: ACCOUNT_KINDS.USER_AVAILABLE, ownerUserId: ok }, amount: 1n }],
+      }),
+    );
+    expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: `ok-kind:${ok}` } })).toBe(1);
+    expect(await prisma.ledgerAccount.count({ where: { kind: ACCOUNT_KINDS.USER_AVAILABLE, ownerUserId: ok } })).toBe(1);
+  });
+});
