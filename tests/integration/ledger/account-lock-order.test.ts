@@ -93,24 +93,43 @@ async function seed(userId: string, amount: bigint) {
 }
 
 /**
- * 等到至少 n 个后端卡在锁上（`wait_event_type = 'Lock'`），并返回它们正在执行的语句。
+ * 等到**服务端**真的有一条语句卡在锁上（`wait_event_type = 'Lock'`）且它的文本匹配 `pattern`，
+ * 并返回那一句。
  *
- * 返回**语句文本**不是装饰：本文件第一档判据的全部内容就是「卡在哪一句上」。
- * 窗口 2 s（远小于 Prisma 交互式事务的 5 s 默认超时）：超时说明**构造**没成立，
- * 因此抛的是构造失败，不是断言失败。
- * 观察者与 Prisma 用同一个 `app_user` 连接（`pg_stat_activity` 的 `wait_event_type` /
- * `query` 只对本会话属主可见；两边同角色才看得见，否则读到的是 NULL 而已）。
+ * ## ★ 为什么这里不能 `sleep` 猜时序（实测教训）
+ * 第一版用的是「受害者发出信号 ⇒ sleep 150 ms ⇒ 竞争者去要 x」。它在**单独跑**时稳定，
+ * 而在 `pnpm test`（5 个 project + 一堆 testcontainers 同时跑）下**红了一次**：竞争者自己成了
+ * 牺牲者（`error: deadlock detected` 落在**竞争者**那条连接上、测试文件耗时 57 s）。
+ * 根因是那句 sleep 量错了对象——事件循环拥塞时「**先发起**」与「服务端**先开始等待**」不是
+ * 同一件事；而死锁探测器中止的是**等待计时先到点**的那一个。⇒ 现在改成观察**服务端的事实**：
+ * 受害者的等待已经在 `pg_stat_activity` 里看得见了，竞争者才去要 x。这样 δ>0 由构造保证。
+ *
+ * 窗口 3 s：超时说明**构造**没成立（不是断言失败），照本项目既定纪律响亮地抛。
+ * 观察者与 Prisma 用同一个 `app_user` 连接（`pg_stat_activity` 的 `wait_event_type` / `query`
+ * 只对本会话属主可见；两边同角色才看得见，否则读到的是 NULL 而已）。
  */
-async function waitForLockWaiters(client: Client, n: number): Promise<string[]> {
-  for (let i = 0; i < 80; i += 1) {
+async function waitForBlockedStatement(client: Client, pattern: RegExp): Promise<string> {
+  for (let i = 0; i < 120; i += 1) {
     const r = await client.query<{ query: string }>(
       `SELECT query FROM pg_stat_activity
         WHERE datname = current_database() AND wait_event_type = 'Lock'`,
     );
-    if (r.rows.length >= n) return r.rows.map((row) => row.query);
+    const hit = r.rows.map((row) => row.query).filter((sql) => pattern.test(sql));
+    if (hit.length > 0) return hit[0]!;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  throw new Error('2 s 内没有观察到等待锁的后端 —— 这条用例的时序前提不成立（构造失败，不是断言失败）');
+  // ★ 超时时把**实际**在等的语句原样带出来：否则「构造失败」这四个字没有任何证据，
+  //   而下一个人只能自己重跑一遍才知道那一笔到底卡在哪一句上（本项目对「装置给出假绿」
+  //   的既定处置就是把原始事实打出来）。这条消息也是探针 `P-LOCK-REMOVED` /
+  //   `P-PLACE-AFTER-CREATEMANY` 的证据来源：那两条探针下它会显示出 `INSERT INTO …entries`。
+  const all = await client.query<{ query: string; wait_event_type: string | null }>(
+    `SELECT query, wait_event_type FROM pg_stat_activity WHERE datname = current_database()`,
+  );
+  const waiting = all.rows.filter((r) => r.wait_event_type === 'Lock').map((r) => r.query);
+  throw new Error(
+    `3 s 内没有观察到匹配 ${String(pattern)} 的等锁语句 —— 这条用例的时序前提不成立（构造失败，不是断言失败）。` +
+      `此刻**实际**在等锁的语句：${JSON.stringify(waiting)}`,
+  );
 }
 
 /** 把错误对象压成一行可读文本（断言失败时把**实测形状**打出来，而不是只说「不相等」）。 */
@@ -122,21 +141,21 @@ function shapeOf(error: unknown): string {
 /**
  * 造一次**真死锁**（SQLSTATE `40P01`），并让**被重试的那一笔**当牺牲者。
  *
- * ## 构造（它是确定性的，不靠 sleep 猜时序）
+ * ## 构造（确定性的：靠**观察**而不是靠 sleep 猜，理由见 `waitForBlockedStatement`）
  * ```
- * 竞争者（一条裸 pg 连接）: BEGIN; SELECT y FOR UPDATE;                    ← 先持有 y
+ * 竞争者（一条裸 pg 连接）: BEGIN; SELECT y FOR UPDATE;              ← 先持有 y
  * 牺牲者（withBoundedConflictRetry 包住的那笔）: 取 x（成功）→ 取 y（卡住）
- * 竞争者（150 ms 之后）                       : SELECT x FOR UPDATE          ← 环在这一刻形成
+ * 观察者: pg_stat_activity 里真的出现「牺牲者卡在那一句上」                ← 服务端事实
+ * 竞争者（+50 ms）: SELECT x FOR UPDATE                               ← 环在这一刻形成
  * ```
- * 牺牲者随后被 PostgreSQL 的死锁探测器中止（`deadlock_timeout` 默认 1 s），
+ * 牺牲者随后被 PostgreSQL 的死锁探测器中止（`deadlock_timeout` 默认 1 s；两次单独实测各 ~1.04 s），
  * 竞争者拿到 x、回滚、释放 ⇒ 重试那一次一路上到 COMMIT。
  *
- * ## 为什么那 150 ms 是**承重**的
- * 死锁探测器在每个进程**自己开始等待**之后 `deadlock_timeout` 到点时才跑，跑的时候发现环
- * 就把**自己**中止掉。牺牲者先开始等待（它在竞争者要 x 之前就在等 y），因此它的计时器总是
- * 先到点 ⇒ 它总是牺牲者。若两者**同时**开始等待，谁是牺牲者就成了竞态（两条计时器几乎同时
- * 到期），而那条用例会变成一条偶发红。**据实记载**：预检两次实测的 1.1 s / 1.28 s 正是这个
- * 1 s 的探测器（不是「大概卡一秒」）。
+ * ## 为什么牺牲者**一定**是牺牲者
+ * 探测器的判据是「这个进程**自己**开始等待之后 `deadlock_timeout` 到点」——先开始等的那个先到点，
+ * 于是先发现自己身处环里、先把自己中止掉。上面第 3 步把「牺牲者已经在等」变成**观察到的事实**，
+ * 竞争者的等待因此必然晚于它（δ>0）。若竞争者反而被中止（构造失败），这里**响亮地抛**——
+ * 那条用例不能据此判任何事。
  *
  * ## 两道 `lock` 的形状由调用方给（这就是两档错误的来源）
  * `$queryRaw` ⇒ **P2010**；Prisma 委托 ⇒ **P2034**（预检 §0.4 实测）。两档都带 `40P01`。
@@ -145,14 +164,14 @@ async function deadlockThenRetry(opts: {
   readonly x: string;
   readonly y: string;
   readonly lock: (tx: Prisma.TransactionClient, accountId: string) => Promise<unknown>;
+  /** 受害者**卡住那一句**在 `pg_stat_activity.query` 里的特征（必须只匹配受害者自己）。 */
+  readonly blockedPattern: RegExp;
 }): Promise<{ attempts: number; retries: Array<[number, unknown]>; firstError: unknown; finalError: unknown }> {
   const rival = new Client({ connectionString: pg.appUri });
   await rival.connect();
   await rival.query('BEGIN');
   await rival.query('SELECT id FROM ledger.accounts WHERE id = $1::uuid FOR UPDATE', [opts.y]);
 
-  let victimIsWaiting!: () => void;
-  const waitingReached = new Promise<void>((resolve) => { victimIsWaiting = resolve; });
   let attempts = 0;
   let firstError: unknown = null;
   const retries: Array<[number, unknown]> = [];
@@ -165,7 +184,6 @@ async function deadlockThenRetry(opts: {
         await prisma.$transaction(
           async (tx) => {
             await opts.lock(tx, opts.x);
-            victimIsWaiting();
             await opts.lock(tx, opts.y); // ← 竞争者持有它 ⇒ 卡住
           },
           { timeout: 20_000 },
@@ -181,10 +199,28 @@ async function deadlockThenRetry(opts: {
     { onRetry: (attempt, error) => retries.push([attempt, error]) },
   );
 
-  await waitingReached;
-  await new Promise((resolve) => setTimeout(resolve, 150));
-  // 这一句会阻塞到牺牲者被中止（环形成 ⇒ 探测器把牺牲者干掉 ⇒ x 的锁归竞争者）。
-  await rival.query('SELECT id FROM ledger.accounts WHERE id = $1::uuid FOR UPDATE', [opts.x]);
+  const observer = new Client({ connectionString: pg.appUri });
+  await observer.connect();
+  let blockedStatement: string;
+  try {
+    blockedStatement = await waitForBlockedStatement(observer, opts.blockedPattern);
+  } finally {
+    await observer.end();
+  }
+  expect(
+    blockedStatement,
+    `构造见证：受害者必须卡在**它自己那一句**上（实测：${blockedStatement}）。若它卡在别处，这条用例证明的就不是这一档。`,
+  ).toMatch(opts.blockedPattern);
+
+  await new Promise((resolve) => setTimeout(resolve, 50)); // 让牺牲者的等待计时**先**起跑一个相位
+  try {
+    // 这一句会阻塞到牺牲者被中止（环形成 ⇒ 探测器把牺牲者干掉 ⇒ x 的锁归竞争者）。
+    await rival.query('SELECT id FROM ledger.accounts WHERE id = $1::uuid FOR UPDATE', [opts.x]);
+  } catch (error) {
+    // **构造失败**（而不是断言失败）：竞争者自己成了牺牲者。这说明「谁先开始等待」的时序没成立，
+    // 这一轮的测量作废——响亮地抛，绝不把它当成一次「如期」。
+    throw new Error(`构造失败：竞争者自己成了死锁牺牲者（${shapeOf(error)}）——时序前提不成立，这一轮不能据此判任何事`);
+  }
   await rival.query('ROLLBACK');
   await rival.end();
 
@@ -229,16 +265,16 @@ describe('账户行锁序与两档重试判别式（C35 / C36；真库 + 真服�
 
     const observer = new Client({ connectionString: pg.appUri });
     await observer.connect();
-    let blocked: string[];
+    let blocked: string;
     try {
-      blocked = await waitForLockWaiters(observer, 1);
+      blocked = await waitForBlockedStatement(observer, /FROM "?ledger"?\."?accounts"?[\s\S]*ORDER BY id FOR UPDATE/);
     } finally {
       await observer.end();
     }
     expect(
-      blocked.filter((sql) => /FROM "?ledger"?\."?accounts"?[\s\S]*ORDER BY id FOR UPDATE/.test(sql)),
-      `那一笔必须卡在**按 id 升序取全部账户行锁**的那一句上（卡在别处说明这次测的不是锁序）。实测：${JSON.stringify(blocked)}`,
-    ).toHaveLength(1);
+      blocked,
+      `那一笔必须卡在**按 id 升序取全部账户行锁**的那一句上（卡在别处说明这次测的不是锁序）。实测：${blocked}`,
+    ).toMatch(/ORDER BY id FOR UPDATE/);
 
     // 第二档：它**还没碰过** `second`。反向取锁的实现会先锁住 `second` ⇒ NOWAIT 报 55P03。
     const probe = new Client({ connectionString: pg.appUri });
@@ -333,7 +369,11 @@ describe('账户行锁序与两档重试判别式（C35 / C36；真库 + 真服�
     const measured = await deadlockThenRetry({
       x,
       y,
-      lock: (tx, id) => tx.$queryRaw`SELECT id FROM ledger.accounts WHERE id = ${id}::uuid FOR UPDATE`,
+      // 尾部的 SQL 注释是**构造见证的一部分**：竞争者那条连接的语句文本与这一句**逐字相同**
+      // （都是 `… WHERE id = $1::uuid FOR UPDATE`），而观察者要在 `pg_stat_activity` 里
+      // **只**认出受害者那一句（`blockedPattern`）。
+      lock: (tx, id) => tx.$queryRaw`SELECT id FROM ledger.accounts WHERE id = ${id}::uuid FOR UPDATE /* t4-victim-p2010 */`,
+      blockedPattern: /t4-victim-p2010/,
     });
 
     // 顺序是**承重**的：形状与判别式先断言（它们是这一档的全部内容），收敛性放在后面。
@@ -363,6 +403,9 @@ describe('账户行锁序与两档重试判别式（C35 / C36；真库 + 真服�
       y,
       // Prisma 委托（不是 `$queryRaw`）：`increment: 0n` 只为拿行锁，不改任何余额。
       lock: (tx, id) => tx.ledgerAccount.updateMany({ where: { id }, data: { balance: { increment: 0n } } }),
+      // 委托生成的语句是 `UPDATE "ledger"."accounts" …`（带引号），与竞争者的 `SELECT … FOR UPDATE`
+      // 形状不同 ⇒ 观察者不会把竞争者认成受害者。
+      blockedPattern: /UPDATE\s+"ledger"\."accounts"/,
     });
 
     const error = measured.firstError;
