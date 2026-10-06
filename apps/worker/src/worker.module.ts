@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@vca/api/config/config.module.js';
+import { PolicyModule } from '@vca/api/common/policy/policy.module.js';
 import { DbModule } from '@vca/api/db/db.module.js';
+import { LedgerModule } from '@vca/api/modules/ledger/index.js';
 import { NotifyModule } from '@vca/api/modules/notify/index.js';
 
 /**
@@ -38,10 +40,47 @@ import { NotifyModule } from '@vca/api/modules/notify/index.js';
  * 设计 §14 点名它是 P1 的欠账）：worker 与 api 共用同一个 `DATABASE_URL` 契约与同一个库，
  * 「账本 append-only 在这条连接上是不是空操作」这个问题它今天就该回答。
  *
- * **复访触发条件：worker 第一次写账本时（P3 结算），同一次改动里必须**
+ * ## 复访触发条件**已落地**（P3 / Task 5；此前的版本写的是「条件还没到」）
+ *
+ * 本文件此前逐字记着：「**复访触发条件：worker 第一次写账本时（P3 结算），同一次改动里必须**
  * **(a) `imports` 加 `LedgerModule`，(b) 加对账（不变式 #2）的周期执行者（计划 D11）。**
  * 两条必须一起做，因为它们共享同一个理由：worker 是唯一能**自动**动账本的进程——
- * 一旦它开始写账本，没人周期性对账就意味着不变式 #2 又回到了「声明了但未强制」。
+ * 一旦它开始写账本，没人周期性对账就意味着不变式 #2 又回到了「声明了但未强制」。」
+ *
+ * **P3 / Task 5 兑现了那两条**：(a) 上面的 `imports` 加了 `LedgerModule`；
+ * (b) `main.ts` 把 `ledger-reconcile`（`LedgerReconciliationService.reconcilePerAccount`
+ * + `isPerAccountClean`）挂进 `runWorker` 的 `tasks`，每 `RECONCILE_INTERVAL_MS` 一次。
+ *
+ * **顺序上的一点说明（据实）**：那两条触发条件写的是「worker 第一次**写**账本时」，
+ * 而 Task 5 交付的周期对账**只读**账本（P2 的划界：对账的语义是**发现**，不是修复）。
+ * 提前落地它的理由不是「条件到了」，而是**这一条读法需要索引与判据都先存在**：
+ * 逐账户判据（`reconcilePerAccount`）与 `entries(account_id)` 索引是同一次落地的
+ * （D4 / 裁定 ⑥），而周期执行者搭的是同一个 runner（裁定 ⑩：**不另造第二套循环**）。
+ * 真正的**写**路径（结算 / 托管释放）在 Task 7/8/10 —— 那时 `LedgerService` 的导入
+ * 才会在这里被真正用到（今天只有 `LedgerReconciliationService` 被取）。
+ *
+ * ## ★ 为什么必须同时加 `PolicyModule`（实测，DI 图不接受「只加 LedgerModule」）
+ *
+ * `LedgerModule` 是一个**带路由的模块**：它的类级构造函数注入 `PolicyGuard`（为了
+ * `onModuleInit` 里注册 `ledgerAdminGrant` 条件），而 `PolicyGuard` 由 `PolicyModule`
+ * 提供。`PolicyModule` 标了 `@Global()`，但 **`@Global()` 只让「已经被 import 过一次」的
+ * 模块的 exports 对全局可见**——API 侧是 `AppModule` 自己 `imports: [PolicyModule, …]`
+ * 提供的，而 worker 的图里从前没有任何东西 import 过它。
+ *
+ * 实测（不加会怎样）：`pnpm test --project integration tests/integration/worker` 下两条
+ * 既有进程用例直接红，`InstanceLoader.createInstancesOfProviders` 抛
+ * `UnknownDependenciesException: Nest can't resolve dependencies of the LedgerModule (?, AdminDirectory).
+ * Please make sure that the argument PolicyGuard at index [0] is available in the LedgerModule module.`
+ * —— **worker 起不来**，而这不是一条「少了个功能」的失败，是**进程级**的。
+ *
+ * ## ★ `AuthModule` **不需要**（同一轮实测，据实记载为什么不做冗余 import）
+ *
+ * 直觉上还要 `AuthModule`（`LedgerModule` 的构造函数同时注入 `AdminDirectory`，而它由
+ * `AuthModule` 导出）。实测**不需要**：`LedgerModule` 自己 `imports: [AuditModule, AuthModule]`
+ * （`ledger.module.ts:48`），`AdminDirectory` 因此在它的模块作用域里已经可解析。
+ * 加 `AuthModule` 也能跑（两种写法都实测过），但那会往 worker 的依赖图里多拉进
+ * `AuthController` 与 `RedisModule`（会话/限流），而 worker 两样都不需要
+ * ——**为一个已经能解析的依赖加一条边，正是本项目反复惩罚的「为想象中的需求预埋」**。
  */
-@Module({ imports: [ConfigModule, DbModule, NotifyModule] })
+@Module({ imports: [ConfigModule, DbModule, NotifyModule, PolicyModule, LedgerModule] })
 export class WorkerModule {}

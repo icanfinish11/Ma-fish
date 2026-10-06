@@ -5,12 +5,44 @@ import { NestFactory } from '@nestjs/core';
 // `notify` 的内部布局。这条边界由 `.dependency-cruiser.cjs` 的
 // `no-cross-module-internals` 守着（`apps/worker` 深引 `modules/*` 内部即报错）。
 import { OutboxConsumer } from '@vca/api/modules/notify/index.js';
+// P3 / Task 5：周期对账的执行者。走模块的**对外接口**取服务与判据（与 `OutboxConsumer` 同一条
+// 依赖纪律：worker 是独立构建/部署的进程，深引 `modules/ledger` 的内部文件会被
+// `.dependency-cruiser.cjs` 的 `no-cross-module-internals` 直接拒）。
+import { LedgerReconciliationService } from '@vca/api/modules/ledger/index.js';
 // 平台层（`db/*`）不是任何功能模块的内部实现，按设计可以直取——与 `worker.module.ts`
 // import `@vca/api/db/db.module.js` 同一条依赖方向。
 import { PrismaService } from '@vca/api/db/prisma.service.js';
 import { assertRuntimeDbRole } from '@vca/api/db/runtime-role.js';
 import { WorkerModule } from './worker.module.js';
 import { describeError, runWorker } from './worker.js';
+
+/**
+ * 账本对账的**周期**（P3 / Task 5；计划 D17 / 控制器裁定 ⑩）。
+ *
+ * ## 60 秒是怎么来的（据实：取值理由，不是实测最优）
+ *
+ * 两端各有一个已知量：
+ * * **下界**：P2 的 `DEFAULT_POLL_MS = 1_000`（outbox 的轮询粒度）。对账没必要比通知更快
+ *   —— 它的语义是**发现**，不是修复（P2 的划界逐字：不变式 #2 的职责是事后发现）。
+ * * **上界**：运维能接受的通知延迟。设计 §8.3 的不变式 #2 是一条**告警**判据，
+ *   而「下一次有人跑测试」是它今天的实际发现周期（P2 的边界一/二就是这么写的）。
+ *   把最坏发现延迟从「下一次有人跑测试」压到「一分钟」已经达到目的；
+ *   再压小只是让一条 40 ms 的查询更频繁地打库（20 万行实测 40 ms，`reconcilePerAccount`）。
+ *
+ * ## 与关停预算的关系（Step 8 的三个数之一）
+ *
+ * `DEFAULT_SHUTDOWN_TIMEOUT_MS = 5_000`，而一次 `reconcilePerAccount()` 在 20 万行上
+ * 是 **40 ms** 量级 ⇒ **一次 tick 远小于关停预算**。收到 `SIGTERM` 时循环不再开新的一轮，
+ * 正在跑的那一次照常跑完（P2 的划界：对账只读，跑完不会留下半成品），
+ * 最坏情况是关停多等**一次 tick**。
+ *
+ * ## 为什么是模块常量而不是环境变量（D14）
+ *
+ * P3 **不新增任何环境变量**。周期任务的间隔照 `DEFAULT_POLL_MS` 的形状写成常量；
+ * 真需要按部署调时再走一次「新增变量」的完整登记流程（K9：`tests/helpers/env.ts`
+ * **与另外六处手写夹具**）。
+ */
+export const RECONCILE_INTERVAL_MS = 60_000;
 
 /**
  * worker 进程入口（**独立进程、没有 HTTP 服务器**）。
@@ -87,6 +119,41 @@ async function bootstrap(): Promise<void> {
   await runWorker(
     {
       consumer: app.get(OutboxConsumer),
+      // ── 周期任务（P3 / Task 5；控制器裁定 ⑩：**一个**共享机制，不另造第二套循环）──────
+      // 它与 Task 10 的三个计时器搭的是**同一个** runner：`runWorker` 的 `tasks`。
+      // 判据（「到点了吗」）是收 `now` 的纯函数、住在 `exchange/core/timers.ts`；
+      // 这里给的只是「一次 tick 做什么」。
+      tasks: [
+        {
+          name: 'ledger-reconcile',
+          intervalMs: RECONCILE_INTERVAL_MS,
+          runOnce: async () => {
+            const report = await app.get(LedgerReconciliationService).reconcilePerAccount();
+            if (LedgerReconciliationService.isPerAccountClean(report)) return;
+            // ## 对账的语义是「**发现**」，不是「修复」（P2 的划界，逐字继承）
+            // 不变式 #2 的职责是**事后发现**。因此这里只**报**，不改任何一行 ——
+            // 把发现改写成修复会让「钱被动过」这件事失去证据（那正是要查的东西）。
+            //
+            // ## 这一行的形状：一行、有界、不含机密量（C11）
+            // 账户 id 是内部标识，可以进日志；余额可以进（它不是凭证）。**只报前 5 条**：
+            // 一份 20 万行的漂移报告不应该把日志打成一片，而「有漂移」这件事本身
+            // 已经由 `driftAccounts=` 那个计数说清楚了（完整的报告是运维入口的事）。
+            //
+            // 出口是 stderr（与 worker 其余诊断同一个出口，`WorkerModule` 刻意不含
+            // `AppLoggerModule`）；`describeError` 那条「压成单行」的纪律在这里同样适用
+            // —— 因此列表用 `join(',')` 而不是多行。
+            process.stderr.write(
+              `[worker] 账本对账不干净：totalBalance=${report.totalBalance.toString()} ` +
+                `totalEntryAmount=${report.totalEntryAmount.toString()} ` +
+                `driftAccounts=${report.drifts.length} ` +
+                `first=${report.drifts
+                  .slice(0, 5)
+                  .map((d) => `${d.accountId}:${d.drift.toString()}`)
+                  .join(',')}\n`,
+            );
+          },
+        },
+      ],
       close: () => app.close(),
     },
     { signal: controller.signal },

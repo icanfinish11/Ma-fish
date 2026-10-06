@@ -32,9 +32,44 @@ export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5_000;
 /** 单批处理条数（与 `OutboxConsumer.runOnce` 的默认值一致，显式写出以固定契约）。 */
 const BATCH_SIZE = 50;
 
+/**
+ * 一个**周期任务**（P3 / Task 5；控制器裁定 ⑩ / D13）。
+ *
+ * ## 为什么形状是 `{ name, runOnce, intervalMs }` 而不是一个 `setInterval`
+ *
+ * 控制器裁定的原文：「**一个只能靠等待来测的 7 天计时器是不可测的。**」形状的落点是两条：
+ * ① **判据**（「到点了吗」）是收 `now` 的纯函数，住在 `exchange/core/timers.ts`（Task 3）；
+ * ② **谁来 tick** 就是这个接口，它可注入 ⇒ 单测里数次数、读它真的把多少毫秒交给了 `sleep`，
+ * 不必等。
+ *
+ * ## `runOnce` 必须自己保证幂等
+ *
+ * 它可能被重复调用（进程重启、上一轮还没跑完就进入下一轮、以及**本轮已到期的任务
+ * 不会因为上一轮没跑完而跳过**），而 worker 是唯一能**自动**动账本的进程。所有周期任务的
+ * 幂等都落在**确定性幂等键**上（`exchange/core/idempotency.ts`，Task 3）——不要在这里加锁，
+ * 那会造出第二个「谁先谁后」的问题。
+ */
+export interface WorkerTask {
+  /** 稳定名字（进日志；单测按它断言「哪个任务跑了」）。 */
+  readonly name: string;
+  /** 一次 tick。**必须自己保证幂等**（可能被重复调用，且可能与上一轮重叠）。 */
+  runOnce(): Promise<void>;
+  /** 两次 tick 之间的最小间隔（毫秒）。`0` 表示每轮都跑（只用于测试）。 */
+  readonly intervalMs: number;
+}
+
 /** 循环真正用到的那一面（结构化类型：单测不必造一个真 Nest 应用）。 */
 export interface WorkerDependencies {
   consumer: { runOnce(options?: { batchSize?: number }): Promise<number> };
+  /**
+   * **可选**：周期任务（P3 / Task 5 起）。
+   *
+   * 省略时行为与改动前**逐字**相同（`tests/unit/worker/loop.test.ts` 的四条既有用例
+   * 是这条常驻见证；`timers.test.ts` 末尾另有一条「省略 vs 空数组」的并排对照）。
+   * 这就是它与 `consumer` 的区别所在：`consumer` 是**必需**的（worker 的存在理由），
+   * 而周期任务是**加进来**的一层，因此它绝不能改变没有它时的那条路径。
+   */
+  tasks?: readonly WorkerTask[];
   close(): Promise<void>;
 }
 
@@ -158,6 +193,17 @@ export async function runWorker(
 
   log(`[worker] outbox 消费者已启动（每 ${pollMs}ms 轮询一次，单批 ${BATCH_SIZE} 条）`);
 
+  // ── 周期任务（P3 / Task 5；控制器裁定 ⑩ / D13）──────────────────────────────────
+  // 这里是**唯一**读进程时钟的地方：判据本身（`due*` 纯函数，`exchange/core/timers.ts`）
+  // 全部收 `now` 参数，本循环只负责把「现在几点」喂进去。这条边界是刻意的 ——
+  // 「读进程时钟」与「判断到没到点」是两件事，混在一起就让 7 天计时器只能靠等待来测
+  // （控制器裁定 ⑩ 的原文）。**任何判据内部都不许读 `Date.now()`**（D13）。
+  const tasks = deps.tasks ?? [];
+  /** 每个任务**上一次开始 tick** 的时刻（`name` 是稳定键：日志与单测都按它认任务）。 */
+  const lastRunAt = new Map<string, number>();
+  /** 距下一次 tick 还要等多久（毫秒）。`0` = 现在就有任务到期。 */
+  let waitMs = 0;
+
   while (!signal?.aborted) {
     let handled: number;
     try {
@@ -167,8 +213,42 @@ export async function runWorker(
       await sleep(pollMs, signal);
       continue;
     }
-    // 有活干就立刻再来一轮（把积压排空），没活才等
-    if (handled === 0) await sleep(pollMs, signal);
+
+    // 每个任务**自己**的到期时刻：`lastRun` 缺失（从没跑过）⇒ 立刻到期。
+    // 循环本身不需要一个全局的 `lastTickAt` —— 那是**无人读的变量**（C16），
+    // 而这里每一个判断都落在某个任务的记录上。
+    const now = Date.now();
+    waitMs = 0;
+    for (const task of tasks) {
+      const dueAt = (lastRunAt.get(task.name) ?? Number.NEGATIVE_INFINITY) + task.intervalMs;
+      // ★ 「没到点」与「到点了」在这里分开：**先记时刻再跑**，这样一次跑得很久的
+      //   任务不会在下一轮被重复认为是「刚跑过」（记的是**开始**时刻，因此它的下一轮
+      //   到期时刻也是从开始算起——这是刻意的：周期对账要的是「至少每 intervalMs 一次」，
+      //   不是「上一次结束之后再过 intervalMs」）。
+      if (now < dueAt) {
+        waitMs = Math.max(waitMs, dueAt - now);
+        continue;
+      }
+      lastRunAt.set(task.name, now);
+      try {
+        await task.runOnce();
+      } catch (err) {
+        // 与「消费抛错不退出」**同一条纪律**：数据库抖动是暂时的，退出会把「周期对账」
+        // 变成需要人工介入的故障。**但必须记一行** —— 一次静默失败的周期对账等于没有对账
+        // （P2 的 D11 警告的正是「把同一个盲区跑得更勤」）。归属也在这里：点名是哪个任务。
+        log(`[worker] 周期任务 ${task.name} 失败：${describeError(err)}`);
+      }
+    }
+
+    // 没活干就等：**等得比轮询间隔久**当且仅当有任务比它更晚到期。上限取
+    // `max(pollMs, waitMs)` —— 少等会空转打库，多等会让 outbox 的通知延迟变大。
+    const idleMs = handled === 0 ? Math.max(pollMs, waitMs) : 0;
+    if (idleMs > 0) {
+      // 记下**真的等了多久**：单测靠它读「间隔被尊重了没有」（数 tick 次数做不到这件事
+      // ——次数由「跑到第几轮」决定，而「够不够 intervalMs」由这里决定）。
+      if (waitMs > 0) log(`[worker] 等待周期任务：${waitMs}ms`);
+      await sleep(idleMs, signal);
+    }
   }
 
   await closeBounded(deps, shutdownTimeoutMs, log);

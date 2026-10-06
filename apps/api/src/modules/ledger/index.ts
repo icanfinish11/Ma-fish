@@ -33,6 +33,11 @@ export { LedgerModule } from './ledger.module.js';
 export { POLICY_CONDITIONS } from './ledger.controller.js';
 export { LedgerService } from './ledger.service.js';
 export { LedgerReconciliationService } from './reconciliation.service.js';
+// P3 / Task 5：逐账户对账的两份**返回形状**。它们必须在这里 —— `apps/worker` 是独立进程，
+// 而 worker 的周期对账要读 `report.drifts`（C11 那条日志里的账户 id 与差额），
+// 跨模块引用只走 `index.ts`（§3.3 第 2 条 / `no-cross-module-internals`）。
+// `PerAccountReport` 是**判据的输入**（`isPerAccountClean(report)`），不只是内部细节。
+export type { PerAccountDrift, PerAccountReport } from './reconciliation.service.js';
 
 export {
   EmptyPostingError,
