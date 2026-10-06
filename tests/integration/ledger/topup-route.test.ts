@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import request from 'supertest';
+import { Client } from 'pg';
 import type { INestApplication } from '@nestjs/common';
 import { ROLES, uuidv7 } from '@vca/shared';
 import { CSRF_COOKIE, CSRF_HEADER } from '@vca/api/common/security/csrf.middleware.js';
@@ -140,6 +141,63 @@ describe('额度发放路由：POST /ledger/credits（C22 / D9 / D10 / C30）', 
     expect(ok.status).toBe(200);
     expect(ok.body).toMatchObject({ created: true, balance: '100' });
   });
+
+  it('★ 锁争用超出事务预算 ⇒ 503 LEDGER_TX_TIMEOUT（不是 500）：同一幂等键重试是安全的（M3）', async () => {
+    // ## 它挡的缺陷形态（P2 最终全分支审查 M3）
+    //
+    // 请求路径的事务用 Prisma 的**默认**预算（`maxWait` 2 s / `timeout` 5 s），而测试里那些
+    // 持锁的用例显式放宽到 20 s ⇒ 争用超过 5 s 时生产路径抛 `P2028`，而它此前**没有翻译**
+    // ⇒ 500。**安全但不可用**：调用方拿到 500 后无法区分「别重试」与「重试是安全的」，
+    // 而这里的事实恰好是**重试安全**（同一个幂等键走重放 ⇒ `created:false`，不记第二笔）。
+    // ⇒ 修法是把它翻成 **503**（服务暂时不可用 + 可重试），而不是改事务预算——
+    // 后者要在一个**没有测量**的数字上做决定，正是 D8 裁定里被否掉的那种赌注。
+    //
+    // ## ★ 构造的前提是**实测**的，不是照抄审查那句话
+    //
+    // 审查的原话是「争用下生产预算会产出 P2028」。**第一版按那句话写（持锁不放、等 5 s 看它
+    // 变红）实测：请求根本不会在 5 s 时返回——它一直卡在行锁上，60 s 撞测试超时**
+    // （证据 `evidence/fix-m3-step3-route-measure.txt`）。原因是 Prisma 的定时器起爆之后要向
+    // **同一条连接**发 ROLLBACK，而那条连接正被阻塞的语句占着。
+    // ⇒ 被量出来的形状是两条：
+    //   ① 事务预算**不是**锁等待的 deadline（一条可用性事实，据实记载，本任务不改它）；
+    //   ② `P2028` 在**阻塞语句结束之后**才到手 ⇒ 那条翻译在真实路径上确有其事。
+    // 构造因此改成：持锁 6 s（让 5 s 预算在锁还被持有时过期）⇒ 放锁 ⇒ 断言 503。
+    // 断言耗时 > 5 s 是刻意的：它把①也钉住，免得下一个人以为「5 s 预算兜住了延迟」。
+    const userId = await realUser();
+    await post({ userId, amount: '100', idempotencyKey: `tx-timeout-seed:${userId}` }).expect(200); // 先把那一行造出来
+    const locker = new Client({ connectionString: pg.appUri });
+    await locker.connect();
+    try {
+      await locker.query('BEGIN');
+      await locker.query(
+        `SELECT id FROM ledger.accounts WHERE owner_user_id = $1 AND kind = 'USER_AVAILABLE' FOR UPDATE`,
+        [userId],
+      );
+      const started = Date.now();
+      // `post()` 返回的是 supertest 的 `Test`（惰性）：`.then()` 才会真的把请求发出去。
+      const pending = post({ userId, amount: '100', idempotencyKey: `tx-timeout:${userId}` }).then((r) => r);
+      await new Promise((resolve) => setTimeout(resolve, 6_000)); // 让 5 s 预算**在锁还被持有时**过期
+      await locker.query('ROLLBACK');                             // 放锁：被阻塞的 UPDATE 这才完成
+      const res = await pending;
+      const elapsed = Date.now() - started;
+
+      expect(elapsed, '没有真的等过事务预算（这条用例的时序前提不成立，不是断言失败）').toBeGreaterThan(5_000);
+      expect(res.status, `status=${String(res.status)} body=${JSON.stringify(res.body)} elapsed=${String(elapsed)}`).toBe(503);
+      expect(res.body).toEqual({ code: 'LEDGER_TX_TIMEOUT' });
+      // 事务被回滚 ⇒ 那一笔一行都没留下，余额仍是种下去的那 100。
+      expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: `tx-timeout:${userId}` } })).toBe(0);
+      expect(await ledger.readBalances(prisma, userId)).toEqual({ available: 100n, frozen: 0n });
+      // ★ 接受方向的同伴证据：**同一个幂等键**在争用消失之后重试 ⇒ 成功（这正是 503 想告诉
+      //   调用方的那件事：重试安全）。没有这一句，「503」也可能只是「怎么都失败」。
+      const retry = await post({ userId, amount: '100', idempotencyKey: `tx-timeout:${userId}` });
+      expect(retry.status, `重试应当安全：status=${String(retry.status)} body=${JSON.stringify(retry.body)}`).toBe(200);
+      expect(retry.body).toMatchObject({ created: true, balance: '200' });
+      expect(await prisma.ledgerTransaction.count({ where: { idempotencyKey: `tx-timeout:${userId}` } })).toBe(1);
+    } finally {
+      await locker.query('ROLLBACK').catch(() => undefined);
+      await locker.end();
+    }
+  }, 90_000);
 
   it('★ 未知用户 ⇒ 404 LEDGER_UNKNOWN_USER 且库里 0 行（C1：唯一造钱端点上的一次手误不再静默销毁额度）', async () => {
     // ## 它挡的缺陷形态（P2 最终全分支审查的 C1）

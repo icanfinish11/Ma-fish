@@ -68,8 +68,8 @@ const frozenRef = (userId: string): AccountRef =>
  *
  * | 结论 | 落点 | 谁看着它 |
  * |---|---|---|
- * | C25/D8 余额扣减的并发权威是**条件更新的受影响行数** | `applyBalances` | 「两笔并发各冻结 6000」+ 那条确定性用例（`stage === 'conditional-update'`）+ 「解冻」那条（`USER_FROZEN` 那一侧只有它看着） |
- * | C26/D9 幂等键是数据库**唯一约束**，三态：重放 / 409 / 新键 | `postLegs` 的 findUnique 比腿 + `isIdempotencyConflict` | 幂等①②③ |
+ * | C25/D8 余额扣减的并发权威是**条件更新的受影响行数** | `applyBalances` | 「两笔并发各冻结 6000」+ 那条确定性用例（`stage === 'conditional-update'`）+ 「解冻」那条（`USER_FROZEN` 那一侧只有它看着）+ 「托管不透支」那条（I1：托管 / 收入那一侧） |
+ * | C26/D9 幂等键是数据库**唯一约束**，三态：重放 / 409 / 新键 | `postLegs` 的 findUnique 比**腿 + kind** + `isIdempotencyConflict` | 幂等①②③ + 幂等②′（I2：同键同腿异 kind） |
  * | C28 「应用侧显式平衡断言」是唯一稳定的错误通道 | **`postLegs` 头部**那次 `assertBalanced` | 「直接腿入口」三条用例（探针 p7'：删掉它 ⇒ ② 变红） |
  * | D10 一笔过账一行审计，**写在同一个事务里** | `postLegs` 末尾的 `audit.record(…, tx)` | 「账本回滚 ⇒ 审计行 0 行」（独立断言） |
  *
@@ -78,10 +78,34 @@ const frozenRef = (userId: string): AccountRef =>
  * 本文件里因此**没有任何**捕获 `DriverAdapterError` 的代码——那条防线由
  * `tests/integration/db/ledger-enforcement.test.ts` 用「绕过应用直接写分录」证明。
  *
- * ## 为什么本文件只 import `../audit/index.js`
+ * ## ★ 幂等键是**一个全局命名空间**（P2 最终审查 M2：现在把约定写下来）
+ *
+ * 库里那条唯一索引建在 `idempotency_key` **一列**上（`migration.sql` 的
+ * `transactions_idempotency_key_key`），**不是** `(producer, key)`。因此**所有生产者共用
+ * 一个命名空间**，而今天有两个来源会往里放键：
+ *   * **管理员自选**（`POST /ledger/credits` 的请求体，≤ 200 字符，任意字符串）；
+ *   * **worker / P3 自选**（设计 §8.5 举例的 `settle:auction:{id}`）。
+ *
+ * ⇒ **约定（现在就定，因为今天只有一个生产者，改动成本为零）**：
+ *   1. `settle:` 前缀**保留**给 worker / P3 的结算键；管理员（以及任何将来的调用方）
+ *      不得使用它；
+ *   2. 每个生产者给自己的键加**自己的前缀**（管理员走 `admin:` 之类），
+ *      命名空间因此是**不相交的**而不是靠运气；
+ *   3. 一个键一旦用过，它的**含义**就固定了（D9 的判别式含 `kind` 与腿，见幂等②′）。
+ *   **为什么要紧**：若管理员用一个将来会被 worker 使用的键发了额度，那次结算会以
+ *   「重放」返回 `created:false`（或 409）——**调用方以为结算发生了**，而账本里躺着的
+ *   是那笔 TOPUP。这不是理论风险：键是调用方给的，而 `settle:auction:{id}` 是可猜的。
+ *
+ * **据实记载：这是一条约定，不是一条守卫。** 今天**没有**任何代码检查前缀（加检查需要
+ * 先定下「谁拥有哪些前缀」，而那是一次契约变更）。**复访触发条件**：出现**第二个**
+ * 生产者时（P3 的结算落地），同一次改动里必须二选一——加前缀校验，或把唯一索引改成
+ * `(producer, key)`。在那之前，本节是这条规则唯一的存在形式。
+ *
+ * ## 为什么本文件只 import `../audit/index.js` 与 `../auth/index.js`
  * §3.3 第 2 条「跨模块只走显式接口」由 `no-cross-module-internals` 静态强制：
  * 只有 `modules/<other>/index.ts` 被放行。深引 `../audit/audit.service.js` 会让
  * `pnpm arch` 直接报错（那条规则的存在理由写在 `dependency-cruiser.cjs` 里）。
+ * `../auth/index.js` 是同一处置（C1：收款人必须存在，而「在不在」归 auth）。
  */
 @Injectable()
 export class LedgerService {

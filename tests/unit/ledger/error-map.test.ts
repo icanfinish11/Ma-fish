@@ -167,3 +167,59 @@ describe('领域错误 → HTTP 的翻译表（唯一出口）', () => {
     expect(ledgerErrorToHttp({ code: 500 })).toBeNull();
   });
 });
+
+/**
+ * **基础设施层**的错误（不是领域错误）也只有一个出口 —— P2 最终审查 M3。
+ *
+ * ## 它挡的是什么
+ * 请求路径的事务用 Prisma 的**默认**预算（`maxWait` 2 s / `timeout` 5 s），而测试里那些
+ * 持锁的用例显式放宽到 20 s。争用超过 5 s 时 Prisma 抛 `P2028`，而它此前**没有翻译** ⇒ 500。
+ * 500 让调用方无法区分「别重试」与「重试是安全的」，而这里的事实是：**重试是安全的**
+ * （同一个幂等键会走重放路径 ⇒ `created:false`，不会记第二笔）。因此它是 **503**。
+ *
+ * ## 为什么它单独一张表
+ * 上面那张表的每一行都是**领域错误类**（`instanceof`）；这一档判的是 Prisma 的 `code`——
+ * 它是基础设施的形状，不是账本的语义。两张表分开，是为了让「谁负责哪一类」在文件里看得见。
+ */
+interface InfraRow {
+  label: string;
+  error: () => unknown;
+  status: number;
+  code: string;
+}
+
+/** 用真实形状构造：Prisma 的已知错误是 `Error` 的实例，`code` 挂在实例上。 */
+function prismaError(code: string): Error {
+  return Object.assign(new Error(`Prisma 报了一个 ${code}`), { code });
+}
+
+const INFRA_ROWS: InfraRow[] = [
+  {
+    label: 'P2028（Prisma 交互式事务超时：争用/锁等待超出事务预算）',
+    error: () => prismaError('P2028'),
+    status: 503,
+    code: 'LEDGER_TX_TIMEOUT',
+  },
+];
+
+describe('基础设施层错误 → HTTP：P2028 是可安全重试的 503（M3）', () => {
+  for (const row of INFRA_ROWS) {
+    it(`${row.label} ⇒ ${String(row.status)} ${row.code}`, () => {
+      const mapped = ledgerErrorToHttp(row.error());
+      expect(mapped, '这一档没有被翻译（返回了 null ⇒ 500，调用方看不出重试是安全的）').toBeInstanceOf(HttpException);
+      expect(mapped?.getStatus()).toBe(row.status);
+      const body = mapped?.getResponse() as Record<string, unknown>;
+      expect(body.code).toBe(row.code);
+      // 与上面那张表同一条纪律：响应体只有 code（不回显 Prisma 的内部消息）。
+      expect(Object.keys(body), `响应体里混进了别的字段：${JSON.stringify(body)}`).toEqual(['code']);
+    });
+  }
+
+  it('**别的** Prisma 错误码仍然 ⇒ null（不许把任意 Prisma 错误都当成「可重试」）', () => {
+    // 这条是 503 那一档的反面：判别式必须是**恰好一个** code。
+    // 放宽成「任何 Prisma 错误都回 503」会把一次真正的不变量破坏说成一次可重试的争用。
+    for (const code of ['P2002', 'P2025', 'P2034', 'P1001', 'P2010']) {
+      expect(ledgerErrorToHttp(prismaError(code)), `${code} 被误判成事务超时`).toBeNull();
+    }
+  });
+});

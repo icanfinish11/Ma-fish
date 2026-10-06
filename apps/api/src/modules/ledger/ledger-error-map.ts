@@ -4,6 +4,7 @@ import {
   HttpException,
   InternalServerErrorException,
   NotFoundException,
+  ServiceUnavailableException,
   UnprocessableEntityException,
 } from '@nestjs/common';
 import {
@@ -35,6 +36,7 @@ import {
  * | `MissingAccountError` / `SystemAccountMissingError` | 500 | 服务端数据缺失（迁移没跑 / 账户该在而不在） |
  * | `UnbalancedPostingError` / `EmptyPostingError` / `ZeroAmountLegError` / `NetZeroLegError` / `SelfMoveError` | **500** | 服务端**自己的** bug（C28：这些断言的存在就是为了在这里响亮） |
  * | `UnknownAccountKindError` | 422 | 数据里出现了 §8.1 之外的 kind（C30：五个之外一律不认） |
+ * | **`P2028`（Prisma 交互式事务超时）** | **503** | 争用 / 锁等待超出事务预算。**不是**领域错误，但同样只有一个出口：500 会让调用方看不出**重试是安全的**（同一个幂等键会重放） |
  *
  * ## 为什么 409 而不是 400 / 422（与 P1 那次裁定同源）
  *
@@ -58,6 +60,39 @@ import {
  * 而金额的**唯一**合法载体是账本（C22/C27）。
  * 这条性质由 `tests/unit/ledger/error-map.test.ts` 逐档断言（`Object.keys(body)` 恰好是 `['code']`）。
  */
+/**
+ * Prisma 的**交互式事务超时**（`P2028`）—— 基础设施层的形状，不是账本的语义。
+ *
+ * ## 为什么它要在这里翻译（P2 最终审查 M3）
+ * 请求路径的事务用 Prisma 的**默认**预算（`maxWait` 2 s / `timeout` 5 s），而测试里那些持锁的
+ * 用例显式放宽到 20 s。争用超过 5 s 时抛这个错误，而它此前落到 `null` ⇒ **500**：
+ * 调用方无法区分「别重试」与「重试是安全的」，而这里的事实恰好是**重试是安全的**
+ * （同一个幂等键会走重放路径 ⇒ `created:false`，不会记第二笔）。⇒ **503**。
+ *
+ * ## 为什么判别式必须窄到**恰好一个 code**
+ * 放宽成「任何 Prisma 错误都回 503」会把一次真正的不变量破坏说成一次可重试的争用——
+ * 那正是本文件开头那条「500 与 4xx 之间不能含糊」的反面。反例由
+ * `tests/unit/ledger/error-map.test.ts` 的「别的 Prisma 错误码仍然 ⇒ null」那条守着。
+ *
+ * ## 见证（端到端，实测）
+ * `tests/integration/ledger/topup-route.test.ts` 的「锁争用超出事务预算 ⇒ 503」：用一条独立
+ * 连接把目标用户的账户行 `FOR UPDATE` 锁住、持锁 6 s（让 5 s 预算在锁还被持有时过期）、
+ * 放锁 ⇒ 请求以 **503 `LEDGER_TX_TIMEOUT`** 返回（实测耗时 **6196 ms**），库里一行未留，
+ * 然后**同一个幂等键**重试 ⇒ 200（证明「重试安全」那句话）。
+ *
+ * ## ★ 顺带被量出来的一件事（审查那句话的机制与它说的不同，据实记载）
+ * 审查的原话是「争用下生产预算会产出 P2028」。**第一版按那句话写（持锁不放、等 5 s 看它
+ * 变红）实测：请求在 5 s 时根本不会返回——它一直卡在行锁上，60 s 撞测试超时**
+ * （证据 `evidence/fix-m3-step3-route-measure.txt`）。原因是 Prisma 的定时器起爆之后要向
+ * **同一条连接**发 ROLLBACK，而那条连接正被阻塞的语句占着。
+ * ⇒ **事务预算不是锁等待的 deadline**：延迟由争用方决定，`P2028` 在阻塞语句结束之后才到手。
+ * 这是一条**可用性**事实，本任务**没有**改它（改它要先在一个没有测量的数字上做决定）；
+ * 修的是「拿到 P2028 时回什么」。两者的分工写在这里，免得下一个人把 503 当成延迟兜底。
+ */
+function isTransactionTimeout(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'P2028';
+}
+
 export function ledgerErrorToHttp(error: unknown): HttpException | null {
   if (error instanceof InsufficientFundsError) {
     return new ConflictException({ code: 'LEDGER_INSUFFICIENT_FUNDS' });
@@ -103,6 +138,11 @@ export function ledgerErrorToHttp(error: unknown): HttpException | null {
   }
   if (error instanceof SelfMoveError) {
     return new InternalServerErrorException({ code: 'LEDGER_SELF_MOVE' });
+  }
+  // 基础设施层的那一档（**不是**领域错误：它判的是 Prisma 的 code，不是 `instanceof`）。
+  // 放在领域错误之后：两者对象形状不同，顺序不影响结果，但「先语义、后基础设施」更好读。
+  if (isTransactionTimeout(error)) {
+    return new ServiceUnavailableException({ code: 'LEDGER_TX_TIMEOUT' });
   }
   // 未登记的错误 ⇒ null：交给 Nest 的默认过滤器，**不**伪装成一个已知错误。
   // 它自己**绝不抛**（输入可能是 null / 字符串 / 任意对象）——翻译表在 catch 里被调用，
