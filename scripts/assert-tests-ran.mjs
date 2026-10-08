@@ -196,6 +196,22 @@ const SCOPED_GATES = {
     floor: 9,
     why: 'P3 Task 4 的真库见证（账户行取锁顺序 / 两档真死锁 / 非法 kind 经真实服务被拒）',
   },
+  // P3 / Task 5.5（增量 A 的数据面）的**新列形状**见证。实测：3 条，0 条 skip。
+  //
+  // 为什么它也要有下限：这一组是「六个承诺列 + `code_lines` 在库里长什么样」的**唯一**
+  // 机器见证——`prisma migrate diff` 能证明「库与 schema 一致」，但证明不了
+  // 「可空性真的是可空的」（它比对的是两份声明，不是数据库的行为；Task 2 的探针 S-2
+  // 已经量过漂移门对手写 DDL 的失明）。把这三条静默删掉或 skip 掉，
+  // 「`null` = 没有声明」与「旧行没有 `code_lines`」这两条语义就再没有任何东西在检查。
+  //
+  // ⇒ 同一条纪律对新用例**立刻**生效（Task 4 在本文件里写下的那句话）：
+  // 不给下一个任务留「从零算一遍未受保护面」的活。
+  'fidelity-columns': {
+    project: 'integration',
+    paths: ['tests/integration/db/fidelity-columns.test.ts'],
+    floor: 3,
+    why: 'P3 Task 5.5 的真库见证（增量 A 八个列的类型与可空性 / NULL 是被接受的 / null ≠ 空集）',
+  },
 };
 
 /** vitest 自己的 JS 入口（读它 `package.json` 里声明的 `bin.vitest`，不猜路径）。 */
