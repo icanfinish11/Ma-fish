@@ -79,6 +79,24 @@ export interface ParsedMetadata {
    * 判据只有在**真的丢掉了文件**时才为真（恰好等于上限不算截断）。
    */
   fileTreeTruncated: boolean;
+  /**
+   * 代码行数合计（**下界**：扫描有上限，见 `CODE_LINE_SCAN_MAX_FILES` 与
+   * `CODE_READ_BYTES_PER_FILE`——第 33 个代码文件之后的不数、单个文件 64 KiB 之后的
+   * 不数，因此它只会**低估**）。
+   *
+   * ★ 增量 A / Task 5.5：它此前**只**作为 `facts().codeLines` 参与评分，算完就丢掉，
+   * 因此 `asset_metadata` 里没有它、`AssetMetadataView` 里也没有它。保真链需要它落库：
+   * `min_code_lines(n)` 这条声明（Task 6 的闭集）的判据就是这一列。
+   *
+   * ## 两个类型不是同一个（别把它们合并）
+   *
+   * **解析侧**（这里）**总是**知道行数——它是刚算出来的，因此 `number`；
+   * **读取侧**（`asset-access.service.ts` 的 `AssetMetadataView`）**可能不知道**——
+   * 迁移之前的旧行没有这个值，因此那边是 `number | null`。
+   * 把读侧写成 `number` 会逼出一个编造的 `0`，而那会把「之前不存在」与「真的 0 行」
+   * 混成同一个值（那正是 `eligibility.ts` 类注释里点名的「三个取值来源」那一类缺陷）。
+   */
+  codeLines: number;
 }
 
 export interface ParseMetadataOptions {
@@ -537,6 +555,10 @@ class MetadataScanner {
       dependencies: this.dependencyList(),
       completeness: scoreCompleteness(this.facts(), weights),
       fileTreeTruncated: this.treeTruncated,
+      // ★ 增量 A / Task 5.5：把数到的行数**带出去**（此前它只进 `facts()` 参与评分）。
+      // 它直接取字段，与 `facts()` 里那一个是**同一个**来源——两处各算一遍会让
+      // 「分数里算的是 8 行、落库的是别的数」在原理上可能发生。
+      codeLines: this.codeLines,
     };
   }
 

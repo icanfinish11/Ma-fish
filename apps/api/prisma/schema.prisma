@@ -239,6 +239,32 @@ model AssetMetadata {
   /// 数组本身放不下这个事实，而「截断了却看不出」会让预览资料谎报项目规模。
   fileTreeTruncated Boolean @map("file_tree_truncated")
 
+  /// ★ 增量 A / Task 5.5：解析期算出的**代码行数合计**（下界——扫描有上限，见
+  /// `parse-metadata.ts` 的 `CODE_LINE_SCAN_MAX_FILES` 与 `CODE_READ_BYTES_PER_FILE`）。
+  ///
+  /// ## 为什么它此前不存在，以及为什么现在存在
+  ///
+  /// 它此前**只**作为 `CompletenessFacts.codeLines` 参与 §6.2 的评分，算完就丢掉 ——
+  /// 于是「代码行数统计」（§6.1 第 1 行的 dossier 十项之一）在库里没有落点，
+  /// 而保真链的 `min_code_lines(n)` 声明（增量 A 的承诺闭集）**没有判据**。
+  /// D16 的复访条件（「要真实行那三条时，`asset_metadata` 需要新增对应的列」）
+  /// 就触发在这一列上，而修法是**换判据方向**：从「平台自动校验」改成「作者声明 + 机器核对」。
+  ///
+  /// ## **可空是承重的，不是风格**
+  ///
+  /// 迁移会跑在**已有数据的库**上（P3 Task 2 的双验要求「那一行活过 `ALTER TABLE`」）。
+  /// 给旧行填 `0` 会把「**这一列之前不存在**」与「**这份制品真的 0 行代码**」变成
+  /// 同一个值 —— 而 `min_code_lines(n)` 的判据读到 `0` 会**判违约成立**：
+  /// **一次数据缺失因此变成一次错误的裁决。**
+  /// ⇒ 可空 + **声明侧 fail-closed**（A-6 的 `assertClaimVerifiable`：这一列为空时
+  /// **不允许**声明 `min_code_lines`）。读侧的类型因此是 `number | null`
+  /// （`AssetMetadataView`），而写入侧（刚算完的解析结果）是 `number`——
+  /// 两侧的事实确实不同，别把它们写成同一个类型。
+  ///
+  /// 见证：`tests/integration/db/fidelity-columns.test.ts`（形状 + 「NULL 是被接受的」）、
+  /// `tests/integration/asset/ownership.test.ts`（写路径落值 + 读路径原样读回）。
+  codeLines Int? @map("code_lines")
+
   assetVersion AssetVersion @relation(fields: [assetVersionId], references: [id])
 
   @@schema("asset")
@@ -453,6 +479,47 @@ model SwapOffer {
   /// 而不是「72 这个魔数出现在查询里」——将来按类别给不同期限时，改的是写入侧一处。
   expiresAt DateTime @map("expires_at") @db.Timestamptz(3)
 
+  // ── ★ 增量 A / Task 5.5：**提议方对自己拿出来的那一件作品的承诺** ──────────────
+  //
+  // 它们写在 `propose` **那一刻**（Task 6），而不是写在合约上。理由是一条时序论证
+  // （规格 §5.1 的 TOCTOU 论证）：`propose` 时合约**还不存在**，而提议方的承诺必须在
+  // **他能反悔之前**落下；接受方的确认只能在**他看到之后**落下（那三个在 `SwapContract` 上）。
+  // 两处一起才表达得出「**双方各自**承诺了什么」。释放时读 `contract.offer` 取这三列
+  // （同 schema，不违反 C5）。
+  //
+  // 三个值一起才是「哪一份」：`versionId` 说**哪一个版本**、`sha256` 是那个版本的**明文摘要**
+  // （`asset_versions.sha256`，上传时算出，已存在）、`dossierDigest` 是平台生成的 dossier 的
+  // **规范序列化**的摘要（A-9 的 `dossierDigestOf`；A-6 **先存**，A-9 落地后再接真值）。
+  //
+  // **可空**：迁移之前落库的要约没有这三个值，填一个假值（零 UUID / 空串）会让
+  // 「这份要约没有承诺」与「它承诺了一个全零的版本」分不开——与 `claims` 同一条纪律。
+  // 写入侧的 fail-closed（A-6 的 `propose` 必须填满三列）是**应用**的事，列只表达
+  // 「历史行可能没有」。
+
+  /// 提议方在 `propose` 那一刻拿出来的那个 `asset_versions.id`。
+  offeredVersionId String? @map("offered_version_id") @db.Uuid
+
+  /// 上面那个版本的**明文** sha256（= `asset_versions.sha256`）。
+  offeredSha256 String? @map("offered_sha256")
+
+  /// 被要约方看到的那份 dossier 的**规范序列化**摘要（A-9 算，A-6 存）。
+  offeredDossierDigest String? @map("offered_dossier_digest")
+
+  /// ★ 增量 A / Task 5.5：提议方的**声明**（承诺闭集，规格 §6；写侧在 A-6）。
+  ///
+  /// 闭集只有五条：`paths_exist` / `entry_file_exists` / `dependency_manifest_parses` /
+  /// `min_code_lines` / `declared_stack`。**不接受自由文本**——那会把「机器可证的违约」
+  /// 退化成一场口水仗（规格 §6.3 的纪律）。
+  ///
+  /// ## **可空是承重的**：`null` = **没有声明**，它与「声明了一个**空集**」不是同一件事
+  ///
+  /// 与 `readme_excerpt` 完全同一条纪律（那个列上写着「『没有』与『空文件』不是同一件事」）。
+  /// 写成 `NOT NULL DEFAULT '[]'` 会让「这份要约什么都没承诺」与「它承诺了零条」合并成
+  /// 一个值，而释放前的校验（A-8）与争议审判（P3.5）都要问「**有没有**声明」。
+  /// 见证：`tests/integration/db/fidelity-columns.test.ts` 的
+  /// 「`claims` 的 NULL 与空集是两个不同的值」。
+  claims Json?
+
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
 
   /// 一份要约的 1:1 合约（`ACCEPTED` 时才存在）。
@@ -488,6 +555,26 @@ model SwapContract {
   /// 全局锁序（C35），业务代码不得依赖这里的先后。
   assetAId String @map("asset_a_id") @db.Uuid
   assetBId String @map("asset_b_id") @db.Uuid
+
+  // ── ★ 增量 A / Task 5.5：**接受方对被要约作品的确认** ──────────────────────────
+  //
+  // 写在 `accept` **那一刻**（Task 6），与 `SwapOffer` 上提议侧那三列对称。
+  // 为什么必须分成两处：提议方的承诺要在他**能反悔之前**落下，而接受方的确认只能在
+  // 他**看到之后**落下——`accept` 请求必须把预览响应给的 `(assetVersionId, dossierDigest)`
+  // **原样带回**（规格 §5.1 的 TOCTOU 执行点）：若作者在接受方看完预览之后、点接受之前
+  // 上传了新版本，**接受失败**并提示「资料已变更，请重新查看」，而不是把这次接受绑到
+  // 一份对方**从未看过**的 dossier 上。没有这一列，钉住记的就只是「平台此刻的版本」。
+  //
+  // **可空**：迁移之前的合约没有它们（同上，假值比 NULL 更糟）。
+
+  /// 接受方确认的那个 `asset_versions.id`（= 被要约作品的那一份）。
+  targetVersionId String? @map("target_version_id") @db.Uuid
+
+  /// 上面那个版本的**明文** sha256（= `asset_versions.sha256`）。
+  targetSha256 String? @map("target_sha256")
+
+  /// 接受方看到的那份 dossier 的**规范序列化**摘要（A-9 算，A-6 存）。
+  targetDossierDigest String? @map("target_dossier_digest")
 
   /// `PENDING_BOTH_LOCK` / `VALIDATING` / `RELEASED` / `DISPUTED` / `SETTLED` / `CANCELLED`
   /// （§6.3 + D18 对 `DISPUTED` 的落点说明）。CHECK 钉住闭集（见迁移）。

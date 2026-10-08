@@ -155,6 +155,11 @@ export class AssetVersionService {
           dependencies: metadata.dependencies,
           completeness: metadata.completeness,
           fileTreeTruncated: metadata.fileTreeTruncated,
+          // ★ 增量 A / Task 5.5：代码行数**落库**（保真链的 `min_code_lines(n)` 判据要读它）。
+          // 来源是解析器刚数出来的那个数（`ParsedMetadata.codeLines`，**总是**有值）；
+          // 这一列在库里**可空**，因为迁移之前的旧行没有这个值——写入侧因此不存在
+          // 「写 null」这条路（真写 null 只可能来自 `metadata.codeLines` 被伪造）。
+          codeLines: metadata.codeLines,
         },
       });
 

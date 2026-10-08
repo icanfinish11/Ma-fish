@@ -12,6 +12,7 @@ import { PrismaService } from '@vca/api/db/prisma.service.js';
 import { AuditService } from '@vca/api/modules/audit/index.js';
 import { AssetService } from '@vca/api/modules/asset/asset.service.js';
 import { AssetVersionService } from '@vca/api/modules/asset/asset-version.service.js';
+import { AssetAccessService } from '@vca/api/modules/asset/asset-access.service.js';
 import {
   AssetNotFoundError,
   OwnershipService,
@@ -172,6 +173,20 @@ describe('asset schema：迁移落地的形状（C4 / C5 / C6）', () => {
       'asset_metadata.dependencies:jsonb',
       'asset_metadata.completeness:integer',
       'asset_metadata.file_tree_truncated:boolean',
+      // ★ 增量 A / Task 5.5：`code_lines` 是列全集里新增的那一格（保真链的
+      // `min_code_lines` 判据要读它）。
+      //
+      // **它在 `file_tree_truncated` 之后**，因为迁移是一条 `ALTER TABLE … ADD COLUMN`
+      // —— PostgreSQL 把新列追加在末尾，`ordinal_position` 因此排在最后（= 8）。
+      // **据实记载一处计划与实际不符**：计划 Step 5 写的是「在 `asset_metadata.completeness:integer`
+      // 之后插入一行」，而那个位置与这条断言的 `ORDER BY … ordinal_position` **冲突**——
+      // 照计划放会红。接线之后第一次跑这条用例，diff 打出的正是
+      // `+ "asset_metadata.code_lines:integer?"` 落在 `file_tree_truncated` 与
+      // `asset_versions.id` 之间（`evidence/t55-step35-pipeline-red.txt`），本行据此定稿。
+      //
+      // 可空（`?`）是刻意的：旧行没有这个值，填 0 会把「之前不存在」与「真的 0 行」
+      // 混成同一个值（见 Task 5.5 的「先验再做」）。
+      'asset_metadata.code_lines:integer?',
       // 版本记录：`storage_key` 与 `plaintext_bytes` 是 Task 5 移交给本任务的两列
       // （前者给下载路径取对象，后者是**写入侧计量器**数出的那个带外长度）。
       'asset_versions.id:uuid',
@@ -239,6 +254,7 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
   let prisma: PrismaService;
   let assets: AssetService;
   let versions: AssetVersionService;
+  let access: AssetAccessService;
   let store: LocalArtifactStore;
   let storeDir: string;
 
@@ -258,6 +274,9 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
     // 这正是 Task 5 的注释预告的时机）。因此这里给的是 `ringFromEnv()`——**同一份**环境夹具
     // 算出的同一个环，而不是另造一个。
     versions = new AssetVersionService(prisma);
+    // ★ 增量 A / Task 5.5：读路径的那一半（`AssetAccessService.readMetadata`）。
+    // 它只依赖 `PrismaService`（一次 `select`），因此不需要 `AssetService` 的那套注入。
+    access = new AssetAccessService(prisma);
     assets = new AssetService(
       store,
       ringFromEnv(),
@@ -328,6 +347,110 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
     expect(row.completeness).toBe(metadata.completeness);
     expect(row.fileTreeTruncated).toBe(metadata.fileTreeTruncated);
     expect(row.fileTreeTruncated).toBe(false);
+  });
+
+  /**
+   * ★ 增量 A / Task 5.5：**写路径**把 `code_lines` 落库，来源是解析器算出的那个数。
+   *
+   * ## 为什么这一条与「六个元数据字段逐字段落库」那条分开
+   *
+   * 那一条的标题数的是**六个**字段（`ParsedMetadata` 当时的形状），而 `code_lines` 是
+   * 保真链新增的第七项——把它塞进那一条会让「哪些字段属于哪次改动」在一个标题里消失。
+   *
+   * ## 判据的**地面真值**（不是自我对照）
+   *
+   * `ok.zip` 里唯一的代码文件是 `src/index.ts`，内容是
+   * `'export const answer = 42;\n'.repeat(8)` ⇒ **8 行**（`countLines` 数换行符，
+   * 末尾是换行所以不加一）；`README.md` 是 Markdown——它在 `NON_CODE_LANGUAGES` 里
+   * ⇒ **一行都不算**。两个数都不是从被测代码里读出来的，因此「两边都是 0」这种写法
+   * 不能让它变绿。
+   *
+   * ## 它拦得住的那个缺陷
+   *
+   * 这一列**曾经根本不存在**（解析期算进 §6.2 的分数之后就丢掉）⇒ 保真链的
+   * `min_code_lines(n)` 声明没有判据。**接线之前这条用例实测以
+   * `expected null to be 8` 变红**（报告 §TDD 有那次的原始输出）。
+   */
+  it('★ 增量 A：`code_lines` 落库，值是解析器算出的 8 行（ok.zip 的 src/index.ts）', async () => {
+    const { assetId, ingested, metadata } = await ingestVersion(prisma, assets, store);
+
+    const persisted = await versions.persistIngested({ assetId, ingested, metadata });
+    const row = await prisma.assetMetadata.findUniqueOrThrow({
+      where: { assetVersionId: persisted.assetVersionId },
+    });
+
+    expect(row.codeLines).toBe(8);
+    // 与解析结果**同一来源**：库里的值必须**就是**解析器带出来的那个数。上面那句钉的是
+    // 地面真值，这一句钉的是**同源**——两句一起才排除「两边都是同一个错误常数」。
+    expect(metadata.codeLines).toBe(8);
+    expect(row.codeLines).toBe(metadata.codeLines);
+  });
+
+  /**
+   * ★ 增量 A / Task 5.5：**读路径**把 `code_lines` 带出来。
+   *
+   * 判据写成**键全集**而不是「逐字段存在性」：`readMetadata` 的 `select` 是一张白名单
+   * （`storage_key` / `file_id` / `key_id` / `sha256` 刻意**取不到**，见那个方法的注释），
+   * 因此「少带出一列」与「多带出一列」都必须红——而存在性断言对前者完全瞎。
+   *
+   * **这一条在接线之前也能编译**（`Object.keys` 不需要那个字段的声明），因此它是本任务里
+   * **先红后绿**的那一条：接线前实测 `+ "codeLines"` 缺失而变红（报告 §TDD 有原始输出）。
+   */
+  it('★ 增量 A：读路径把 `code_lines` 带出来（`readMetadata` 的 select 是白名单）', async () => {
+    const { assetId, ingested, metadata } = await ingestVersion(prisma, assets, store);
+    const persisted = await versions.persistIngested({ assetId, ingested, metadata });
+
+    const view = await access.readMetadata(persisted.assetVersionId);
+
+    expect(view, '元数据行写进去了却读不回来').not.toBeNull();
+    expect(Object.keys(view!).sort()).toEqual([
+      'assetVersionId',
+      'codeLines',
+      'completeness',
+      'dependencies',
+      'fileTree',
+      'fileTreeTruncated',
+      'languages',
+      'readmeExcerpt',
+    ]);
+    // 键全集只说「带出来了」，这一句说「带出来的是**那一列的值**」：三句一起才排除
+    // 「键在、值是常量」那种写法（`null` 也能满足上面的键全集）。
+    expect(view!.codeLines).toBe(8);
+    expect(view!.codeLines).toBe(metadata.codeLines);
+  });
+
+  /**
+   * ★ 增量 A / Task 5.5：**旧行**（`code_lines` 为 NULL）读回 `null`，**不是** `0`。
+   *
+   * 这一条与上面那条是**一对**：上面钉「有值时读回那个值」，这一条钉「**没有值时读回
+   * 没有值**」。两条缺一条，`number | null` 这个类型就有一半是没有见证的——
+   * 而缺的若是这一半，一个把 NULL 折成 `0` 的实现会让 `min_code_lines(n)`
+   * **判违约成立**：**一次数据缺失变成一次错误的裁决**（这是 `code_lines` 可空而不
+   * `NOT NULL DEFAULT 0` 的全部理由）。
+   *
+   * ## 为什么用 `UPDATE` 造旧行，而不是「迁移之前先写一行」
+   *
+   * 「迁移之前的行」在**这个**库里造不出来（迁移是 testcontainer 引导的一部分，
+   * 那时还没有任何行）。可空性已经由 `tests/integration/db/fidelity-columns.test.ts`
+   * 在**真库**上钉住（列是 `YES`，且一条 `NULL` 的 `INSERT` 被接受），因此这里只需要
+   * 造出那个**取值**即可——用属主身份把这一列改回 NULL（生产路径不会这么做，
+   * 这条语句本身就是「模拟历史数据」的说明）。
+   */
+  it('★ 增量 A：旧行（code_lines 为 NULL）读回 `null` 而不是 `0`', async () => {
+    const { assetId, ingested, metadata } = await ingestVersion(prisma, assets, store);
+    const persisted = await versions.persistIngested({ assetId, ingested, metadata });
+
+    // 先确认这一行**本来有值**（否则下面那句 `toBeNull` 会在一片 NULL 上白绿）。
+    expect((await access.readMetadata(persisted.assetVersionId))!.codeLines).toBe(8);
+
+    await owner.query(`UPDATE asset.asset_metadata SET code_lines = NULL WHERE asset_version_id = $1`, [
+      persisted.assetVersionId,
+    ]);
+
+    const view = await access.readMetadata(persisted.assetVersionId);
+    expect(view, '版本行还在，元数据却读不回来了').not.toBeNull();
+    // `toBeNull` 同时排除 `0` 与 `undefined`：`0` 是那个会制造错误裁决的编造值。
+    expect(view!.codeLines).toBeNull();
   });
 
   it('版本与元数据**同一事务**：元数据写不进去时版本也不留行', async () => {

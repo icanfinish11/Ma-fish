@@ -112,6 +112,10 @@ export class AssetAccessService {
             dependencies: true,
             completeness: true,
             fileTreeTruncated: true,
+            // ★ 增量 A / Task 5.5：保真链的 `min_code_lines(n)` 判据要读这一列。
+            // 它在白名单里（它不是 `storage_key` / `file_id` / `key_id` / `sha256`
+            // 那四类服务端标识，而是 §6.1 的 dossier 十项之一「代码行数统计」）。
+            codeLines: true,
           },
         },
       },
@@ -130,6 +134,10 @@ export class AssetAccessService {
       dependencies: metadata.dependencies as unknown as ParsedMetadata['dependencies'],
       completeness: metadata.completeness,
       fileTreeTruncated: metadata.fileTreeTruncated,
+      // 原样读回（`number | null`）：旧行没有这个值 ⇒ `null`，**不是** `0`。
+      // 编造一个 `0` 会让「这一列之前不存在」与「这份制品真的 0 行代码」变成同一个值，
+      // 而声明侧的判据读到 `0` 会**判违约成立**——一次数据缺失变成一次错误的裁决。
+      codeLines: metadata.codeLines,
     };
   }
 }
@@ -157,9 +165,34 @@ export interface DownloadableVersion {
   readonly keyId: string;
 }
 
-/** 元数据响应的形状：`ParsedMetadata` 逐字段 + 版本 id（**只有它，没有别的**）。 */
-export interface AssetMetadataView extends ParsedMetadata {
+/**
+ * 元数据响应的形状：`ParsedMetadata` 逐字段 + 版本 id（**只有它，没有别的**）。
+ *
+ * ## ★ 增量 A / Task 5.5：`codeLines` 的**类型两侧不同**，因此它是 `Omit` 之后单独声明的
+ *
+ * ```ts
+ * extends Omit<ParsedMetadata, 'codeLines'>   // 其余字段照旧（写入侧与读取侧事实相同）
+ * readonly codeLines: number | null;          // ← 这一侧**可能不知道**
+ * ```
+ *
+ * 写成 `extends ParsedMetadata`（即 `codeLines: number`）**连编译都过不去**——而那是好事：
+ * 这两侧的事实确实不同。**写入侧**（`parse-metadata.ts` 的 `ParsedMetadata`）的行数总是
+ * 刚算出来的，**读取侧**却要面对**迁移之前的旧行**（那一列是 NULL）。
+ * ⇒ 从 `ParsedMetadata` 里 `Omit` 掉再单独声明，**不是**为了绕开类型检查，而是因为
+ * 「写侧一定有值、读侧可能没有」这句话在类型上必须说出来；写成 `number` 会逼出一个
+ * 编造的 `0`，而 `0` 与「不知道」在保真链的判据里是**相反**的结论。
+ */
+export interface AssetMetadataView extends Omit<ParsedMetadata, 'codeLines'> {
   readonly assetVersionId: string;
+  /**
+   * `asset_metadata.code_lines` **原样**读回。**可空**是刻意的：迁移之前的行没有这个值，
+   * 而 `0` 会把「之前不存在」与「真的 0 行」混成同一个值 —— 那正是
+   * `eligibility.ts` 类注释里点名的「三个取值来源」那一类缺陷。
+   *
+   * 消费侧的义务（Task 6 的 `assertClaimVerifiable`）：这一项为 `null` 时**不允许**
+   * 声明 `min_code_lines`（fail-closed），而不是把它当成 0 去判违约。
+   */
+  readonly codeLines: number | null;
 }
 
 /**
