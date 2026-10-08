@@ -525,17 +525,45 @@ model SwapOffer {
   /// 一份要约的 1:1 合约（`ACCEPTED` 时才存在）。
   contract SwapContract?
 
-  /// 同一对 (作品, 对手方) 上的要约唯一。这是「重复发要约」的执行点：
+  /// 同一对 (作品, 对手方) 上的**活跃**要约唯一。这是「重复发要约」的执行点：
   /// 第二次同向要约撞唯一索引（P2002），而不是静默多出一行。
+  ///
+  /// ## ★ P3 / Task 6（控制器裁定 ①）：库里的这条索引是**部分**唯一索引
+  ///
+  /// ```sql
+  /// CREATE UNIQUE INDEX "swap_offers_target_asset_id_counterparty_id_key"
+  ///   ON "exchange"."swap_offers"("target_asset_id", "counterparty_id")
+  ///   WHERE status IN ('DRAFT', 'SENT');   -- ← 只覆盖**非终态**
+  /// ```
+  ///
+  /// 理由逐字（裁定）：**「`REJECTED` 是终态」约束的是*那一份要约*，而不是*那一对人*。**
+  /// 全线唯一之下，「被拒过一次」会让这一对**永远**不能再对同一件作品发第二次要约 ——
+  /// 一次拒绝永久封死了一条配对路径。部分索引把「活跃要约唯一」这条真正要强制的性质
+  /// 表达出来，且**不动状态机、不引入新的产品概念**（骚扰的上界由 C33 的限流档与
+  /// 目标方自己拒绝的能力承担）。迁移：`20261007140000_p3_swap_offers_partial_unique`。
+  ///
+  /// ## ★★ 这里的 `@@unique` **不是**那条索引的完整声明 —— 漂移门对它失明（实测）
+  ///
+  /// Prisma 表达不了部分索引（`@@unique` 没有 `where` 参数），因此谓词只能手写。
+  /// **保留本行**是刻意的：实测四个方向，见 `20261007140000_.../migration.sql` 的头注释
+  /// （① 同名部分索引 ⇒ `No difference detected`；② 删掉本行 + 库里留着部分索引 ⇒
+  /// **同样** `No difference detected`；③ 保留本行而删掉索引 ⇒ exit 2、点名
+  /// `[+] Added unique index`；④ 换个索引名 ⇒ 报 `Renamed index`）。
+  /// ⇒ **保留本行**让漂移门继续保证「这条索引按名字与列集合存在」这一半；
+  /// 而**谓词**（`WHERE status IN (…)`）的**唯一**机器见证是真库目录断言
+  /// （`tests/integration/db/exchange-enforcement.test.ts` 的 `pg_indexes.indexdef`）
+  /// 加两条行为见证（重新要约成功 / 活跃要约被拒）。
+  /// **不得**把谓词宣传成「漂移门见证的」—— Task 2 已经量过一次同一族失明
+  /// （`migrate diff` 看不到手写 `CHECK`）。
   ///
   /// **它的边界要据实写清**：
   ///   * 它只挡 `(targetAssetId, counterpartyId)` 这一对，**不挡**同一份要约被接受两次
   ///     （那由 `status` 的状态机守卫 + 合约上的 `offer_id` 唯一外键挡）；
-  ///   * 它带着**状态维度缺失**的代价：`REJECTED` 之后重新发要约也会撞上它。
-  ///     控制器裁定 ①（P3 计划落地时的那条）已定：唯一索引应写成**只覆盖非终态的
-  ///     部分唯一索引**（`WHERE state IN (非终态集合)`）。那是一次需要同时改 model、
-  ///     迁移与 `proposeOffer` 的改动，属 **Task 6** 的落点（本任务只建表，
-  ///     不替它选一个会改变语义的形状）。**据实记载**：今天这里是全线唯一。
+  ///   * 它**带状态**（部分索引），因此一份终态的历史要约**不挡**下一次要约；
+  ///   * 同一个 `(target, counterparty)` 上**仍然只允许一份非终态要约**，因此
+  ///     「换一件作品再发一次」在这个形状下是**复用**那一行（`created: false`），
+  ///     而不是第二行 —— 服务层的契约与粗糙点写在 `exchange.service.ts` 的
+  ///     `proposeOffer` 头注释上。
   @@unique([targetAssetId, counterpartyId])
   @@schema("exchange")
   @@map("swap_offers")

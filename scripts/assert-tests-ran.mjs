@@ -87,7 +87,19 @@ const GATES = {
   // **既有用例里的断言**（不新增条数），它们的判别力由探针 p-drop-policy / p-drop-module 证明。
   //   ⇒ 实测值（不是预测）：`node scripts/assert-tests-ran.mjs security` = `Tests 89 passed (89)`；
   //     把矩阵里任意一条 `it` 改成 `it.skip` ⇒ 88 < 89 ⇒ 以 `::error::` 变红（探针 `p-security-floor` 实测）。
-  security: 89,
+  //
+  // P3 / Task 6：**89 → 115**（+26）。把**交换的越权矩阵**纳入 security 门
+  // （`tests/security/exchange/authz-matrix.test.ts`）：6 端点 × 4 角色 = 24 格
+  // + 1 条「`swapOfferSent` 恰好放行『被要约方 + `SENT`』」（三份断言：对手方 200 /
+  // 发起方 403 / 已过期 403）+ 1 条「矩阵覆盖全部已注册的 exchange 路由」。`exchange` 是
+  // P3 里**唯一**能改所有权状态的模块（原子释放会换掉 `assets.owner_id`，Task 8），
+  // 因此「未授权者动不了它」必须计在 security 的账上。
+  //   两条覆盖率门（policy / rate-limit）里新增的是**既有用例里的断言**（六条路由的声明与
+  //   限流归属，各 6 条 `expect`，但**不新增 `it`**）⇒ 它们**不**计入这个数，
+  //   判别力由探针 P-T6-a（删掉 `ExchangeModule` 的接线）与 P-T6-b（删掉一条 `@RateLimited`）证明。
+  //   ⇒ 实测值（不是预测）：`node scripts/assert-tests-ran.mjs security` = `Tests 115 passed (115)`；
+  //     把矩阵里任意一条 `it` 改成 `it.skip` ⇒ 114 < 115 ⇒ 以 `::error::security` 变红。
+  security: 115,
   architecture: 5,
   // P2 / Task 1：**判决 1 的病根就是这里**——设计 §8.3 的「≥10 万次属性测试」此前
   // 没有任何执行者：`tests/property/` 不存在、`test:property` 带 `--passWithNoTests`
@@ -159,18 +171,39 @@ const GATES = {
  */
 const SCOPED_GATES = {
   // P3 / Task 2 的真库强制点。实测（`--reporter=json`）：15 条，0 条 skip。
+  //
+  // P3 / Task 6：**15 → 18**（+3）。**手写谓词**（部分唯一索引）的三条见证：
+  // ① 目录里 `pg_indexes.indexdef` 逐字含 `WHERE`，且取值集合与
+  //    `ACTIVE_OFFER_STATUSES` 排序后相同（跨文件一致性）；
+  // ② `REJECTED`（以及 `ACCEPTED` / `WITHDRAWN` / `EXPIRED`）之后同一对**可以**再插一份；
+  // ③ 三条独立连接真并发抢同一对 ⇒ 恰好一份胜出（另两条 23505）。
+  // **为什么必须计在这里**：`prisma migrate diff` 对部分索引的谓词**结构性失明**
+  // （Task 6 实测四方向，逐条写在 `20261007140000_p3_swap_offers_partial_unique/migration.sql`
+  // 的头注释里）。这三条是谓词**唯一**的机器见证，被静默删掉就没有任何东西在检查
+  // 「重新要约」这件事仍然成立。
+  //   ⇒ 实测值（不是预测）：`node scripts/assert-tests-ran.mjs exchange-enforcement` = `Tests 18 passed (18)`。
   'exchange-enforcement': {
     project: 'integration',
     paths: ['tests/integration/db/exchange-enforcement.test.ts'],
-    floor: 15,
-    why: 'P3 Task 2 的 exchange 真库强制点（append-only / 唯一索引 / 状态闭集 / 检查约束）',
+    floor: 18,
+    why: 'P3 Task 2 的 exchange 真库强制点 + Task 6 的部分唯一索引（目录 + 两个行为方向 + 真并发）',
   },
   // P3 / Task 3 的交换纯核心。实测：47 条（6 个文件），0 条 skip。
+  //
+  // P3 / Task 6：**47 → 80**（+33）。本任务在同一个目录里新增三个文件：
+  // `claims.test.ts`（13，增量 A-6 的承诺闭集）、`dto.test.ts`（5）、
+  // `error-map.test.ts`（15 = 12 档翻译 + 撞码 + 未登记 + 非 Error 输入）。
+  // **同一条纪律对新用例立刻生效**（Task 4 在本文件里写下的那句话）：
+  // 不给下一个任务留「从零算一遍未受保护面」的活。
+  //   ⇒ 实测值（不是预测）：`node scripts/assert-tests-ran.mjs exchange-core` = `Tests 80 passed (80)`。
+  //   ★ **首轮我先填了 78（一个估计），门以 78 通过而实际执行 80** —— 正是本文件开头
+  //     那段话要防的形状（「低的这 4 条让『静默删掉最多 4 条安全用例』不会红」）。
+  //     因此这里对齐到实测的 80；下一次任何删除都会红一次。
   'exchange-core': {
     project: 'unit',
     paths: ['tests/unit/exchange'],
-    floor: 47,
-    why: 'P3 Task 3 的交换纯核心（状态机 / 全局锁序 / 确定性幂等键 / 三个计时器 / 资格 / 义务判据）',
+    floor: 80,
+    why: 'P3 Task 3 的交换纯核心 + Task 6 的承诺闭集 / DTO / 错误翻译表（A-6）',
   },
   // P3 / Task 4 的账本写路径（本任务自己新增的 36 条）。实测：22 + 4 + 10 = 36 条，0 条 skip。
   // **为什么连新用例也一起钉**：上面那 62 条之所以成为「当时最大的开放项」，正是因为
@@ -211,6 +244,45 @@ const SCOPED_GATES = {
     paths: ['tests/integration/db/fidelity-columns.test.ts'],
     floor: 3,
     why: 'P3 Task 5.5 的真库见证（增量 A 八个列的类型与可空性 / NULL 是被接受的 / null ≠ 空集）',
+  },
+  // ★ P3 / Task 6：**新登记**（Task 5.5 的发现 3，控制器裁定「保护它们」）。
+  //
+  // ## 它补的是哪一类洞
+  // Task 5.5 实测：这个文件的 **19 条**此前**不受任何下限保护** ——
+  // 它在 `integration` project 里，而那个 project 的规模与构成一直在变，
+  // 给它设总数下限只会制造噪音。于是「文件被改名 / 被删空 / 整段 `skip` 掉」
+  // 都不会让 `pnpm test` 变红，而它检查的东西（所有权的转让与历史，P1 的核心不变式）
+  // 一件都不剩。
+  //
+  // ## 控制器的裁定逐字
+  // 「账本那条裁定的**本意**是『不该有任何一批用例不受保护』，而不是『只保护我当时
+  //   点名的那两条路径』。…… ⇒ 给 `tests/integration/asset/ownership.test.ts`
+  //   登记一条按路径作用域的下限。」
+  // Task 5.5 当时**没有**擅自扩半径（那会把改动伸进 P1 既有文件的门禁）——
+  // 那是正确的判断，而正确答案就是现在去做，且它很便宜（`fidelity-columns` 已证明机制可用）。
+  //
+  // ## 判别力（本轮实测两个方向，见报告）
+  // * `it.skip` 掉任意一条 ⇒ 18 < 19 ⇒ `::error::ownership` 变红；
+  // * 把路径改成一个不存在的文件 ⇒ 「一条用例都没执行」那一支变红。
+  'ownership': {
+    project: 'integration',
+    paths: ['tests/integration/asset/ownership.test.ts'],
+    floor: 19,
+    why: 'P1 的所有权转让与历史（Task 5.5 发现它此前不受任何下限保护；控制器裁定保护它们）',
+  },
+  // ★ P3 / Task 6：**新登记**。本任务新增的集成套件（要约的整个生命周期 + 增量 A-6）。
+  // 同一条纪律：新用例落在 `integration` 里就必须**立刻**有下限，否则下一个任务又要
+  // 从零算一遍「未受保护面」（Task 4 在本文件里写下的那句话）。
+  // 它判的是**服务层**：五个拒绝面各配一条验收对照、控制器裁定 ① 的重新要约、
+  // A-6 的承诺列落库 / TOCTOU 两个方向 / 声明侧 fail-closed、以及四个终态的到达路径。
+  //   ⇒ 实测值（不是预测）：`node scripts/assert-tests-ran.mjs exchange-offers` = `Tests 22 passed (22)`。
+  //     （21 是本任务第一版的条数；随后补了一条**真交错**的用例——并发的第二个 `accept`
+  //      撞上条件更新 ⇒ 409，见 `offers.test.ts` 的那条头注释。数字随实测对齐。）
+  'exchange-offers': {
+    project: 'integration',
+    paths: ['tests/integration/exchange'],
+    floor: 22,
+    why: 'P3 Task 6 的要约生命周期与增量 A-6 的钉住 / TOCTOU（服务层的真库见证）',
   },
 };
 

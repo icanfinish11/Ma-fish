@@ -167,6 +167,61 @@ describe('每个路由都必须有策略声明（§9 / 验收 13.2）', () => {
         decl: { resource: 'Ledger', action: 'grant', condition: 'ledgerAdminGrant' },
         rateLimit: 'search',
       });
+
+      /**
+       * ── P3 / Task 6：交换的**六条**路由（逐条）────────────────────────────────
+       *
+       * 与 `HealthController` 那一条同一理由，而这一次的盲区**已经发生过一次**：
+       * 若 `ExchangeModule` 忘了进 `AppModule.imports`，那六条路由在运行期是 **404**，
+       * 而上面那句 `expect(undeclared).toEqual([])` **照样全绿**
+       * —— 没被注册的路由不在注册表里，`undeclared` 依然是空数组。
+       * ⇒ 「门会红」与「门**看得见**这些路由」是两件事，下面六条断言的是后者。
+       *
+       * 判别力（探针 P-T6-a）：把 `ExchangeModule` 从 `AppModule.imports` 里删掉
+       * ⇒ 这六条**立刻红**（`registry.find` 返回 `undefined`），
+       * 而第一条用例仍然绿 —— 这正是它们存在的证明。
+       *
+       * ## 三条不在 §9 矩阵里的声明（据实记载，与 `exchange.controller.ts` 的类注释同源）
+       * §9 只写了 `SwapOffer accept / reject` 与 `SwapContract confirmLock`。
+       * `create` / `withdraw` / `read` 取的是「最保守并且在今天可判定的一档」，
+       * 逐条写在这里而不是留在一句注释里：**声明是契约**，而契约要被断言看见。
+       */
+      expect(registry.find('ExchangeController', 'propose'), '交换的发要约路由没被注册表发现').toMatchObject({
+        path: '/exchange/offers',
+        isPublic: false,
+        decl: { resource: 'SwapOffer', action: 'create' },
+        rateLimit: 'bid',
+      });
+      expect(registry.find('ExchangeController', 'accept')).toMatchObject({
+        path: '/exchange/offers/:offerId/accept',
+        isPublic: false,
+        // 条件 `swapOfferSent` 由 `ExchangeModule.onModuleInit` 注册（D11 的接缝）。
+        // 漏注册的表现是**本模块路由全部 403**（fail-closed），而这条断言会在那之前
+        // 就把「声明里写着这个条件名」这件事钉住。
+        decl: { resource: 'SwapOffer', action: 'accept', condition: 'swapOfferSent' },
+        rateLimit: 'bid',
+      });
+      expect(registry.find('ExchangeController', 'reject')).toMatchObject({
+        path: '/exchange/offers/:offerId/reject',
+        decl: { resource: 'SwapOffer', action: 'reject', condition: 'swapOfferSent' },
+        rateLimit: 'bid',
+      });
+      expect(registry.find('ExchangeController', 'withdraw')).toMatchObject({
+        path: '/exchange/offers/:offerId/withdraw',
+        // **无条件**：「只有发起方」那条限制由服务层执行（见控制器类注释里的分工）。
+        decl: { resource: 'SwapOffer', action: 'withdraw' },
+        rateLimit: 'bid',
+      });
+      expect(registry.find('ExchangeController', 'readOffer')).toMatchObject({
+        path: '/exchange/offers/:offerId',
+        decl: { resource: 'SwapOffer', action: 'read', condition: 'swapOfferSent' },
+        rateLimit: 'search',
+      });
+      expect(registry.find('ExchangeController', 'readContract')).toMatchObject({
+        path: '/exchange/contracts/:contractId',
+        decl: { resource: 'SwapContract', action: 'read', condition: 'swapContractParty' },
+        rateLimit: 'search',
+      });
     });
   });
 

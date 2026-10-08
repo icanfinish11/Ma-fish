@@ -75,6 +75,40 @@ export function assertOfferTransition(from: OfferStatus, to: OfferStatus): void 
   if (!OFFER_TRANSITIONS[from].includes(to)) throw new InvalidExchangeTransitionError(from, to);
 }
 
+/**
+ * 一个要约状态是不是**终态**（= 上面那张表里没有出边）。
+ *
+ * 从迁移表**派生**，而不是另写一份名单：终态的定义就是「没有出边」，
+ * 而多写一份 `['ACCEPTED','REJECTED','WITHDRAWN','EXPIRED']` 是同一件事的第二种说法。
+ */
+export function isTerminalOfferStatus(status: OfferStatus): boolean {
+  return OFFER_TRANSITIONS[status].length === 0;
+}
+
+/**
+ * **活跃**（非终态）的要约状态。
+ *
+ * ## 它是哪一条数据库约束的 TypeScript 侧定义处（P3 / Task 6，控制器裁定 ①）
+ *
+ * `exchange.swap_offers` 上的唯一索引是**部分**唯一索引，谓词是
+ * `status IN ('DRAFT','SENT')`（迁移 `20261007140000_p3_swap_offers_partial_unique`）。
+ * 服务层的「同一对 `(target, counterparty)` 上已有活跃要约吗」这一问必须与那条谓词
+ * **是同一个集合**：两边漂移的失效形态是静默的——服务查了一个更宽的集合，
+ * 于是「复用」会命中一行索引根本不挡的历史要约，而库里同时存在两份活跃要约。
+ *
+ * ## 为什么它由 `isTerminalOfferStatus` 派生（而不是手写两个字面量）
+ * 手写 `['DRAFT','SENT']` 会让「§6.3 加一个非终态」变成两处改动，而漏掉的那一处
+ * 正是这里。派生之后，state-machine 那张表的改动会**顺带**改到本常量。
+ *
+ * **见证**：`tests/integration/db/exchange-enforcement.test.ts` 把
+ * `pg_indexes.indexdef` 里的取值集合与这个数组逐字比对（真库那一侧），
+ * 因此「迁移的谓词」与「服务的集合」漂移时会红一次。`migrate diff` 对此**失明**
+ * （实测见那个迁移的头注释）。
+ */
+export const ACTIVE_OFFER_STATUSES: readonly OfferStatus[] = Object.freeze(
+  Object.values(OFFER_STATUSES).filter((status) => !isTerminalOfferStatus(status)),
+);
+
 export function assertContractTransition(from: ContractStatus, to: ContractStatus): void {
   if (!CONTRACT_TRANSITIONS[from].includes(to)) throw new InvalidExchangeTransitionError(from, to);
 }

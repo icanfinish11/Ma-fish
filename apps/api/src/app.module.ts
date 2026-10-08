@@ -15,6 +15,17 @@ import { AuditModule } from './modules/audit/audit.module.js';
 import { AssetModule } from './modules/asset/asset.module.js';
 import { AuthModule } from './modules/auth/auth.module.js';
 import { SessionMiddleware } from './modules/auth/session.middleware.js';
+// P3 / Task 6 把交换模块装进来，于是 `/exchange/offers` 那六条路由第一次真的存在
+// （在那之前 `exchange/` 下只有纯核心，一条路由都没有）。与上面几条同一处置：
+// 组合根直接 import module 文件而不是 `modules/exchange/index.ts`（豁免写在
+// `.dependency-cruiser.cjs` 的 `from.pathNot` 里）。
+//
+// ★ **据实记载这处接线的盲区**：漏掉这一行时，六条路由在运行期是 **404**，
+// 而 `tests/security/policy-route-coverage.test.ts` 的第一条用例照样全绿
+// （`undeclared` 是空数组——没被注册的路由不在注册表里）。因此那道门里必须有一条
+// **逐条**断言 `registry.find('ExchangeController', …)` 的用例；它的存在理由
+// 与 `HealthController.live` 那一条逐字相同（同一个盲区在 P1 / Task 8 出现过一次）。
+import { ExchangeModule } from './modules/exchange/exchange.module.js';
 import { HealthModule } from './modules/health/health.module.js';
 // 组合根按设计就该认识每一个模块，因此这里直接 import 它的 module 文件而不是
 // `modules/ledger/index.ts`——豁免写在 `.dependency-cruiser.cjs` 的 `from.pathNot` 里
@@ -117,6 +128,7 @@ import { LedgerModule } from './modules/ledger/ledger.module.js';
     AuthModule,
     AssetModule,
     LedgerModule,
+    ExchangeModule,
     HealthModule,
   ],
   providers: [

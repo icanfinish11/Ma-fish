@@ -157,6 +157,34 @@ describe('每个路由都必须有明确的限流归属（修复轮 1 / C-4）',
         rateLimit: 'search',
         rateLimitSkipped: false,
       });
+
+      /**
+       * ── P3 / Task 6：交换的六条路由（逐条；**限流归属**是它的问题）──────────────
+       *
+       * 控制器裁定 ④ / **C33**：交换路由挂 **`bid` 档（30 次/分钟、按用户）**，
+       * 并**记录档名不吻合**（档名叫 `bid` 而挂的是要约的收发）——理由与改法逐字写在
+       * `exchange.controller.ts` 的类注释里（`RATE_LIMITS` 是设计文档 §4.1 威胁 #13
+       * 那张表的投影，新增一档是一次**设计裁定**，不是实现者可以顺手做的）。
+       *
+       * 读路径（两条 `GET`）挂 `search`：`bid` 是「按用户、写动作」的档，
+       * 而读取没有「按用户写入」的语义，`search` 是表里唯一「按 IP、短窗口」的档。
+       *
+       * 判别力（探针 P-T6-b）：把 `@RateLimited('bid')` 从 `propose` 上删掉
+       * ⇒ 那一条立刻红（`rateLimit` 变成 `null` 而 `rateLimitSkipped` 是 `false`，
+       * 正是这道门的「漏声明」分支）——一条**不限流的发要约接口**会在 CI 上先红一次。
+       */
+      for (const handler of ['propose', 'accept', 'reject', 'withdraw'] as const) {
+        expect(registry.find('ExchangeController', handler), `ExchangeController.${handler} 没有限流归属`).toMatchObject({
+          rateLimit: 'bid',
+          rateLimitSkipped: false,
+        });
+      }
+      for (const handler of ['readOffer', 'readContract'] as const) {
+        expect(registry.find('ExchangeController', handler), `ExchangeController.${handler} 没有限流归属`).toMatchObject({
+          rateLimit: 'search',
+          rateLimitSkipped: false,
+        });
+      }
     });
   });
 

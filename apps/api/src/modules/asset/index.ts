@@ -67,6 +67,10 @@ export {
 export {
   AssetAccessService,
   AssetVersionNotFoundError,
+  // P3 / Task 6（增量 A-6）：`proposeOffer` 要按 `assetId` 取一件作品的四个事实
+  // （所有人 / 锁 / 当前那一份的版本与摘要 / 元数据视图）。它是**本模块唯一的**新增读形状，
+  // 理由与「为什么必须存在」写在 `asset-access.service.ts` 的 `readAssetFacts` 上。
+  type AssetFactsView,
   type AssetMetadataView,
   type DownloadableVersion,
 } from './asset-access.service.js';

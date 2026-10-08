@@ -90,6 +90,86 @@ export class AssetAccessService {
   }
 
   /**
+   * **一件作品对外可用的全部事实**（P3 / Task 6；增量 A-6 的第一个消费者）。
+   *
+   * ## 为什么它必须存在（一处计划缺口，据实记载）
+   *
+   * 增量 A-6 要求 `proposeOffer` 写四个东西：提议方拿出的那一份的
+   * `offered_version_id` / `offered_sha256` / `offered_dossier_digest` 与 `claims`。
+   * 其中 `offered_sha256` 的来源是**唯一**的（A-6 的 Produces 行逐字：
+   * 「`AssetVersion.sha256`（已存在）」），而 `claims` 的判据要读元数据的事实。
+   * 此外 `swap_offers` 还需要两列**创建那一刻的快照**：`counterparty_id`
+   * （= 被要约作品的所有人）与 `status` 的资格（§6.1 第 2 条要读完整度与 README）。
+   *
+   * 实测：`asset` 今天导出**三个**读形状，**没有一个**能回答「这件作品的所有人是谁」
+   * 或「它当前那一份的 sha256 是什么」——
+   * {@link checkAccess} 只回**布尔**、{@link readMetadata} 按**版本 id** 读且刻意不含
+   * `sha256`（它是内容指纹，不进对外契约）、{@link findDownloadableVersion} 按**版本 id**
+   * 读且不 select `sha256`。
+   * ⇒ 这是 Task 6 对 `asset` 的**唯一**一处新增，而它是 A-6 的使能条件
+   * （与 D4「为一个已交付功能加索引不是投机抽象，是它的使能条件」同一判据）。
+   *
+   * ## 为什么它返回 `ownerId` / `lockedAt`，而不是让调用方再判一次
+   *
+   * * `ownerId` 是**事实**，不是判定：授权判定仍然是 {@link checkAccess}（D11 的唯一入口，
+   *   `proposeOffer` 里各调用一次）。但 `swap_offers.counterparty_id` 要存的是**取值**，
+   *   而「是不是他的」这个布尔里没有那个取值；
+   * * `lockedAt` 是 `asset.assets` 的列（D10 的锁落在作品行上），而 §6.3:284 的
+   *   「不可编辑 / 不可另行上架 / 不可删除」要判的正是它。
+   *
+   * **一次读取给出全部四个事实**（而不是让调用方按需挑字段）：`eligibility.ts` 的类注释
+   * 已经为同一族缺陷付过一次代价——「三个参数会在调用点散成三处取值来源」。
+   *
+   * ## 为什么它落在本文件而不是新开一个服务 / 让 `exchange` 直接读表
+   *   * `swap_offers.counterparty_id` 的列注释把这件事写死了：**「按 `targetAssetId`
+   *     反查 `asset.assets.owner_id` 会跨模块（C5 禁止）」** —— 直接读对方的表不是
+   *     本仓库的形状；
+   *   * 它**不改任何既有形状**：没有新模块、没有新文件、没有改 P1 的 schema、没有新索引。
+   *
+   * ## 为什么是「委托 `readMetadata`」而不是复制一份嵌套 `select`
+   * 元数据的**形状只有一处定义**（{@link readMetadata} 的那个 `select`）。在这里再写
+   * 一份嵌套 `select` 就是「同一件事两处各写一份」——那正是 `eligibility.ts` 点名的
+   * 缺陷族。两次查询的代价换来的是：加一个元数据列时只有一处要改，而两次查询之间
+   * 没有漂移风险（第二次的键就是第一次刚读出来的 id）。
+   *
+   * ## 据实记载：这是**第一条按 `assetId` 查 `asset_versions` 的读法**
+   *
+   * `AssetVersion` 上没有 `@@index([assetId])`（schema 的注释写着「今天唯一的读法是
+   * 『按版本 id 取一份』，那是主键」）。本方法让那句话不再成立：**每次 `proposeOffer`
+   * 会做两次按 `assetId` 的顺序扫描**。本轮**没有**顺手加索引——那是改 P1 schema 的
+   * 一次迁移，而 Task 5.5 的先例是「不擅自把改动半径伸进 P1 既有文件」。
+   * **复访触发条件**：`asset_versions` 的行数超过 10^4，或者 `proposeOffer` 的 p95
+   * 出现可归因于这里的回归。修法是 `@@index([assetId])` + 一支迁移（Prisma 建得出来，
+   * 因此零漂移门**是**它的见证）。
+   *
+   * @returns 作品不存在 ⇒ `null`（**不是**抛错：调用方要区分的是「这件作品没有可用的
+   *   那一份」，而那是 `AssetNotFoundError` / `IneligibleAssetError` 的判断，属于调用方）。
+   */
+  async readAssetFacts(assetId: string): Promise<AssetFactsView | null> {
+    const asset = await this.prisma.asset.findUnique({
+      where: { id: assetId },
+      select: { id: true, ownerId: true, lockedAt: true },
+    });
+    if (asset === null) return null;
+    const latest = await this.prisma.assetVersion.findFirst({
+      where: { assetId },
+      // `id` 是**决定性的次键**：`created_at` 是 `timestamptz(3)`，同一毫秒内的两份版本
+      // 在只按时间排序时顺序未定义。主键是 UUIDv7（C4，时间有序），因此 `id desc`
+      // 与 `createdAt desc` 同向，而它让「当前那一份」成为**确定**的。
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      select: { id: true, sha256: true },
+    });
+    return {
+      assetId: asset.id,
+      ownerId: asset.ownerId,
+      lockedAt: asset.lockedAt,
+      // 一份版本都没有 ⇒ `null`（**不是**抛错、也不是一个全零的版本）。
+      currentVersion: latest === null ? null : { assetVersionId: latest.id, sha256: latest.sha256 },
+      metadata: latest === null ? null : await this.readMetadata(latest.id),
+    };
+  }
+
+  /**
    * 元数据读取（§9 矩阵：`Asset` 元数据 read = **所有人**）。
    *
    * **只回元数据**：`storage_key` / `file_id` / `key_id` 是服务端内部标识
@@ -140,6 +220,35 @@ export class AssetAccessService {
       codeLines: metadata.codeLines,
     };
   }
+}
+
+/**
+ * 一件作品对外可用的全部事实（见 {@link AssetAccessService.readAssetFacts}）。
+ *
+ * ## 为什么 `sha256` 在这里（而 `AssetMetadataView` 里没有它）
+ * 两者是不同的边界：`AssetMetadataView` 会**直接成为 HTTP 响应**
+ * （`asset.controller.ts` 的元数据路由），因此内容指纹不进它；
+ * 本类型是**跨模块的服务端形状**——增量 A-6 要把它写进
+ * `swap_offers.offered_sha256`（那一列由 A-8 在释放前回比）。
+ * 它**不进任何响应体**：`OfferView` 里刻意没有 `offeredSha256`（理由见 `dto.ts`）。
+ */
+export interface AssetFactsView {
+  readonly assetId: string;
+  /**
+   * 作品的所有人。**是事实，不是判定**：授权判定的唯一入口仍然是
+   * {@link AssetAccessService.checkAccess}（D11）。`exchange` 需要这个**取值**
+   * 是因为 `swap_offers.counterparty_id` 存的是「创建那一刻的所有人快照」。
+   */
+  readonly ownerId: string;
+  /**
+   * 处分冻结的时刻（D10：锁落在**作品**行上）。`null` = 没锁。
+   * §6.3:284 的「不可编辑 / 不可另行上架 / 不可删除」判的就是它。
+   */
+  readonly lockedAt: Date | null;
+  /** 当前那一份（最新的版本行）。一份都没有 ⇒ `null`。 */
+  readonly currentVersion: { readonly assetVersionId: string; readonly sha256: string } | null;
+  /** 当前那一份的元数据视图；没有版本、或那一份没有元数据行 ⇒ `null`。 */
+  readonly metadata: AssetMetadataView | null;
 }
 
 /** 下载路径定位制品所需的那几列（见 {@link AssetAccessService.findDownloadableVersion}）。 */

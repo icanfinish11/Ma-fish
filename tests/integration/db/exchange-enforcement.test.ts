@@ -1,6 +1,11 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { Client } from 'pg';
+// P3 / Task 6：谓词的取值集合与服务层「有没有活跃要约」用的是**同一个**常量
+// （见下面 ④-b 的目录断言）。跨模块引用只走 `index.ts`——但这里是 `tests/`，
+// 而架构规则的主体是 `apps/` 的源码（`dependency-cruiser.cjs` 不巡航 `tests/`），
+// 因此深引 `core/state-machine.js` 是测试的特权（与既有用例的形状一致）。
+import { ACTIVE_OFFER_STATUSES } from '@vca/api/modules/exchange/core/state-machine.js';
 import { startPostgres, type TestPg } from '../../helpers/db.js';
 
 /**
@@ -423,6 +428,164 @@ describe('exchange 的数据库强制点（P3 / Task 2）', () => {
         [c2],
       );
       expect(n.rows[0]!.n, '并发之后这张合约上**恰好一行**义务').toBe(1);
+    } finally {
+      await Promise.all(extra.map((cl) => cl.end()));
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ④-b ★ P3 / Task 6（控制器裁定 ①）：`swap_offers` 的**部分**唯一索引
+  //
+  // 裁定逐字：**「`REJECTED` 是终态」约束的是*那一份要约*，而不是*那一对人*。**
+  // ⇒ 索引只覆盖**非终态**（`DRAFT` / `SENT`），于是「被拒过一次」不再永久封死一条配对路径。
+  //
+  // ## ★★ 为什么见证必须是这一层（六个方向实测过，不是推断）
+  //
+  // 谓词是**手写 DDL**（Prisma 表达不了部分索引），而 `prisma migrate diff` 对它
+  // **结构性失明**。四个方向在一次性库 `vca_t6_drift` 上逐条实测：
+  //   ① 模型保留 `@@unique` + 库里是同名部分索引 ⇒ `No difference detected`（exit 0）；
+  //   ② 模型删掉 `@@unique` + 库里留着部分索引 ⇒ **同样** `No difference detected`（exit 0）；
+  //   ③ 模型保留 `@@unique` 而索引被整个删掉 ⇒ exit 2、`[+] Added unique index …`；
+  //   ④ 部分索引换一个名字 ⇒ exit 2、`Renamed index …`。
+  // ⇒ 漂移门只能见证「这条索引按名字与列集合存在」（方向 ③），**见证不了谓词**。
+  // 谓词的见证就是下面这三条：目录（`pg_indexes.indexdef` 逐字）+ 两个**行为**方向。
+  // **不得**把它宣传成「漂移门见证的」—— Task 2 已经为同一族失明付过一次代价
+  // （删掉一条手写 `CHECK`，漂移门照样 exit 0）。
+  // ══════════════════════════════════════════════════════════════════════════
+
+  it('★ 唯一索引是**部分**的：目录里的 `indexdef` 逐字含谓词，且取值集合与 `ACTIVE_OFFER_STATUSES` 相同', async () => {
+    const idx = await owner.query<{ indexdef: string }>(
+      `SELECT indexdef FROM pg_indexes
+        WHERE schemaname = 'exchange' AND tablename = 'swap_offers'
+          AND indexname = 'swap_offers_target_asset_id_counterparty_id_key'`,
+    );
+    // 非空转前提：索引**在**。少了这一条，下面那句断言在「索引根本不存在」时会以
+    // 「读不到定义」的形式红，而那种红指向错误的原因。
+    expect(idx.rows).toHaveLength(1);
+    const def = idx.rows[0]!.indexdef;
+
+    // 逐字：列顺序、`UNIQUE`、以及 `WHERE` 子句都在这一句里。
+    // 判别力：把 `WHERE status IN ('DRAFT','SENT')` 删掉（退回全线唯一）⇒ 立刻红。
+    // 这正是裁定 ① 之前的那一行，因此**这条断言就是「裁定 ① 落地了」的判据**。
+    expect(def).toBe(
+      'CREATE UNIQUE INDEX swap_offers_target_asset_id_counterparty_id_key ' +
+        "ON exchange.swap_offers USING btree (target_asset_id, counterparty_id) WHERE (status = ANY (ARRAY['DRAFT'::text, 'SENT'::text]))",
+    );
+
+    // 取值集合的**跨文件一致性**：迁移的谓词与服务层查「有没有活跃要约」时用的集合
+    // 必须是同一个。两边漂移的失效形态是静默的——服务查了一个更宽的集合，
+    // 于是「复用」会命中一行索引根本不挡的历史要约，而库里同时存在两份活跃要约。
+    // 比较用**排序后的集合**而不是渲染顺序：PostgreSQL 的 `= ANY (ARRAY[…])` 渲染
+    // 形式是它的实现细节，而这里真正要钉的是「哪些取值」。
+    const inPredicate = [...def.matchAll(/'([^']*)'/g)].map((m) => m[1] as string).sort();
+    expect(inPredicate).toEqual([...ACTIVE_OFFER_STATUSES].sort());
+    // 非空转前提：集合不是空的（否则上面那条在空谓词上也会成立——而那是**全线**唯一）。
+    expect(inPredicate.length).toBeGreaterThan(0);
+  });
+
+  it('★ 行为：`REJECTED`（终态）之后**同一对可以**再插一份要约（裁定 ① 的验收面）', async () => {
+    const proposer = randomUUID();
+    const counterparty = randomUUID();
+    const offered = await makeAsset(proposer);
+    const target = await makeAsset(counterparty);
+    const insert = (status: string | null): Promise<unknown> =>
+      status === null
+        ? owner.query(
+            `INSERT INTO exchange.swap_offers
+               (id, proposer_id, offered_asset_id, target_asset_id, counterparty_id, expires_at, status)
+             VALUES (gen_random_uuid(), $1, $2, $3, $4, now() + interval '72 hours', 'SENT')`,
+            [proposer, offered, target, counterparty],
+          )
+        : owner.query(
+            `INSERT INTO exchange.swap_offers
+               (id, proposer_id, offered_asset_id, target_asset_id, counterparty_id, expires_at, status)
+             VALUES (gen_random_uuid(), $1, $2, $3, $4, now() + interval '72 hours', $5)`,
+            [proposer, offered, target, counterparty, status],
+          );
+
+    // 第一份：活的。
+    await expect(insert(null)).resolves.toBeDefined();
+    // 第二份**活跃**的、同一对 ⇒ 只可能被部分唯一索引拒（那一格就是下面那条）。
+    await expect(insert(null), '同一对的第二份活跃要约必须被拒（部分唯一索引的强制点）').rejects.toMatchObject({
+      code: '23505',
+    });
+
+    // 把第一份置为**终态**，再插一份活跃的 ⇒ **接受**（裁定 ① 的那一句话）。
+    await owner.query(
+      `UPDATE exchange.swap_offers SET status = 'REJECTED'
+        WHERE target_asset_id = $1 AND counterparty_id = $2 AND status = 'SENT'`,
+      [target, counterparty],
+    );
+    await expect(
+      insert(null),
+      'REJECTED 之后同一对必须能重新要约（控制器裁定 ①：「REJECTED 是终态」约束的是那一份要约，不是那一对人）',
+    ).resolves.toBeDefined();
+
+    // 历史行**还在**（终态是终态：那一行的 status 没有被改写，也没有被删）。
+    const rows = await owner.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM exchange.swap_offers WHERE target_asset_id = $1 AND counterparty_id = $2`,
+      [target, counterparty],
+    );
+    expect(rows.rows[0]!.n).toBe(2);
+
+    // ★ 另两个终态也走同一支（`ACCEPTED` 与 `WITHDRAWN` / `EXPIRED` 都是终态）：
+    //   只测 `REJECTED` 时，一个把谓词写成 `status <> 'REJECTED'` 的实现照样全绿。
+    for (const terminal of ['ACCEPTED', 'WITHDRAWN', 'EXPIRED'] as const) {
+      const p = randomUUID();
+      const c = randomUUID();
+      const o = await makeAsset(p);
+      const t = await makeAsset(c);
+      await owner.query(
+        `INSERT INTO exchange.swap_offers
+           (id, proposer_id, offered_asset_id, target_asset_id, counterparty_id, expires_at, status)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, now() + interval '72 hours', $5)`,
+        [p, o, t, c, terminal],
+      );
+      await expect(
+        owner.query(
+          `INSERT INTO exchange.swap_offers
+             (id, proposer_id, offered_asset_id, target_asset_id, counterparty_id, expires_at)
+           VALUES (gen_random_uuid(), $1, $2, $3, $4, now() + interval '72 hours')`,
+          [p, o, t, c],
+        ),
+        `${terminal} 也是终态 ⇒ 它不该挡住同一对的下一次要约`,
+      ).resolves.toBeDefined();
+    }
+  });
+
+  it('★ 行为：同一对的活跃要约在**真并发**下恰好一份胜出（三条独立连接）', async () => {
+    // node-postgres 的单个 client 会把查询排队（串行执行），因此三条**独立连接**才测得到并发
+    // —— 本仓库的既定纪律（Task 2 的 `(producer,key)` 那一条逐字同源）。
+    const proposer = randomUUID();
+    const counterparty = randomUUID();
+    const offered = await makeAsset(proposer);
+    const target = await makeAsset(counterparty);
+    const extra = await Promise.all(
+      [1, 2, 3].map(async () => {
+        const cl = new Client({ connectionString: pg.ownerUri });
+        await cl.connect();
+        return cl;
+      }),
+    );
+    try {
+      const results = await Promise.allSettled(
+        extra.map((cl) =>
+          cl.query(
+            `INSERT INTO exchange.swap_offers
+               (id, proposer_id, offered_asset_id, target_asset_id, counterparty_id, expires_at)
+             VALUES (gen_random_uuid(), $1, $2, $3, $4, now() + interval '72 hours')`,
+            [proposer, offered, target, counterparty],
+          ),
+        ),
+      );
+      expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+      const rejected = results.filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
+      expect(rejected.map((r) => (r.reason as { code?: string }).code)).toEqual(['23505', '23505']);
+      const n = await owner.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM exchange.swap_offers WHERE target_asset_id = $1`,
+        [target],
+      );
+      expect(n.rows[0]!.n, '并发之后这一对上**恰好一行**活跃要约').toBe(1);
     } finally {
       await Promise.all(extra.map((cl) => cl.end()));
     }
