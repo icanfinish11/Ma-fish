@@ -43,7 +43,9 @@ export const CONTRACT_TRANSITIONS: Readonly<Record<ContractStatus, readonly Cont
   VALIDATING: ['RELEASED', 'CANCELLED'],
   RELEASED: ['SETTLED', 'DISPUTED'],
   // ★ D6 / C31：`DISPUTED` 的唯一出路是 `SETTLED`（一次**冻结释放**，
-  //   `releaseEscrow(sellerId = payer, feeBps: 0)`）。**没有 `RESOLVED_REVERSED`。**
+  //   `releaseEscrow(sellerId = payer, feeBps: 0)`）。**账本上没有「逆转」这个原语**——
+  //   「不存在」只对账本成立（规格 D8）：`RESOLVED_REVERSED` 那条边 = **所有权回转**，
+  //   由 P3.5 在同一个事务里用两笔**正向**转让 + 罚没（`FORFEIT`）表达，不需要账本逆向。
   DISPUTED: ['SETTLED'],
   SETTLED: [],
   CANCELLED: [],

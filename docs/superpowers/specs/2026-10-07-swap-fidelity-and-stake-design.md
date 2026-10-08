@@ -71,7 +71,7 @@
 | 事实 | 证据 |
 |---|---|
 | 交换不收保证金（保证金是 §7.1 拍卖那一行的事） | P3 计划 D9；「不在 P3 范围内」第 4 条 |
-| `RELEASED` 不动钱，钱在 `SETTLED` 才动；`RESOLVED_REVERSED` 被显式判为**不存在** | P3 计划 C31 / D6；`tests/unit/exchange/state-machine.test.ts` 有一条「不存在 `RESOLVED_REVERSED`」的断言（计划行 1567–1571） |
+| `RELEASED` 不动钱，钱在 `SETTLED` 才动；`RESOLVED_REVERSED` 被显式判为**不存在**（**注意：这句只在「账本」意义上成立**——账本上没有「逆转」这个原语；**所有权回转**那条边由本文件的 **D8** 承接，见 §9.1） | P3 计划 C31 / D6；`tests/unit/exchange/state-machine.test.ts` 有一条「不存在 `RESOLVED_REVERSED`」的断言（计划行 1567–1571） |
 | 补差为 0 时释放事务**连义务行都不建** ⇒ 争议期能冻的只有空气 | P3 计划行 3643 的 `if (contract.topUpAmount > 0n && …)` |
 | §10 的「争议败诉 −15 分」在 P3 计划里**零落点**；`creditScore` 列存在但**零写入者** | `grep 信誉\|credit` over P3 计划 ⇒ 0 匹配；`apps/api/prisma/schema.prisma:39` |
 | 一个偶然的缓解（据实记载，不是设计）：`locked_at` 永不清空 + `proposeOffer` 拒被锁定的作品 ⇒ 欺诈方刚换到的东西**恰好**不能再拿去发要约 | P3 计划行 2973；但 `unlockAssets` **零调用方**（见 2.4） |
@@ -289,7 +289,7 @@ SwapContract:
   PENDING_BOTH_LOCK / VALIDATING 任一方退出 → CANCELLED（无惩罚）
 ```
 
-**对既有实现的预期破坏（据实记载）**：`tests/unit/exchange/state-machine.test.ts` 有一条专门断言「**不存在** `RESOLVED_REVERSED`」的用例（P3 计划行 1567–1571），以及 `CONTRACT_TRANSITIONS.DISPUTED = ['SETTLED']`（Task 3 已合并，`21e5a54`）。本设计会让它变红 —— **这是预期的，不是回归**。处置沿用 P3 Task 1 改 P1 契约时的做法：**逐字引用旧断言、写明它为什么被取代、配一条变异探针**。
+**对既有实现的预期破坏（据实记载）**：`tests/unit/exchange/state-machine.test.ts` 有一条专门断言「**不存在** `RESOLVED_REVERSED`」的用例（P3 计划行 1567–1571）——**该断言只对「账本」成立**（账本上没有逆转原语），它**不**蕴含「所有权回转不存在」，本文件的 D8 正是那条边的承接者 —— 以及 `CONTRACT_TRANSITIONS.DISPUTED = ['SETTLED']`（Task 3 已合并，`21e5a54`）。本设计会让它变红 —— **这是预期的，不是回归**。处置沿用 P3 Task 1 改 P1 契约时的做法：**逐字引用旧断言、写明它为什么被取代、配一条变异探针**。
 
 ### 9.2 数据面（两批分开）
 
