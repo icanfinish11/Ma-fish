@@ -644,14 +644,35 @@ describe('tar.gz：仅凭头部判定 + 提前中止（D8、C19）', () => {
     expect(reasonOf(hardlinkResult.result)).toContain('硬链接');
   });
 
-  it('20,001 个条目的 tar.gz ⇒ 条目数上限（真实阈值）', async () => {
-    const archive = buildTarGz(
-      Array.from({ length: 20_001 }, (_unused, index) => ({ name: `f${index}.txt` })),
-    );
-    const { result } = await inspectTarGzOf(archive);
-    expect(result.ok).toBe(false);
-    expect(reasonOf(result)).toContain('条目数');
-  });
+  /**
+   * ★ **显式 `testTimeout`（P3 / Task 7）—— 一个测试预算，不是断言被放宽。**
+   *
+   * 它是本文件里最慢的一条（要**真的**造出 20,001 个条目的 tar.gz 再走一遍判定），
+   * 而 `unit` project **没有**自己的 `testTimeout`（`vitest.config.ts` 只给
+   * integration / security / property / architecture 配过）⇒ 它吃 vitest 的 **5 s 默认值**。
+   *
+   * | 场景 | 实测 |
+   * |---|---|
+   * | 单独跑这一个文件（`--reporter=verbose`） | **1052 ms** |
+   * | 全量 `pnpm test`（5 个 project + 一堆 testcontainers 同时跑） | **> 5000 ms（超时）** |
+   *
+   * 这与 P3 / Task 7 给 `tests/unit/config/bootstrap-guard.test.ts` 加预算的是**同一类**
+   * 问题（那条的论证逐字：「一个通过与否取决于机器有多忙的用例不是见证」），
+   * 也是本仓库给 `architecture` project 配超时时用过的同一条论证。
+   * **下面断言的东西一个字都没改**：改的只是「允许多久跑完」（30 s，是单独跑实测的 ~28 倍）。
+   */
+  it(
+    '20,001 个条目的 tar.gz ⇒ 条目数上限（真实阈值）',
+    async () => {
+      const archive = buildTarGz(
+        Array.from({ length: 20_001 }, (_unused, index) => ({ name: `f${index}.txt` })),
+      );
+      const { result } = await inspectTarGzOf(archive);
+      expect(result.ok).toBe(false);
+      expect(reasonOf(result)).toContain('条目数');
+    },
+    30_000,
+  );
 
   it('空 tar.gz（0 个条目）**拒绝**：tar 的「没有任何有效条目」与「不是 tar」是同一条信号', async () => {
     // 这是刻意 fail-closed 的一侧。理由：`tar` 的 Parser 在 DONE 时用

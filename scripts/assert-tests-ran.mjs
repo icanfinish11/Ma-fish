@@ -99,7 +99,14 @@ const GATES = {
   //   判别力由探针 P-T6-a（删掉 `ExchangeModule` 的接线）与 P-T6-b（删掉一条 `@RateLimited`）证明。
   //   ⇒ 实测值（不是预测）：`node scripts/assert-tests-ran.mjs security` = `Tests 115 passed (115)`；
   //     把矩阵里任意一条 `it` 改成 `it.skip` ⇒ 114 < 115 ⇒ 以 `::error::security` 变红。
-  security: 115,
+  //
+  // P3 / Task 7：**115 → 119**（+4）。交换的越权矩阵新增**一行**端点
+  // （`POST /exchange/contracts/:contractId/confirm-lock`，Task 7 的第七条路由）× 4 个角色 = 4 格。
+  // 同一文件里那条「★ 条件」用例被**改写**（从 3 个方向扩到 6 个：对手方读到 / **发起方读自己的** /
+  // 陌生人 403 / 不存在的 id 403 / 终态双方 200 / 终态**不能**被接受），但**不新增 `it`**
+  // ⇒ 它不改变这个数（判别力由探针 P-T7-readoffer-* 证明）。
+  //   ⇒ 实测值（不是预测）：`node scripts/assert-tests-ran.mjs security` = `Tests 119 passed (119)`。
+  security: 119,
   architecture: 5,
   // P2 / Task 1：**判决 1 的病根就是这里**——设计 §8.3 的「≥10 万次属性测试」此前
   // 没有任何执行者：`tests/property/` 不存在、`test:property` 带 `--passWithNoTests`
@@ -199,11 +206,17 @@ const SCOPED_GATES = {
   //   ★ **首轮我先填了 78（一个估计），门以 78 通过而实际执行 80** —— 正是本文件开头
   //     那段话要防的形状（「低的这 4 条让『静默删掉最多 4 条安全用例』不会红」）。
   //     因此这里对齐到实测的 80；下一次任何删除都会红一次。
+  //
+  // P3 / Task 7：**80 → 82**（+2）。`error-map.test.ts` 的表新增两档（交换的翻译表
+  // 从 12 档到 14 档，每档一条 `it`）：`AssetLockedByContractError`（双锁那一侧的作品锁）
+  // 与 `ExpiredExchangeWindowError`（24 小时窗口）。那两档的计数断言（`toHaveLength(14)`）
+  // 在同一次改动里同步上调 —— **没有**放宽「表里不许撞码」那一条（它仍然要求两两不同）。
+  //   ⇒ 实测值（不是预测）：`node scripts/assert-tests-ran.mjs exchange-core` = `Tests 82 passed (82)`。
   'exchange-core': {
     project: 'unit',
     paths: ['tests/unit/exchange'],
-    floor: 80,
-    why: 'P3 Task 3 的交换纯核心 + Task 6 的承诺闭集 / DTO / 错误翻译表（A-6）',
+    floor: 82,
+    why: 'P3 Task 3 的交换纯核心 + Task 6 的承诺闭集 / DTO / 错误翻译表（A-6）+ Task 7 的两档新翻译',
   },
   // P3 / Task 4 的账本写路径（本任务自己新增的 36 条）。实测：22 + 4 + 10 = 36 条，0 条 skip。
   // **为什么连新用例也一起钉**：上面那 62 条之所以成为「当时最大的开放项」，正是因为
@@ -278,11 +291,55 @@ const SCOPED_GATES = {
   //   ⇒ 实测值（不是预测）：`node scripts/assert-tests-ran.mjs exchange-offers` = `Tests 22 passed (22)`。
   //     （21 是本任务第一版的条数；随后补了一条**真交错**的用例——并发的第二个 `accept`
   //      撞上条件更新 ⇒ 409，见 `offers.test.ts` 的那条头注释。数字随实测对齐。）
+  //
+  // P3 / Task 7：**22 → 31**（+9）。作用域是**整个目录** `tests/integration/exchange`，
+  // 而 Task 7 在同一个目录里新增了 `double-lock.test.ts`（9 条：双方确认 ⇒ 锁 + `VALIDATING` /
+  // 幂等重放 / 24 小时窗口两个方向 / 非当事人 404 / 资产锁冲突回滚 / 资格不通过停在 `VALIDATING` /
+  // 撤销的两个阶段与三条 409 / 真死锁被服务层消化）。
+  // **为什么保持目录作用域而不是改成单文件**：目录作用域让「下一个任务在同一个目录里新增文件」
+  // 自动落进门的保护范围（这正是本文件存在的理由），代价是每次新增都要在这里对齐一次数字。
+  //   ⇒ 实测值（不是预测）：`node scripts/assert-tests-ran.mjs exchange-offers` = `Tests 31 passed (31)`。
   'exchange-offers': {
     project: 'integration',
     paths: ['tests/integration/exchange'],
-    floor: 22,
-    why: 'P3 Task 6 的要约生命周期与增量 A-6 的钉住 / TOCTOU（服务层的真库见证）',
+    floor: 31,
+    why: 'P3 Task 6 的要约生命周期与增量 A-6 的钉住 / TOCTOU + Task 7 的双锁与 VALIDATING（服务层的真库见证）',
+  },
+  // ★ P3 / Task 7：**新登记**。本任务在 `asset` 侧新增的两个集成套件。
+  //
+  // ## 它补的是哪一类洞（与 Task 4/5.5/6 的同一条纪律）
+  // 新用例落在 `integration` 里就必须**立刻**有下限，否则下一个任务又要从零算一遍
+  // 「未受保护面」（Task 4 在本文件里写下的那句话）。
+  //   * `asset-lock.test.ts`（10 条）：§6.3:284 的锁本体 —— 两列 + 行锁（并发互斥靠
+  //     `pg_stat_activity` 的观察，不是 sleep）/ 幂等重放 / 解锁的两个方向 /
+  //     缺作品不伪装成已锁定 / 两种介质上的同一条顺序规则 / 缺失 id 按锁序报 /
+  //     反向双锁恰好一笔成功 / **真死锁（P2010）经 `withBoundedConflictRetry` 收敛** /
+  //     `isLocked` 的三个方向 / 真库列形状；
+  //   * `version-locked.test.ts`（4 条）：增量 A-7 —— 版本写入边界的锁检查
+  //     （拒绝面 + 两条验收对照 + 未知作品仍然是 404）。
+  //   ⇒ 实测值（不是预测）：`node scripts/assert-tests-ran.mjs p3-asset-lock` = `Tests 14 passed (14)`。
+  'p3-asset-lock': {
+    project: 'integration',
+    paths: [
+      'tests/integration/asset/asset-lock.test.ts',
+      'tests/integration/asset/version-locked.test.ts',
+    ],
+    floor: 14,
+    why: 'P3 Task 7 的作品交换锁定（并发互斥 / 全局锁序 / 两档重试）与增量 A-7 的版本写入边界',
+  },
+  // ★ P3 / Task 7：**新登记**（`unit` 里的那一半）。
+  //
+  // A-7 顺手把「抛得出来、译不出来」那颗哑弹补上了：`assetErrorToHttp` 新增
+  // `AssetLockedForVersionError ⇒ 409 ASSET_LOCKED_FOR_VERSION`，而这条映射所在的**表**
+  // 由这个文件逐档钉住。它与项目里其他 `unit` 文件一样**此前不受任何下限保护** ——
+  // 本任务在这里顺手补上（8 条），理由与 Task 4 写下、Task 5.5/6 各自照做的那一句同源：
+  // **不给下一个任务留「从零算一遍未受保护面」的活**。
+  //   ⇒ 实测值（不是预测）：`node scripts/assert-tests-ran.mjs asset-error-map` = `Tests 8 passed (8)`。
+  'asset-error-map': {
+    project: 'unit',
+    paths: ['tests/unit/asset/asset-error-map.test.ts'],
+    floor: 8,
+    why: 'P1 Task 8 定下的 asset 边界的领域错误 → HTTP 映射表（含 P3 Task 7 / 增量 A-7 新加的 409 那一档）',
   },
 };
 

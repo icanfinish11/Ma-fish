@@ -210,6 +210,16 @@ describe('asset schema：迁移落地的形状（C4 / C5 / C6）', () => {
       // 两个方向都在：可空（`?`）与 `timestamptz(3)` 都由这一行钉住——把它写成非空或
       // 裸 `timestamp` 都会让这一行红（C6 的精度与 D10 的「null = 没锁」都靠它）。
       'assets.locked_at:timestamp with time zone?(3)',
+      // ★ P3 / Task 7：`holder_contract_id` 是**列全集**里新增的那一格
+      // （Task 7 对计划的一处自查修正：`locked_at` 只说「锁了」，而「谁锁的」是
+      // **解锁**与**幂等重放**两条判据的输入）。
+      //
+      // 它同样排在末尾（`ordinal_position` = 5）：迁移 `20261007150000_p3_asset_lock_holder`
+      // 是一条 `ALTER TABLE … ADD COLUMN`，PostgreSQL 把新列追加在末尾。
+      // 两个方向都在：可空（`?`，`null` = 这块作品没被任何合约锁着）与 `uuid` 都由这一行钉住；
+      // 把它写成非空、或者给它加一条指向 `exchange.swap_contracts` 的外键（C5 禁止跨模块约束），
+      // 都会让这一行红。
+      'assets.holder_contract_id:uuid?',
       'ownership_history.id:uuid',
       'ownership_history.asset_id:uuid',
       'ownership_history.from_user_id:uuid',
