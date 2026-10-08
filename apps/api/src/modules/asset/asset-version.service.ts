@@ -4,6 +4,7 @@ import { PrismaService } from '../../db/prisma.service.js';
 // 互相 import 会构成一个环（`no-circular` 在 `pnpm test` 的 architecture project 里实测抓到过）。
 // 理由与依赖图写在 `ingested-version.ts` 的头部。
 import type { IngestedVersion } from './ingested-version.js';
+import { AssetLockService } from './asset-lock.service.js';
 import { AssetNotFoundError } from './ownership.service.js';
 import type { ParsedMetadata } from './metadata/parse-metadata.js';
 
@@ -64,7 +65,17 @@ import type { ParsedMetadata } from './metadata/parse-metadata.js';
  */
 @Injectable()
 export class AssetVersionService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    /**
+     * ★ 增量 A-7：作品的**交换锁定**（P3 / Task 7 的 `AssetLockService`）。
+     *
+     * 它是 §6.3:284「不可编辑」这句话在本文件里的执行者：`{ assetId }` 分支在写任何一行
+     * **之前**问一次「这件作品锁着吗」。注入而不是在这里读表：那个判定的**唯一**实现
+     * 在 `AssetLockService.isLocked` 上（「作品现在能不能被编辑」只有一个答案来源）。
+     */
+    private readonly locks: AssetLockService,
+  ) {}
 
   /**
    * 把一条待落库的接入记录（连同它的元数据）写进 `asset` schema。
@@ -123,10 +134,30 @@ export class AssetVersionService {
        *     且两次不同）。
        *     错误类型与措辞都复用**同一个** `AssetNotFoundError`（它住在 `ownership.service.ts`，
        *     不是复制一份）：两个类同名同言，边界上的翻译就只有一处。
+       *
+       *     ★ **增量 A-7（P3 / Task 7）**：这一段同时是**处分冻结**的检查点
+       *     —— §6.3:284 说双方锁定之后作品「**不可编辑**」，而本方法是**唯一**能把版本
+       *     加到一件已存在作品上的写入点。判据走 `AssetLockService.isLocked`
+       *     （**一个**判决给出两件事：作品在不在、锁着吗），因此两件事**在同一次读取里**
+       *     被回答——分两次读会让「作品消失了」与「它刚被锁上」在两次快照之间换位。
+       *
+       *     **据实划界**：这条路径今天**零生产调用方**（类注释第 27 行写着这件事），
+       *     所以这道检查今天拦住的是**测试与将来的调用方**。放它的理由是本项目的标准：
+       *     **结构性不可能 > 约定** —— 等那条路径第一次有调用方时，锁已经在它里面了。
+       *     **复访触发条件**（与 `isLocked` 的注释同一条）：这条检查是**读**，不是锁。
+       *     真出现「看 v1、交 v2」的流程时，它必须改成按同一条全局锁序取行锁（`FOR UPDATE`），
+       *     否则「读完之后、写版本之前，别人把作品锁上了」这个窗口就是一条真实的旁路。
        */
       if (input.assetId !== undefined) {
-        const asset = await tx.asset.findUnique({ where: { id: input.assetId }, select: { id: true } });
-        if (asset === null) throw new AssetNotFoundError(input.assetId);
+        const verdict = await this.locks.isLocked(tx, input.assetId);
+        if (verdict === null) throw new AssetNotFoundError(input.assetId);
+        if (verdict.locked) {
+          // 409（`ASSET_LOCKED_FOR_VERSION`）。**不**复用 `AssetNotFoundError`：
+          // 作品**存在**且调用方通常就是它的所有人，回 404 等于用「没有这个作品」
+          // 去描述一个他拥有、只是被处分冻结的作品（`SelfTransferRejectedError`
+          // 当初拒 404 的理由逐字相同）。
+          throw new AssetLockedForVersionError(input.assetId, verdict.holderContractId);
+        }
       }
 
       const version = await tx.assetVersion.create({
@@ -170,6 +201,35 @@ export class AssetVersionService {
         plaintextBytes: version.plaintextBytes,
       };
     });
+  }
+}
+
+/**
+ * 往一件**被处分冻结**的作品里写新版本 ⇒ **409**（增量 A-7 / §6.3:284 的第一个执行点）。
+ *
+ * ## 为什么这个错误住在 `asset` 而不是复用 `exchange/core/errors.ts` 的 `AssetLockedError`
+ * 预检 §0.2 实测：`asset → exchange` 一旦成环，`pnpm arch` 就是 **6 条 error / exit 6**
+ * （单向时 exit 0）。D11 的接缝是「`asset` 拥有处分判定，`exchange` 把事实**推**给它」，
+ * 因此这里**只**读 `asset.assets` 自己的两列，不 import 任何 exchange 符号。
+ *
+ * ## 为什么是 409 而不是 404 / 422
+ * 与 `AssetLockedByContractError`（同一份锁的另一条路径）逐字同一条理由：
+ * 作品**存在**，请求本身完全合法，冲突在于**资源的当前状态**（它被另一份合约处分冻结）。
+ * 404 会用「没有这个作品」描述一个调用方拥有的作品；422 在本仓库是「内容不可接受」。
+ *
+ * ## 为什么它**不**从 `asset/index.ts` 导出（一处据实记载）
+ * 今天没有任何模块外的调用方：它的 HTTP 出口在本模块的 `assetErrorToHttp` 里，
+ * 而抛出它的那条路径（`persistIngested` 的 `{ assetId }` 分支）也没有生产调用方。
+ * C16：不为不存在的调用方建接口。**复访触发条件**：那条路径第一次有 HTTP 调用方时，
+ * 它跟着 `AssetNotFoundError` 一起进 `index.ts`（那时边界才需要分开说清责任方）。
+ */
+export class AssetLockedForVersionError extends Error {
+  constructor(
+    readonly assetId: string,
+    readonly holderContractId: string | null,
+  ) {
+    super(`作品已被锁定（§6.3:284）：${assetId} 由合约 ${holderContractId ?? '(未知)'} 持有`);
+    this.name = 'AssetLockedForVersionError';
   }
 }
 

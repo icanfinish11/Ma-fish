@@ -43,6 +43,15 @@ export { ExchangeService, OFFER_TTL_HOURS, CONTRACT_LOCK_HOURS } from './exchang
 export type { AcceptOfferInput, OfferDecisionInput, ProposeOfferInput } from './exchange.service.js';
 export { exchangeErrorToHttp } from './exchange-error-map.js';
 
+/**
+ * 双锁与 `VALIDATING`（P3 / Task 7）。
+ *
+ * 它是 Task 8 / Task 10 的 `Consumes` 行逐字点名的符号：Task 8 的释放路径与
+ * Task 10 的计时器都要读/推进合约（`confirmLock` 本身由路由与测试行使）。
+ */
+export { SwapContractService } from './swap-contract.service.js';
+export type { ConfirmedLock } from './swap-contract.service.js';
+
 // 增量 A-6 的闭集：Task 9 的 manifest 与 P3.5 的 `judge` 都读它
 // （A-6 的 Produces 行逐字）。**逐条导出**（不用 `export *`），理由见文件头。
 export {
@@ -58,6 +67,7 @@ export type { Claim, ClaimFacts, ClaimKind } from './core/claims.js';
 export {
   AssetLockedError,
   EscrowShortfallError,
+  ExpiredExchangeWindowError,
   IneligibleAssetError,
   InvalidClaimsError,
   InvalidExchangeTransitionError,

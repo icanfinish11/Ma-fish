@@ -309,18 +309,39 @@ describe('越权矩阵：exchange 的六条路由 × 四种角色（判据 11 / 
     },
     {
       handler: 'readOffer',
-      label: 'GET /exchange/offers/:offerId（声明：SwapOffer.read + 条件 swapOfferSent）',
-      party: 'counterparty',
+      label: 'GET /exchange/offers/:offerId（声明：SwapOffer.read + 条件 swapOfferParty）',
+      party: 'proposer',
       call: (role) =>
         withCookie(
           request(app.getHttpServer()).get(`/exchange/offers/${offerId}`),
+          cookieNameFor(role, 'proposer'),
+        ),
+      expect: {
+        anonymous: { status: 403, kind: 'login' },
+        stranger: { status: 403, kind: 'denied' },
+        admin: { status: 403, kind: 'denied' },
+        // ★ 验收面：**双方都读得到，且不判状态**（Task 7 修掉了 Task 6 报告的那条缺陷）。
+        // `offerId` 是一份**已经 `ACCEPTED`** 的要约 —— 在旧声明（`swapOfferSent`）下
+        // 双方都是 403；新声明（`swapOfferParty`）下双方都是 200。
+        party: { status: 200, kind: 'ok' },
+      },
+    },
+    {
+      handler: 'confirmLock',
+      label: 'POST /exchange/contracts/:contractId/confirm-lock（声明：SwapContract.confirmLock + 条件 swapContractParty）',
+      party: 'counterparty',
+      call: (role) =>
+        withCookie(
+          request(app.getHttpServer()).post(`/exchange/contracts/${contractId}/confirm-lock`),
           cookieNameFor(role, 'counterparty'),
         ),
       expect: {
         anonymous: { status: 403, kind: 'login' },
         stranger: { status: 403, kind: 'denied' },
         admin: { status: 403, kind: 'denied' },
-        party: { status: 403, kind: 'denied' },
+        // ★ 验收面：被要约方（`partyA`）**第一次**确认成功 ⇒ 200，合约仍在
+        // `PENDING_BOTH_LOCK`（还没轮到对方）。`readContract` 那一格证明这条路对当事人是通的。
+        party: { status: 200, kind: 'ok' },
       },
     },
     {
@@ -337,8 +358,7 @@ describe('越权矩阵：exchange 的六条路由 × 四种角色（判据 11 / 
         stranger: { status: 403, kind: 'denied' },
         admin: { status: 403, kind: 'denied' },
         // ★ 验收面：合约**没有状态维度**（`swapContractParty` 不判 status），
-        //   因此当事人即使在合约已经 `PENDING_BOTH_LOCK` 之后也读得到 —— 与上面
-        //   `readOffer` 的 `party` 格（403）形成一对**有判别力**的对照。
+        //   因此当事人即使在合约已经 `VALIDATING` 之后也读得到。
         party: { status: 200, kind: 'ok' },
       },
     },
@@ -369,13 +389,25 @@ describe('越权矩阵：exchange 的六条路由 × 四种角色（判据 11 / 
   }
 
   /**
-   * ★ 条件的**验收面**：`swapOfferSent` 恰好放行「被要约方 + `SENT`」。
+   * ★ 条件的**验收面**：`swapOfferSent` 恰好放行「被要约方 + `SENT`」，
+   * 而 `swapOfferParty`（Task 7 给**读**新增的那一条）放行**双方、不判状态**。
    *
-   * 上面那张矩阵里 `accept` / `reject` / `readOffer` 的 `party` 格全是 403，
-   * 因为它们跑在一份**已经 `ACCEPTED`** 的要约上。没有下面这两条用例，
-   * 「条件判否」与「条件永远判否」长得一模一样 —— 那正是「一条不可能失败的断言」。
+   * 上面那张矩阵里 `accept` / `reject` 的 `party` 格全是 403，因为它们跑在一份
+   * **已经 `ACCEPTED`** 的要约上。没有下面这几条用例，「条件判否」与「条件永远判否」
+   * 长得一模一样 —— 那正是「一条不可能失败的断言」。
+   *
+   * ## 四个方向（本用例的全部内容）
+   *   ① 新的 `SENT` 要约上，**对手方**读得到（200）；
+   *   ② **发起方**读**自己的**要约也读得到（200）—— 这是控制器裁定「修」的那一半
+   *      （Task 6 据实报告：旧声明下这里是 **403**，而那与这条路由自己的注释、
+   *      以及服务层 `getOffer` 的判定都相反）；
+   *   ③ **陌生人**仍然 403「该资源未被授权访问」（拒绝面，且与「需要登录」可区分）；
+   *   ④ 一份**终态**（`EXPIRED`）要约：**双方都读得到**（200）—— 而**同一个**终态要约上
+   *      `accept` 仍然 403：两条条件因此是**两条规则**，不是一次放宽。
+   *
+   * ⑤ 不存在的 id ⇒ 403（fail-closed：条件查不到那一行就判否，不泄露存在性）。
    */
-  it('★ 条件恰好放行「被要约方 + `SENT`」：一份新的 `SENT` 要约上，对手方 200，发起方 403', async () => {
+  it('★ 读要约的两个条件各守各的：双方（含发起方、含终态）读得到 200，陌生人 403，而终态**接受**仍然 403', async () => {
     const exchange = app.get(ExchangeService);
     const proposerId = (await prisma.swapOffer.findUniqueOrThrow({ where: { id: offerId } })).proposerId;
     // 换一件**新的**被要约作品（同一对 `(target, counterparty)` 上的活跃要约唯一）。
@@ -415,31 +447,56 @@ describe('越权矩阵：exchange 的六条路由 × 四种角色（判据 11 / 
     // 需要一个**新的**对手方会话（`freshTarget` 的所有人）。
     const { sessionId } = await sessions.create(owner, { ip: '127.0.0.1', userAgent: 'vitest' });
     const ownerCookie = `${SESSION_COOKIE}=${sessionId}; ${CSRF_COOKIE}=${csrf}`;
-    const asOwner = await request(app.getHttpServer())
-      .get(`/exchange/offers/${fresh.offerId}`)
-      .set('Cookie', ownerCookie)
-      .set(CSRF_HEADER, csrf);
+    const read = async (cookieName: string, id: string): Promise<request.Response> =>
+      request(app.getHttpServer())
+        .get(`/exchange/offers/${id}`)
+        .set('Cookie', cookieName)
+        .set(CSRF_HEADER, csrf);
+
+    // ① 对手方读到（验收面）。
+    const asOwner = await read(ownerCookie, fresh.offerId);
     expect(asOwner.status, failureDetail(asOwner)).toBe(200);
     expect((asOwner.body as { offerId: string }).offerId).toBe(fresh.offerId);
 
-    // 发起方读**自己的**要约 ⇒ 403（`swapOfferSent` 不认识发起方）。
-    // ★ 这一格是**据实记载计划的一处自相矛盾**：`exchange.controller.ts` 那条路由的
-    //   注释写着「双方可见」，而它的声明读作「被要约方 + `SENT`」。本任务取**声明**
-    //   （覆盖率门逐条断言的就是它），冲突进报告 §concerns。
-    const asProposer = await request(app.getHttpServer())
-      .get(`/exchange/offers/${fresh.offerId}`)
-      .set('Cookie', cookies.get('proposer') as string)
-      .set(CSRF_HEADER, csrf);
-    expect(asProposer.status, failureDetail(asProposer)).toBe(403);
-    expect((asProposer.body as { message: string }).message).toBe('该资源未被授权访问');
+    // ② ★ 发起方读**自己的**要约 ⇒ 200（Task 7 修掉的那一半；旧声明下这里是 403）。
+    const asProposer = await read(cookies.get('proposer') as string, fresh.offerId);
+    expect(
+      asProposer.status,
+      `发起方必须能读自己的要约（控制器裁定：那是他自己的数据）。实测：${failureDetail(asProposer)}`,
+    ).toBe(200);
+    expect((asProposer.body as { offerId: string }).offerId).toBe(fresh.offerId);
 
-    // 已过期（`EXPIRED`）的要约 ⇒ 对手方 403（条件里的 `status = 'SENT'` 那一半）。
+    // ③ 陌生人仍然读不到，且理由与匿名**不同**（守卫的条件判否，不是「需要登录」）。
+    const asStranger = await read(cookies.get('stranger') as string, fresh.offerId);
+    expect(asStranger.status, failureDetail(asStranger)).toBe(403);
+    expect((asStranger.body as { message: string }).message).toBe('该资源未被授权访问');
+
+    // ⑤ 不存在的 id ⇒ 403（fail-closed；不给「这个 id 存在吗」这个问题一个不同的答案）。
+    const missing = await read(cookies.get('proposer') as string, '01920000-0000-7000-8000-0000000000ff');
+    expect(missing.status, failureDetail(missing)).toBe(403);
+    expect((missing.body as { message: string }).message).toBe('该资源未被授权访问');
+
+    // ④ 终态要约：**双方都读得到**（200），而 `accept` 仍然 403。
     await prisma.swapOffer.update({ where: { id: fresh.offerId }, data: { status: 'EXPIRED' } });
-    const expired = await request(app.getHttpServer())
-      .get(`/exchange/offers/${fresh.offerId}`)
+    const ownerOnTerminal = await read(ownerCookie, fresh.offerId);
+    expect(ownerOnTerminal.status, `终态要约对手方必须读得到。实测：${failureDetail(ownerOnTerminal)}`).toBe(200);
+    expect((ownerOnTerminal.body as { status: string }).status).toBe('EXPIRED');
+    const proposerOnTerminal = await read(cookies.get('proposer') as string, fresh.offerId);
+    expect(proposerOnTerminal.status, `终态要约发起方必须读得到。实测：${failureDetail(proposerOnTerminal)}`).toBe(200);
+
+    // ★ 判别力：**同一个**终态要约上，`accept` 走的是另一条条件（`swapOfferSent`）
+    // ⇒ 403。这一格证明「读放宽了」**没有**顺手把决定类动作也放宽 ——
+    // 两条规则各自守着自己的那一半。
+    const acceptOnTerminal = await request(app.getHttpServer())
+      .post(`/exchange/offers/${fresh.offerId}/accept`)
       .set('Cookie', ownerCookie)
-      .set(CSRF_HEADER, csrf);
-    expect(expired.status, failureDetail(expired)).toBe(403);
+      .set(CSRF_HEADER, csrf)
+      .send({ targetCommitment: { assetVersionId: version.id, dossierDigest: DIGEST } });
+    expect(
+      acceptOnTerminal.status,
+      `终态要约**不能**被接受（swapOfferSent 那一半没有被放宽）。实测：${failureDetail(acceptOnTerminal)}`,
+    ).toBe(403);
+    expect((acceptOnTerminal.body as { message: string }).message).toBe('该资源未被授权访问');
   });
 
   it('矩阵自身覆盖 ExchangeController 的**全部**已注册路由（少一条端点就是一个盲区）', async () => {
@@ -452,12 +509,13 @@ describe('越权矩阵：exchange 的六条路由 × 四种角色（判据 11 / 
     expect(registered.length, '注册表里没有 ExchangeController 的任何路由：发现层没接通').toBeGreaterThan(0);
     expect(registered.map((route) => route.handler).sort()).toEqual(MATRIX.map((row) => row.handler).sort());
 
-    // 非空转前提的加强版：六条路由的**路径与声明**确实在注册表里，逐条。
-    // 少了这一条，把六条路由**整个删掉**也能让上面的集合相等（两边都只剩空数组）——
+    // 非空转前提的加强版：七条路由的**路径与声明**确实在注册表里，逐条。
+    // 少了这一条，把七条路由**整个删掉**也能让上面的集合相等（两边都只剩空数组）——
     // 而 `AppModule` 漏掉 `ExchangeModule` 时正是那个形状（运行期 404、门照样绿）。
     expect(registered.map((route) => `${route.handler} ${route.path} ${route.isPublic ? 'public' : 'guarded'}`).sort())
       .toEqual([
         'accept /exchange/offers/:offerId/accept guarded',
+        'confirmLock /exchange/contracts/:contractId/confirm-lock guarded',
         'propose /exchange/offers guarded',
         'readContract /exchange/contracts/:contractId guarded',
         'readOffer /exchange/offers/:offerId guarded',

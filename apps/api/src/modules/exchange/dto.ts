@@ -179,6 +179,20 @@ export interface AcceptOfferResponse {
 }
 
 /**
+ * 确认锁定的响应（`POST /exchange/contracts/:contractId/confirm-lock`；§9:478）。
+ *
+ * `status` 回的是**做完这一次确认之后**的合约状态：`PENDING_BOTH_LOCK`（还在等另一方，
+ * 或本人是重放）、`VALIDATING`（这一次让双方都锁上了）。
+ * `bothLocked` 是**派生值**（= 两个时间戳都非空），不是「这一次有没有推进」——
+ * 一份在双方确认之前被取消的合约上它不是 `true`。
+ */
+export interface ConfirmLockResponse {
+  readonly contractId: string;
+  readonly status: string;
+  readonly bothLocked: boolean;
+}
+
+/**
  * 一份要约的视图（`GET /exchange/offers/:offerId`；**双方可见**）。
  *
  * ## 刻意**没有** `offeredSha256` / `targetSha256`

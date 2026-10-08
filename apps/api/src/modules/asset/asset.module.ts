@@ -7,6 +7,7 @@ import { createStreamingStorage } from '../../common/upload/stream-upload.js';
 import { AuditModule } from '../audit/index.js';
 import { AssetController, POLICY_CONDITIONS } from './asset.controller.js';
 import { AssetAccessService } from './asset-access.service.js';
+import { AssetLockService } from './asset-lock.service.js';
 import { AssetService } from './asset.service.js';
 import { AssetVersionService } from './asset-version.service.js';
 import { createKeyRing, KEY_RING, type KeyRing } from './crypto/key-ring.js';
@@ -84,6 +85,16 @@ import { LocalArtifactStore } from './store/local-artifact.store.js';
     AssetAccessService,
     // 签名下载（Task 8）：签发 + 兑换（D10/D11 的另外两条）。
     DownloadService,
+    /**
+     * 作品的**交换锁定**（P3 / Task 7；§6.3:284 / D10）。
+     *
+     * 它是**无状态**的（构造期没有依赖）：三个方法都收调用方的 `tx`，
+     * 因此它自己**开不出**一个事务来——「锁」与「合约推进到 `VALIDATING`」
+     * 必须在同一个事务里，这一点由类型与依赖图一起保证，而不是靠注释。
+     * 它仍然是一个 provider（而不是一个纯函数模块）：注入方（`SwapContractService`）
+     * 经 DI 拿到它，与 `AssetAccessService` 同一形状。
+     */
+    AssetLockService,
   ],
   exports: [
     ARTIFACT_STORE,
@@ -93,6 +104,8 @@ import { LocalArtifactStore } from './store/local-artifact.store.js';
     OwnershipService,
     AssetAccessService,
     DownloadService,
+    // P3 / Task 7：`exchange` 的 `confirmLock` 是它的第一个调用方（模块外经 `asset/index.ts`）。
+    AssetLockService,
   ],
 })
 export class AssetStoreModule {}

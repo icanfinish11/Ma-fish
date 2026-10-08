@@ -4,9 +4,10 @@ import { parseOrBadRequest } from '../../common/http/parse-or-bad-request.js';
 import { Policy } from '../../common/policy/policy.decorator.js';
 import { RateLimited } from '../../common/security/throttler.js';
 import { acceptOfferSchema, offerReasonSchema, proposeOfferSchema, uuidParamSchema } from './dto.js';
-import type { AcceptOfferResponse, ContractView, OfferView, ProposeOfferResponse } from './dto.js';
+import type { AcceptOfferResponse, ConfirmLockResponse, ContractView, OfferView, ProposeOfferResponse } from './dto.js';
 import { exchangeErrorToHttp } from './exchange-error-map.js';
 import { ExchangeService } from './exchange.service.js';
+import { SwapContractService } from './swap-contract.service.js';
 
 /**
  * 策略条件的名字（**唯一**定义处；`ExchangeModule.onModuleInit` 反向 import 它）。
@@ -23,12 +24,32 @@ import { ExchangeService } from './exchange.service.js';
 export const POLICY_CONDITIONS = {
   /** 本用户是不是这份要约的目标对手方，且要约处于 `SENT`（§9:475 / §9:477 两行共用）。 */
   swapOfferSent: 'swapOfferSent',
+  /**
+   * ★ P3 / Task 7（控制器裁定）：本用户是不是这份要约的**当事人**（发起方**或**被要约方），
+   * **不判状态**。
+   *
+   * ## 它修的是什么（Task 6 找到、控制器裁定「修」的一条真缺陷）
+   * `GET /exchange/offers/:offerId` 的注释一直写着「**双方可见**」，而它的声明是
+   * `swapOfferSent`（「被要约方 + `SENT`」）⇒ 两个方向的读都被拒：
+   *   * **发起方读自己的要约 ⇒ 403**（那是他自己的数据）；
+   *   * **`ACCEPTED` 的要约谁都读不到**（终态不在 `SENT`）。
+   * Task 6 按**声明**走是对的（覆盖率门逐条断言的就是声明），冲突被记录下来交给控制器；
+   * 裁定是「**修**：发起方必须能读自己的要约，终态要约双方可读」。
+   *
+   * ## 为什么是**新增一条**条件，而不是把 `swapOfferSent` 放宽
+   * 那一条还挂在 `accept` / `reject` 上，而那两个动作的授权**必须**是
+   * 「被要约方 + `SENT`」（§9:477）——放宽它等于让发起方去接受自己的要约、
+   * 让一份终态要约还能被拒绝。两条规则的对象不同（读 vs 决定），因此两个条件。
+   * 这也是 D11 的形状：条件由**拥有这个概念的那个模块**注册（`ExchangeModule`），
+   * 守卫从不 import 业务模块。
+   */
+  swapOfferParty: 'swapOfferParty',
   /** 本用户是不是这份合约的当事人（§9:478 `SwapContract confirmLock`）。 */
   swapContractParty: 'swapContractParty',
 } as const;
 
 /**
- * 交换的六条路由（P3 / Task 6；§6.3 的要约生命周期 + §9 的矩阵）。
+ * 交换的七条路由（P3 / Task 6 的六条 + **Task 7 的 `confirmLock`**；§6.3 + §9 的矩阵）。
  *
  * ## 两条策略条件的注册在 `ExchangeModule`（D11 的接缝）
  *
@@ -56,9 +77,12 @@ export const POLICY_CONDITIONS = {
  * |---|---|---|
  * | `propose`（`SwapOffer.create`） | **无条件**（登录即可） | §9 没有这一行。按 P2 `Ledger.grant` 的处置取「最保守并且在今天可判定的一档」；「谁能发要约」在 §6.3 里就是对**自己的**作品发起的动作，因此「登录即可」是今天可判定的那一档 |
  * | `withdraw`（`SwapOffer.withdraw`） | **无条件**（登录即可） | 同上。**「只有发起方」这条限制由服务层执行**（`ExchangeService.withdrawOffer`），理由写在那里 |
- * | `readOffer`（`SwapOffer.read`） | 条件 `swapOfferSent` | 计划明写这一条。**据实记载它与自己的注释冲突**：注释说「双方可见」，而 `swapOfferSent` 只放行「被要约方 + `SENT`」——发起方与终态要约因此读不到。本任务取**声明**（覆盖率门逐条断言的就是它），冲突进报告 §concerns |
+ * | `readOffer`（`SwapOffer.read`） | 条件 `swapOfferParty`（**双方可见、不判状态**） | 计划明写这一条。★ **这处冲突已在 Task 7 修掉**：Task 6 按声明走（`swapOfferSent`）并向控制器报告了「注释说双方可见、声明说被要约方 + `SENT`」的矛盾，裁定是**修**（发起方必须能读自己的要约；终态要约双方可读）。新条件由 `ExchangeModule` 注册，理由见 `POLICY_CONDITIONS.swapOfferParty` |
  *
  * **不发明**一条 §9 没有的授权规则，是这一段的全部内容。
+ *
+ * ★ **P3 / Task 7 的第七条路由**：`confirmLock`（`SwapContract confirmLock`）在 §9:478
+ * **有**矩阵行（当事人），声明因此不需要发明任何东西。
  *
  * ## 为什么每一个处理器都先 `parseOrBadRequest`
  *
@@ -75,7 +99,11 @@ export const POLICY_CONDITIONS = {
  */
 @Controller('exchange')
 export class ExchangeController {
-  constructor(private readonly exchange: ExchangeService) {}
+  constructor(
+    private readonly exchange: ExchangeService,
+    /** P3 / Task 7：双锁与 `VALIDATING`（§9:478 的那条路由）。 */
+    private readonly contracts: SwapContractService,
+  ) {}
 
   /** 发要约（§9:477 的 `DRAFT → SENT`）。**挂 `bid` 档**（C33）。 */
   @Policy({ resource: 'SwapOffer', action: 'create' })
@@ -141,8 +169,17 @@ export class ExchangeController {
     }
   }
 
-  /** 读一份要约。挂 `search`（读路径，按 IP）。声明与注释的冲突见类注释。 */
-  @Policy({ resource: 'SwapOffer', action: 'read', condition: POLICY_CONDITIONS.swapOfferSent })
+  /**
+   * 读一份要约。挂 `search`（读路径，按 IP）。
+   *
+   * ★ **P3 / Task 7 修掉了这里的声明与注释的冲突**（Task 6 据实记载、控制器裁定「修」）：
+   * 条件从 `swapOfferSent`（被要约方 + `SENT`）换成 `swapOfferParty`（**双方、不判状态**）。
+   * 旧声明下**发起方读自己的要约得 403**，而一份 `ACCEPTED` 的要约**谁都读不到** ——
+   * 那不是「更严」，那是这条路由对自己的注释说谎（注释一直写着「双方可见」）。
+   * 服务层（`ExchangeService.getOffer`）本来就是双方可见的，因此这次改动让**两层一致**，
+   * 而不是新开一条更宽的规则：`swapOfferSent` 仍然守着 `accept` / `reject`。
+   */
+  @Policy({ resource: 'SwapOffer', action: 'read', condition: POLICY_CONDITIONS.swapOfferParty })
   @RateLimited('search')
   @Get('offers/:offerId')
   async readOffer(@Param('offerId') offerId: string): Promise<OfferView> {
@@ -162,6 +199,35 @@ export class ExchangeController {
     const id = parseOrBadRequest(uuidParamSchema, { id: contractId });
     try {
       return await this.exchange.getContract(id, actorId());
+    } catch (error) {
+      throw exchangeErrorToHttp(error) ?? error;
+    }
+  }
+
+  /**
+   * 确认锁定（P3 / Task 7；§9:478 的 `SwapContract confirmLock`）。
+   *
+   * ## 声明与限流档
+   * `@Policy({ resource: 'SwapContract', action: 'confirmLock', condition: swapContractParty })`
+   * —— §9 的矩阵里**有这一行**（「`SwapContract confirmLock` = 当事人」），
+   * 条件复用合约当事人那一条（合约**没有状态维度**：当事人确认到哪一步都读得到/动得了，
+   * 而「现在能不能确认」是**服务层**的状态机判定）。
+   * 限流挂 `bid`（C33：交换的写路由挂 `bid` 档，并记录档名不吻合）。
+   *
+   * ## 两个成功形状与三种失败
+   * `200` 带 `{contractId, status, bothLocked}`；服务层的三个因由各有一档翻译：
+   * 窗口过期 / 资产被别的合约锁定 / 资格不通过（422，且合约**已经**停在 `VALIDATING`）。
+   * **据实记载**：资格不通过时状态**已经提交**为 `VALIDATING`，而响应是 422 ——
+   * 调用方唯一正确的下一步是重新读一次合约（它已经不是发出请求前的那个状态了）。
+   */
+  @Policy({ resource: 'SwapContract', action: 'confirmLock', condition: POLICY_CONDITIONS.swapContractParty })
+  @RateLimited('bid')
+  @HttpCode(HttpStatus.OK)
+  @Post('contracts/:contractId/confirm-lock')
+  async confirmLock(@Param('contractId') contractId: string): Promise<ConfirmLockResponse> {
+    const id = parseOrBadRequest(uuidParamSchema, { id: contractId });
+    try {
+      return await this.contracts.confirmLock(id, actorId());
     } catch (error) {
       throw exchangeErrorToHttp(error) ?? error;
     }

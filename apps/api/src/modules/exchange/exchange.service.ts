@@ -3,7 +3,7 @@ import { PrismaService } from '../../db/prisma.service.js';
 import { AssetAccessService, AssetNotFoundError } from '../asset/index.js';
 import { AuditService } from '../audit/index.js';
 import { assertClaimsVerifiable, claimFactsFrom, parseClaims, type Claim } from './core/claims.js';
-import { assessEligibility } from './core/eligibility.js';
+import { eligibilityOf } from './core/eligibility.js';
 import {
   AssetLockedError,
   IneligibleAssetError,
@@ -461,12 +461,12 @@ export class ExchangeService {
    * 服务层的判定是**自足**的（不假设调用方已经判过）：第三方与不存在的 id 得到
    * **同一个** `UnknownExchangeObjectError` —— 不向非当事人泄露一份要约是否存在。
    *
-   * **注意它比路由层的门更宽**：`GET /exchange/offers/:offerId` 上的条件
-   * `swapOfferSent` 只放行「被要约方 + `SENT`」，因此发起方与终态要约在**HTTP** 上是 403，
-   * 而这里允许。**据实记载这处不一致**：计划里那条路由的注释写着「双方可见」，
-   * 而它的声明读作「被要约方 + `SENT`」——两者只能取一个，本任务取**声明**
-   * （覆盖率门逐条断言的就是它）。修法是加一条对象级的条件（覆盖双方、不限制状态），
-   * 那是一次授权规则的新增，属控制器裁定，不属实现者能顺手做的决定（报告 §concerns）。
+   * ## ★ 两层在 Task 7 之后**一致**了（此前不一致，据实记载）
+   * Task 6 时这里允许发起方与终态要约，而路由上的条件 `swapOfferSent` 只放行
+   * 「被要约方 + `SENT`」⇒ 发起方与终态要约在 HTTP 上是 403 而服务层允许。
+   * 控制器裁定**修**，Task 7 因此新增了对象级条件 `swapOfferParty`（双方、不判状态），
+   * 路由与服务层现在说的是同一件事。**这条注释保留这段历史**：
+   * 它是「注释、声明、服务层三处必须说同一件事」的一个真实例子。
    */
   async getOffer(offerId: string, actorId: string): Promise<OfferView> {
     const row = await this.prisma.swapOffer.findUnique({
@@ -615,16 +615,15 @@ export class ExchangeService {
  *
  * **没有元数据行**也走这一支：一件解析不出元数据的作品不是「合格品」，
  * 而 `assessEligibility` 收的是三个事实、没有「有没有事实」这一说 —— 因此那一条
- * 在这一层表达，而不是把一个编造的 `completeness: 0` 喂给判据（那会让「没解析过」
- * 与「完整度为 0」变成同一个答案，正是 `eligibility.ts` 点名的缺陷族）。
+ * 在 `eligibilityOf` 这一层表达，而不是把一个编造的 `completeness: 0` 喂给判据
+ * （那会让「没解析过」与「完整度为 0」变成同一个答案，正是 `eligibility.ts` 点名的缺陷族）。
+ *
+ * **P3 / Task 7 的一次提取**：判据搬去 `core/eligibility.ts` 的 `eligibilityOf`
+ * （`SwapContractService.validate` 要的是**判决**而不是一个异常，因为它的结论必须在
+ * `VALIDATING` 提交**之后**才报出去）。这里保留的是「抛」那一种呈现方式。
  */
 function assertEligible(assetId: string, metadata: AssetMetadataViewLike | null): void {
-  if (metadata === null) throw new IneligibleAssetError(assetId, '没有元数据行（解析产物缺失）');
-  const verdict = assessEligibility({
-    completeness: metadata.completeness,
-    readmeExcerpt: metadata.readmeExcerpt,
-    fileTreeTruncated: metadata.fileTreeTruncated,
-  });
+  const verdict = eligibilityOf(metadata);
   if (!verdict.eligible) throw new IneligibleAssetError(assetId, verdict.reason ?? '不满足 §6.1 第 2 条');
 }
 

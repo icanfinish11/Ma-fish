@@ -84,6 +84,24 @@ export {
   type OpenedDownload,
 } from './download/download.service.js';
 
+/**
+ * 作品的**交换锁定**（P3 / Task 7；§6.3:284 / D10 / C35）。
+ *
+ * ## 谁是第一个模块外调用方（C16 要求的「导出时机」）
+ * `exchange` 的 `SwapContractService.confirmLock`：双方都确认之后它调 `lockAssets`，
+ * 而「解锁」的**生产**调用方是 Task 10 的增量 A-10（两个终态解锁；A-10 逐字说
+ * 那是本节留下的既有缺陷）。
+ *
+ * ## 错误类也必须一起导出
+ * 它跨模块抛（`confirmLock` 会把 `AssetLockedByContractError` 透给 HTTP 边界），
+ * 而边界要能把它翻成 409 —— 把错误类藏在模块内部会让调用方只能按**错误消息**匹配。
+ * 理由与 `AssetNotFoundError` / `SelfTransferRejectedError` 那两条逐字同源。
+ */
+export {
+  AssetLockService,
+  AssetLockedByContractError,
+} from './asset-lock.service.js';
+
 export {
   DOWNLOAD_PATH,
   DOWNLOAD_TTL_SECONDS,

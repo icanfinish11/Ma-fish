@@ -12,6 +12,7 @@ import { PrismaService } from '@vca/api/db/prisma.service.js';
 import { AuditService } from '@vca/api/modules/audit/index.js';
 import { AssetService } from '@vca/api/modules/asset/asset.service.js';
 import { AssetVersionService } from '@vca/api/modules/asset/asset-version.service.js';
+import { AssetLockService } from '@vca/api/modules/asset/asset-lock.service.js';
 import { AssetAccessService } from '@vca/api/modules/asset/asset-access.service.js';
 import {
   AssetNotFoundError,
@@ -273,7 +274,8 @@ describe('版本落库：接入记录 → asset_versions / asset_metadata（Step
     // `ConfigService` 现建，Task 8 把它提取成 `KEY_RING` 提供者（下载路径是第二个消费者，
     // 这正是 Task 5 的注释预告的时机）。因此这里给的是 `ringFromEnv()`——**同一份**环境夹具
     // 算出的同一个环，而不是另造一个。
-    versions = new AssetVersionService(prisma);
+    // ★ 增量 A-7（P3 / Task 7）：第二个依赖是作品的**交换锁定**（§6.3:284 的执行者）。
+    versions = new AssetVersionService(prisma, new AssetLockService());
     // ★ 增量 A / Task 5.5：读路径的那一半（`AssetAccessService.readMetadata`）。
     // 它只依赖 `PrismaService`（一次 `select`），因此不需要 `AssetService` 的那套注入。
     access = new AssetAccessService(prisma);
@@ -651,7 +653,8 @@ describe('所有权转让：指针 + 一行历史（同一事务），制品一�
     store = new LocalArtifactStore(storeDir);
     // 第二个入参是密钥环（Task 8 起从 `ConfigService` 换成 `KEY_RING`，理由见第 2 节的同一条）；
     // 第四个是落库服务（Task 9 起 `AssetService.ingest` 的第三步用它）。
-    versions = new AssetVersionService(prisma);
+    // ★ 增量 A-7（P3 / Task 7）：第二个依赖是作品的**交换锁定**（§6.3:284 的执行者）。
+    versions = new AssetVersionService(prisma, new AssetLockService());
     assets = new AssetService(
       store,
       ringFromEnv(),

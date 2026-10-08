@@ -5,6 +5,7 @@ import { AssetModule } from '../asset/index.js';
 import { AuditModule } from '../audit/index.js';
 import { ExchangeController, POLICY_CONDITIONS } from './exchange.controller.js';
 import { ExchangeService } from './exchange.service.js';
+import { SwapContractService } from './swap-contract.service.js';
 
 /**
  * 交换模块（P3 / Task 6）。
@@ -69,8 +70,8 @@ import { ExchangeService } from './exchange.service.js';
 @Module({
   imports: [AuditModule, AssetModule],
   controllers: [ExchangeController],
-  providers: [ExchangeService],
-  exports: [ExchangeService],
+  providers: [ExchangeService, SwapContractService],
+  exports: [ExchangeService, SwapContractService],
 })
 export class ExchangeModule implements OnModuleInit {
   constructor(
@@ -103,6 +104,27 @@ export class ExchangeModule implements OnModuleInit {
       // 没有第二个维度）。这一点与 `swapOfferSent` 的差别是刻意的：要约的状态是
       // 那一行的语义的一部分，合约的状态不是「谁能看」的一部分。
       return row !== null && (row.partyAId === userId || row.partyBId === userId);
+    });
+
+    /**
+     * ★ P3 / Task 7（控制器裁定）：**要约的当事人**（发起方或被要约方），**不判状态**。
+     *
+     * 它修的是 Task 6 报告里那条真缺陷：`GET /exchange/offers/:offerId` 的声明是
+     * `swapOfferSent`（被要约方 + `SENT`），而它的注释（与服务层的判定）都是「双方可见」
+     * ⇒ 发起方读自己的要约 403、终态要约谁都读不到。
+     * 与 `swapContractParty` 逐字同形：**只判「是不是当事人」**，因为「谁能读」没有第二个维度
+     * （状态是那一行的语义的一部分，而读它正是要看状态）。
+     * 两个判定在同一条查询里：`proposerId` / `counterpartyId` 与 `userId` 的比较。
+     */
+    this.policy.registerCondition(POLICY_CONDITIONS.swapOfferParty, async ({ req, userId }) => {
+      if (userId === undefined) return false;
+      const offerId = String((req.params as Record<string, string>)['offerId'] ?? '');
+      if (offerId === '') return false;
+      const row = await this.prisma.swapOffer.findUnique({
+        where: { id: offerId },
+        select: { proposerId: true, counterpartyId: true },
+      });
+      return row !== null && (row.proposerId === userId || row.counterpartyId === userId);
     });
   }
 }

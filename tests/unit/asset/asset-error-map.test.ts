@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { assetErrorToHttp } from '@vca/api/modules/asset/asset.controller.js';
 import { AssetVersionNotFoundError } from '@vca/api/modules/asset/asset-access.service.js';
+import { AssetLockedForVersionError } from '@vca/api/modules/asset/asset-version.service.js';
 import {
   ArchiveRejectedError,
   ArtifactCleanupError,
@@ -65,6 +66,28 @@ describe('asset 边界的领域错误 → HTTP 映射（Task 8 的裁定落点�
     expect(mapped(new AssetVersionNotFoundError('0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b'))).toMatchObject({
       status: 404,
       code: 'ASSET_VERSION_NOT_FOUND',
+    });
+  });
+
+  it('★ 作品被处分冻结 ⇒ 409（增量 A-7）：`ASSET_LOCKED_FOR_VERSION`，且与「不存在」「自转」都分得开', () => {
+    // §6.3:284「不可编辑」的第一个执行点（P3 / Task 7 / A-7）。这一整条映射今天经 HTTP
+    // **到不了**（`persistIngested` 的 `{ assetId }` 分支零生产调用方），补它的理由是
+    // 这张表是本模块**唯一**的翻译点：一条抛得出来、译不出来的错误是一颗哑弹。
+    const result = mapped(
+      new AssetLockedForVersionError('0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b', '0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c'),
+    );
+    expect(result).toMatchObject({ status: 409, code: 'ASSET_LOCKED_FOR_VERSION' });
+    // 三个反面对照：它不许落进「不存在」（404）、「内容不可接受」（422）、
+    // 也不许与「转给自己」（同一档 409、**不同**的下一步）共用一个 code。
+    expect(result?.status, '被冻结被当成了「作品不存在」').not.toBe(404);
+    expect(result?.status, '被冻结被当成了「内容不可接受」').not.toBe(422);
+    expect(result?.code).not.toBe('ASSET_SELF_TRANSFER_REJECTED');
+    // 持有者 id 是内部标识，**不进响应体**（C11 的边界由这张表把守）。
+    expect(JSON.stringify(result?.body)).not.toContain('0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c');
+    // 持有者未知（行不一致）也走同一格 —— 不许出现第二条翻译。
+    expect(mapped(new AssetLockedForVersionError('0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b', null))).toMatchObject({
+      status: 409,
+      code: 'ASSET_LOCKED_FOR_VERSION',
     });
   });
 

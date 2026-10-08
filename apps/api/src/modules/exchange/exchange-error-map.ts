@@ -5,10 +5,11 @@ import {
   NotFoundException,
   UnprocessableEntityException,
 } from '@nestjs/common';
-import { AssetNotFoundError } from '../asset/index.js';
+import { AssetLockedByContractError, AssetNotFoundError } from '../asset/index.js';
 import {
   AssetLockedError,
   EscrowShortfallError,
+  ExpiredExchangeWindowError,
   IneligibleAssetError,
   InvalidClaimsError,
   InvalidExchangeTransitionError,
@@ -30,7 +31,9 @@ import {
  * | `IneligibleAssetError` | **422** | **制品本身**不满足 §6.1 第 2 条（与 P1 的 422 同义） |
  * | `InvalidExchangeTransitionError` | **409** | 请求本身合法，冲突在于**资源的当前状态** |
  * | `SwapSelfOfferError` | **409** | 这是同一个人（与 P1 的 `SelfTransferRejectedError` 同档） |
- * | `AssetLockedError` | **409** | 作品正被另一份合约锁着（§6.3:284） |
+ * | `AssetLockedError` | **409** | 作品正被另一份合约锁着（§6.3:284）——`proposeOffer` 那一侧 |
+ * | `AssetLockedByContractError` | **409** | 同上，但是**双锁**那一侧（`asset` 的锁服务抛，T7） |
+ * | `ExpiredExchangeWindowError` | **409** | 请求合法，冲突在于**时间**（24 小时窗口已过，T7） |
  * | `StaleCommitmentError` | **409** | 带回的承诺与**当前值**不一致（「资料已变更，请重新查看」） |
  * | `AssetNotFoundError` | **404** | 这次请求引用的作品不存在（**复用 `asset` 的错误类**，见下） |
  * | `EscrowShortfallError` / `UnknownLockOrderError` | **500** | **我们自己的**不变量被破坏了 |
@@ -91,6 +94,25 @@ export function exchangeErrorToHttp(error: unknown): HttpException | null {
   }
   if (error instanceof AssetLockedError) {
     return new ConflictException({ code: 'EXCHANGE_ASSET_LOCKED' });
+  }
+  if (error instanceof AssetLockedByContractError) {
+    // ★ P3 / Task 7：**另一个错误类、另一个 `code`**（`AssetLockedError` 是 409
+    // `EXCHANGE_ASSET_LOCKED`）。两者是同一件事实的两条**路径**：
+    //   * `AssetLockedError`：`proposeOffer` 读到「这件作品锁着」⇒ 换一件作品再发；
+    //   * `AssetLockedByContractError`：**双锁**时作品已被另一份合约持有 ⇒ 这份合约
+    //     走不下去（等它被取消，或者自己也退出）。
+    // 调用方的下一步不同 ⇒ `code` 必须能分流（`code` 正是调用方与告警规则唯一能据以
+    // 分流的东西）。
+    // **据实记载一处被否决的写法**：第一版让两者共用 `EXCHANGE_ASSET_LOCKED`，代价是
+    // `error-map.test.ts` 那条「表里不许撞码」的断言必须放宽 —— 那是一次**闸门削弱**，
+    // 因此改成两个 code（12 档 → 14 档，计数断言同步上调，见那个文件里的算术）。
+    return new ConflictException({ code: 'EXCHANGE_ASSET_LOCKED_BY_CONTRACT' });
+  }
+  if (error instanceof ExpiredExchangeWindowError) {
+    // 409，与 `InvalidExchangeTransitionError` 同一档、**不同**的 `code`：
+    // 「不可接受的是这次请求」有两类因由（资源**状态**的冲突 / **时间**的冲突），
+    // 而调用方的下一步不同（前者重读状态，后者等计时器把它取消掉）。
+    return new ConflictException({ code: 'EXCHANGE_WINDOW_EXPIRED' });
   }
   if (error instanceof StaleCommitmentError) {
     // 409：请求合法（两个 UUID、一个有界的摘要都对），冲突在**资源的当前状态**

@@ -214,3 +214,39 @@ export class UnknownExchangeObjectError extends Error {
   }
 }
 
+/**
+ * 这次动作落在**窗口之外** ⇒ **409**（P3 / Task 7）。今天只有一个窗口：双锁的 24 小时。
+ *
+ * ## 为什么它必须与 `InvalidExchangeTransitionError` **分开**
+ *
+ * 计划 Step 3 逐字：「24 小时的判据：`lockWindowExpired(contract, now)` ⇒ 拒
+ * （`InvalidExchangeTransitionError` **不够** —— 超时是**另一个**因由，走
+ * `ExpiredExchangeWindowError`）」。两个因由的责任方与处置都不同：
+ *   * 「这份合约已经是 `CANCELLED` 了，你不能再确认」是**状态**的冲突（谁都没做错）；
+ *   * 「24 小时已经过去了」是**时间**的冲突 —— 调用方唯一正确的下一步是
+ *     **让计时器把这份合约取消掉**，而不是「再读一次状态」。
+ * 合成一个类会让那次翻译只能靠猜（`exchange-error-map.ts` 的唯一出口就没有依据了）。
+ *
+ * ## 状态码取 409（本仓库的既定切法）
+ * 「不可接受的是**这次请求**」= 409（与 `InvalidExchangeTransitionError`、
+ * `StaleCommitmentError` 同档）；422 留给「不可接受的是**数据**」。
+ * **据实记载**：计划给了这个类的**名字**与它的**存在理由**，但没有给状态码
+ * ——409 是 Task 7 依上面那条切法选的（见报告 §self-review）。
+ *
+ * `deadlineAt` / `now` **不进响应体**（C11 的边界由唯一出口把守，它只回 `code`）：
+ * 它们是诊断，用来回答「到底过期了多久」。
+ */
+export class ExpiredExchangeWindowError extends Error {
+  constructor(
+    /** 哪个窗口。今天只有双锁的 24 小时（`'lock'`）。 */
+    readonly window: 'lock',
+    readonly deadlineAt: Date,
+    readonly now: Date,
+  ) {
+    super(
+      `交换窗口已过期（${window}）：期限 ${deadlineAt.toISOString()}，此刻 ${now.toISOString()}`,
+    );
+    this.name = 'ExpiredExchangeWindowError';
+  }
+}
+

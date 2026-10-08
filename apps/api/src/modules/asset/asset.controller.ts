@@ -33,6 +33,7 @@ import {
 } from './asset.service.js';
 import { DownloadForbiddenError, DownloadService, DownloadTicketRejectedError, type IssuedDownload } from './download/download.service.js';
 import { UUID_IDENTIFIER } from './download/signed-url.js';
+import { AssetLockedForVersionError } from './asset-version.service.js';
 import { AssetNotFoundError, SelfTransferRejectedError } from './ownership.service.js';
 
 /**
@@ -139,6 +140,16 @@ export function assetErrorToHttp(error: unknown): HttpException | null {
   }
   if (error instanceof SelfTransferRejectedError) {
     return new ConflictException({ code: 'ASSET_SELF_TRANSFER_REJECTED' });
+  }
+  if (error instanceof AssetLockedForVersionError) {
+    // ★ 增量 A-7（P3 / Task 7）：§6.3:284「不可编辑」的第一个执行点。
+    // 409，理由与 `SelfTransferRejectedError` 逐字相同（作品存在、请求合法，
+    // 冲突在于资源的当前状态）；`code` 与它分开，因为调用方的下一步不同：
+    // 那边是「重新读一次当前所有人」，这边是「等那份合约走完」。
+    // **据实记载**：这条映射今天经 HTTP 到不了（`persistIngested` 的 `{ assetId }` 分支
+    // 零生产调用方）。补它的理由是这张表是本模块**唯一**的翻译点，而一条抛得出来、
+    // 译不出来的错误是一颗哑弹（`tests/unit/asset/asset-error-map.test.ts` 把它钉住）。
+    return new ConflictException({ code: 'ASSET_LOCKED_FOR_VERSION' });
   }
   if (error instanceof DownloadForbiddenError) {
     return new ForbiddenException({ code: 'ASSET_DOWNLOAD_NOT_AUTHORIZED' });

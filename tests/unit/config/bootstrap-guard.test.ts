@@ -98,7 +98,42 @@ describe('引导期 fail-fast 接线（app.module → ConfigModule → validate�
     'DOWNLOAD_URL_SECRET',
   ] as const;
 
-  it('必填密钥全部缺失时，求值 app.module 会拒绝启动', async () => {
+  /**
+   * ★ **显式 `testTimeout`（P3 / Task 7；控制器裁定）—— 这是一个**测试预算**，不是断言被放宽。
+   *
+   * ## 为什么必须显式给（实测数字，两个会话各测一次）
+   *
+   * 这条用例会 `vi.resetModules()` 之后 `await import('@vca/api/app.module.js')`，
+   * 也就是把**整棵应用模块图**重新求值一遍（含 `ConfigModule.forRoot()` 的校验）。
+   * 它是这个文件里唯一一条**秒级**的用例，其余七条都是 0–3 ms。
+   *
+   * | 场景 | 实测 |
+   * |---|---|
+   * | 单独跑（Task 6 于 BASE `65d06a6`） | 1654 ms |
+   * | 单独跑（Task 6 加上它的接线之后） | 1834 ms |
+   * | **单独跑（Task 7 于 BASE `595a01f`，本机）** | **1950 ms** |
+   * | 全量 `pnpm test`（5 个 project + 一堆 testcontainers 同时跑） | 1628 ms 通过 / **> 5000 ms 超时** |
+   *
+   * `unit` 这个 project **没有**自己的 `testTimeout`（`vitest.config.ts` 只给
+   * integration / security / property / architecture 显式配过），因此它吃的是
+   * vitest 的 **5 s 默认值** —— 而这条用例在满载时**离那条线只有几百毫秒**，
+   * 并且**已经真的红过一次**（Task 6 的第 1 次全量跑）。
+   *
+   * ## 为什么这是「预算」而不是「放松断言」
+   *
+   * 一个**通过与否取决于机器有多忙**的用例不是见证：它绿的时候不代表任何东西成立，
+   * 红的时候也不代表任何东西被破坏。这正是本仓库为 `architecture` project 已经用过一次的
+   * 论证（`vitest.config.ts` 那条注释逐字：「默认值在这里量错了对象：它测的是机器有多忙，
+   * 不是架构有没有被破坏」），也是 P1 的 `signed-download` flake 的同一类
+   * （两个时钟采样之间隔一次 HTTP 往返、余量只有 1 s ⇒ 每次运行约 3.5% 跨秒红）。
+   *
+   * ⇒ **本用例断言的东西一个字都没改**（下面每一句 `expect` 与它此前的语义逐字相同）：
+   * 改的只是「允许多久跑完」。给 60 s：实测最坏 ~1.95 s（单独）/ >5 s（满载），
+   * 余量 ≥ 12 倍；而一个**真的**卡死的实现仍然会在 60 s 内被抓住。
+   */
+  it(
+    '必填密钥全部缺失时，求值 app.module 会拒绝启动',
+    async () => {
     const savedEnv = new Map(REQUIRED_KEYS.map((key) => [key, process.env[key]]));
     const rejections: unknown[] = [];
     const onRejection = (reason: unknown): void => {
@@ -137,5 +172,9 @@ describe('引导期 fail-fast 接线（app.module → ConfigModule → validate�
     for (const key of ['ARTIFACT_KEYS', 'ARTIFACT_ACTIVE_KEY_ID', 'GITHUB_CLIENT_SECRET']) {
       expect(message).toContain(key);
     }
-  });
+    },
+    // ↑ 显式预算（60 s），理由与实测数字见这个 `it` 上方那段注释。
+    //   **它是本文件唯一的秒级用例**：其余七条吃默认值（5 s）绰绰有余。
+    60_000,
+  );
 });

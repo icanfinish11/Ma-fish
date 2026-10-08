@@ -179,6 +179,12 @@ describe('每个路由都必须有明确的限流归属（修复轮 1 / C-4）',
           rateLimitSkipped: false,
         });
       }
+      // ★ P3 / Task 7：`confirmLock` 是**写**路由 ⇒ 同一档（C33）。判别力同 P-T6-b：
+      //   把它从 `bid` 改成 `search`、或者删掉装饰器，这一格都会红。
+      expect(registry.find('ExchangeController', 'confirmLock'), 'ExchangeController.confirmLock 没有限流归属').toMatchObject({
+        rateLimit: 'bid',
+        rateLimitSkipped: false,
+      });
       for (const handler of ['readOffer', 'readContract'] as const) {
         expect(registry.find('ExchangeController', handler), `ExchangeController.${handler} 没有限流归属`).toMatchObject({
           rateLimit: 'search',

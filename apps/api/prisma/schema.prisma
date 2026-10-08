@@ -149,6 +149,24 @@ model Asset {
   /// 「`asset.assets.locked_at`」那一条（列的形状 + 运行期角色锁得动、放得开两个方向）。
   lockedAt DateTime? @map("locked_at") @db.Timestamptz(3)
 
+  /// ★ **谁锁的**（P3 / Task 7）：持有这件作品的**合约 id**。与 `lockedAt` 成对。
+  ///
+  /// ## 为什么需要第二列（Task 7 对本计划的一处自查修正）
+  /// `locked_at` 只说「锁了」，而「谁锁的」是**解锁**与**幂等重放**两条判据的输入：
+  ///   * 解锁时 `holder_contract_id` 必须相等（只有持有者能解，§6.3:290 的退出路径）；
+  ///   * 双锁的幂等重放：同一次 `confirmLock` 被重发（网络重试）时，持有者就是本案合约
+  ///     ⇒ 必须**放行**而不是报「已被锁定」。
+  /// Task 2 加 `locked_at` 时还不知道需要 holder，因此这一列是 Task 7 在同一批提交里
+  /// 加的（一条 `migrate diff` 生成的 `ALTER TABLE`）。
+  ///
+  /// ## 为什么**没有**外键指向 `exchange.swap_contracts`
+  /// C5：跨模块的约束留在**接口层**（`owner_id` 同样没有任何外键，见上面那一段）。
+  /// 这个列是 `exchange` **推**给 `asset` 的一个事实，不是一张被引用的表。
+  /// 代价据实记载：库里可能存在一个指向已删合约的 id —— 但合约**删不掉**
+  /// （`exchange` 三张表的 `DELETE` 在数据库层被撤权，Task 2 的真库取证），
+  /// 而这条路径在 P3 里根本不存在（没有任何入口会删合约）。
+  holderContractId String? @map("holder_contract_id") @db.Uuid
+
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
 
   versions         AssetVersion[]

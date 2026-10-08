@@ -1,0 +1,24 @@
+-- ════════════════════════════════════════════════════════════════════════════
+-- P3 / Task 7 —— `asset.assets.holder_contract_id`（谁锁的）
+--
+-- ## 它修的是什么（本计划内部的一处**自查修正**，据实记载）
+-- Task 2 给 `asset.assets` 加了 `locked_at`，而 Task 7 的 `lockAssets` /
+-- `unlockAssets` 需要回答第二个问题：**谁锁的**。
+--   * 解锁：`holder_contract_id` 必须相等（只有持有者能解，§6.3:290 的退出路径）；
+--   * 幂等重放：同一次 `confirmLock` 被重发时持有者就是本案合约 ⇒ **放行**，
+--     而「已被锁定」的判据是「`locked_at` 非空**且**持有者是**别的**合约」。
+-- ⇒ 没有这一列，「谁锁的」只能靠猜，而两种猜法各有不同的失效形态。
+--
+-- ## 为什么**没有**外键指向 `exchange.swap_contracts`
+-- C5：跨模块的约束留在**接口层**（`asset.assets.owner_id` 同样没有任何外键）。
+-- 这一列是 `exchange` **推**给 `asset` 的一个事实，不是一张被引用的表。
+--
+-- ## 零漂移门**是**这条迁移的见证（与 Task 2 的六条手写 CHECK 不同）
+-- 它整段由 `prisma migrate diff` 生成（下面这一段），Prisma 表达得出来 ⇒
+-- `migrate diff --exit-code` 看得见它。取证见
+-- `.superpowers/sdd/2026-10-07-p3-exchange/evidence/t7-migration-gen.txt`
+-- （生成脚本先打印、再落盘、再逐字比对，并在有数据的表上应用过一次）。
+-- ════════════════════════════════════════════════════════════════════════════
+
+-- AlterTable
+ALTER TABLE "asset"."assets" ADD COLUMN     "holder_contract_id" UUID;

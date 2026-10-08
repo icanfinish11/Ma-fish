@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { HttpException } from '@nestjs/common';
+import { AssetLockedByContractError } from '@vca/api/modules/asset/index.js';
 import { AssetNotFoundError } from '@vca/api/modules/asset/ownership.service.js';
 import { exchangeErrorToHttp } from '@vca/api/modules/exchange/exchange-error-map.js';
 import {
   AssetLockedError,
   EscrowShortfallError,
+  ExpiredExchangeWindowError,
   IneligibleAssetError,
   InvalidClaimsError,
   InvalidExchangeTransitionError,
@@ -115,6 +117,23 @@ const ROWS: Row[] = [
     code: 'EXCHANGE_OFFER_NOT_FOUND',
   },
   {
+    // ★ P3 / Task 7：**双锁**那一侧的作品锁（`asset` 的锁服务抛的那个类）。
+    // 它与 `AssetLockedError` 是同一件事实的两条路径，而 `code` 不同 ——
+    // 调用方的下一步不同（换一件作品再发 vs 这份合约走不下去）。
+    label: 'AssetLockedByContractError（Task 7：双锁时作品已被另一份合约持有）',
+    error: () => new AssetLockedByContractError('a', '01920000-0000-7000-8000-0000000000ff'),
+    status: 409,
+    code: 'EXCHANGE_ASSET_LOCKED_BY_CONTRACT',
+  },
+  {
+    // ★ P3 / Task 7：24 小时窗口过期。它与 `InvalidExchangeTransitionError` 同为 409，
+    // 而**因由不同**（时间 vs 状态）—— 计划逐字要求两者分开（Step 3 第 3 条）。
+    label: 'ExpiredExchangeWindowError（Task 7：双锁的 24 小时窗口已过）',
+    error: () => new ExpiredExchangeWindowError('lock', new Date(0), new Date(1_000)),
+    status: 409,
+    code: 'EXCHANGE_WINDOW_EXPIRED',
+  },
+  {
     label: 'UnknownExchangeObjectError（合约不存在 / 不可见）',
     error: () => new UnknownExchangeObjectError('contract', '01920000-0000-7000-8000-0000000000ee'),
     status: 404,
@@ -146,14 +165,16 @@ describe('交换领域错误 → HTTP（唯一翻译表）', () => {
 
   it('表里不许撞码：每一档的 `code` 两两不同（撞码 = 责任方再也分不开）', () => {
     const codes = ROWS.map((row) => row.code);
-    // 非空转前提：先证明这一组确实有 12 档（否则「两两不同」在空数组上恒真）。
+    // 非空转前提：先证明这一组确实有 14 档（否则「两两不同」在空数组上恒真）。
     // 7（`core/errors.ts` 的七档，Task 3）+ 2（增量 A-6：`InvalidClaimsError` /
     // `StaleCommitmentError`）+ 2（`UnknownExchangeObjectError` 的两个 `kind`）
-    // + 1（复用 `asset` 的 `AssetNotFoundError`）= **12**。
+    // + 1（复用 `asset` 的 `AssetNotFoundError`）= **12**；
+    // ★ P3 / Task 7（增量 A-7 与双锁）再 +2：`AssetLockedByContractError`（双锁那一侧）
+    // 与 `ExpiredExchangeWindowError`（24 小时窗口）⇒ **14**。
     // 这条下限的用途正是「表里少了一档时必须红一次」。**首跑实测：我按 9 写，vitest 报
     // `expected … to have a length of 9 but got 10`** —— 这条断言第一次运行就抓到了
     // 一次算术错误，正是它存在的理由。
-    expect(codes).toHaveLength(12);
+    expect(codes).toHaveLength(14);
     expect(new Set(codes).size).toBe(codes.length);
     // 再看运行期：每一种错误实例真的翻译出上表里那个 code（而不是只在表面上不同）。
     const actual = ROWS.map((row) => (exchangeErrorToHttp(row.error())?.getResponse() as { code: string }).code);

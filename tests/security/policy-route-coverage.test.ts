@@ -214,13 +214,44 @@ describe('每个路由都必须有策略声明（§9 / 验收 13.2）', () => {
       });
       expect(registry.find('ExchangeController', 'readOffer')).toMatchObject({
         path: '/exchange/offers/:offerId',
-        decl: { resource: 'SwapOffer', action: 'read', condition: 'swapOfferSent' },
+        /**
+         * ★ **P3 / Task 7 换了这里的条件**（控制器裁定「修」，Task 6 报告的那条真缺陷）。
+         *
+         * 被替换掉的旧契约原文：
+         * ```
+         * decl: { resource: 'SwapOffer', action: 'read', condition: 'swapOfferSent' },
+         * ```
+         * 旧条件下**发起方读自己的要约得 403**，而一份 `ACCEPTED` 的要约**谁都读不到**
+         * —— 与这条路由自己的注释（「双方可见」）以及服务层的判定都相反。
+         * 新条件 `swapOfferParty`（由 `ExchangeModule.onModuleInit` 注册）= 发起方 **或**
+         * 被要约方，**不判状态**。
+         *
+         * 判别力：把声明改回 `swapOfferSent` ⇒ 这一格立刻红，**同一次改动**也让
+         * `authz-matrix.test.ts` 的两条新用例（发起方 200 / 终态双方 200）红。
+         * 把 `swapOfferParty` 的注册删掉 ⇒ 本模块这条路由 403（fail-closed），
+         * 同样红在那两条上（探针 `P-T7-readoffer-*`）。
+         */
+        decl: { resource: 'SwapOffer', action: 'read', condition: 'swapOfferParty' },
         rateLimit: 'search',
       });
       expect(registry.find('ExchangeController', 'readContract')).toMatchObject({
         path: '/exchange/contracts/:contractId',
         decl: { resource: 'SwapContract', action: 'read', condition: 'swapContractParty' },
         rateLimit: 'search',
+      });
+      /**
+       * ── P3 / Task 7：`confirmLock`（第七条路由）──────────────────────────────
+       *
+       * 与上面六条同一理由（「门会红」与「门**看得见**这条路由」是两件事）：
+       * 若这条路由因为模块/provider 没接上而根本没被注册，`undeclared` 照样是空数组。
+       * 它是 §9:478 那一行（`SwapContract confirmLock` = 当事人），条件因此复用
+       * `swapContractParty`；限流归 `bid`（C33：交换的写路由）。
+       */
+      expect(registry.find('ExchangeController', 'confirmLock'), '确认锁定路由没被注册表发现').toMatchObject({
+        path: '/exchange/contracts/:contractId/confirm-lock',
+        isPublic: false,
+        decl: { resource: 'SwapContract', action: 'confirmLock', condition: 'swapContractParty' },
+        rateLimit: 'bid',
       });
     });
   });
